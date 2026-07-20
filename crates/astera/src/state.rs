@@ -16,8 +16,8 @@ use smithay::{
         renderer::utils::on_commit_buffer_handler,
         winit::WinitInput,
     },
-    delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_seat, delegate_shm,
-    delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_layer_shell,
+    delegate_output, delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, find_popup_root_surface,
     },
@@ -26,6 +26,7 @@ use smithay::{
         keyboard::{FilterResult, ModifiersState, keysyms},
         pointer::{ButtonEvent, Focus as PointerFocusMode, MotionEvent, PointerHandle},
     },
+    output::{Mode, Output as SmithayOutput, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::{
         Client, DisplayHandle,
         backend::{ClientData, ClientId, DisconnectReason},
@@ -38,6 +39,10 @@ use smithay::{
             CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
             TraversalAction, with_states, with_surface_tree_downward,
         },
+        fractional_scale::{
+            FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
+        },
+        output::{OutputHandler, OutputManagerState},
         selection::{
             SelectionHandler,
             data_device::{
@@ -52,6 +57,7 @@ use smithay::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
         },
         shm::{ShmHandler, ShmState},
+        viewporter::ViewporterState,
     },
 };
 
@@ -83,6 +89,11 @@ pub struct Astera {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
     layer_shell_state: WlrLayerShellState,
+    _fractional_scale_state: FractionalScaleManagerState,
+    _viewporter_state: ViewporterState,
+    _output_manager_state: OutputManagerState,
+    wayland_output: SmithayOutput,
+    output_surfaces: Vec<WlSurface>,
     shm_state: ShmState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
@@ -105,6 +116,30 @@ impl Astera {
         let compositor_state = CompositorState::new::<Self>(display);
         let xdg_shell_state = XdgShellState::new::<Self>(display);
         let layer_shell_state = WlrLayerShellState::new::<Self>(display);
+        let fractional_scale_state = FractionalScaleManagerState::new::<Self>(display);
+        let viewporter_state = ViewporterState::new::<Self>(display);
+        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(display);
+        let wayland_output = SmithayOutput::new(
+            "ASTERA-NESTED-1".into(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Astera".into(),
+                model: "Nested Output".into(),
+            },
+        );
+        wayland_output.create_global::<Self>(display);
+        let initial_mode = Mode {
+            size: (1, 1).into(),
+            refresh: 60_000,
+        };
+        wayland_output.change_current_state(
+            Some(initial_mode),
+            Some(smithay::utils::Transform::Normal),
+            Some(Scale::Fractional(1.0)),
+            Some((0, 0).into()),
+        );
+        wayland_output.set_preferred(initial_mode);
         let shm_state = ShmState::new::<Self>(display, Vec::new());
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(display, "astera-seat");
@@ -141,6 +176,11 @@ impl Astera {
             compositor_state,
             xdg_shell_state,
             layer_shell_state,
+            _fractional_scale_state: fractional_scale_state,
+            _viewporter_state: viewporter_state,
+            _output_manager_state: output_manager_state,
+            wayland_output,
+            output_surfaces: Vec::new(),
             shm_state,
             seat_state,
             data_device_state,
@@ -685,9 +725,51 @@ impl Astera {
         let size = Size::new(width, height);
         if self.desktop.outputs[&self.active_output].logical_size != size {
             let _ = self.desktop.resize_output(self.active_output, size);
+            let mode = Mode {
+                size: (saturating_i32(width), saturating_i32(height)).into(),
+                refresh: 60_000,
+            };
+            let scale = self.active_scale();
+            self.wayland_output.change_current_state(
+                Some(mode),
+                None,
+                Some(Scale::Fractional(scale)),
+                None,
+            );
+            self.wayland_output.set_preferred(mode);
             self.configure_fullscreen_windows();
             self.configure_layer_surfaces();
+            self.refresh_visible_scales();
         }
+    }
+
+    fn active_scale(&self) -> f64 {
+        self.desktop.outputs[&self.active_output].native_scale.0 as f64 / 120.0
+    }
+
+    fn refresh_visible_scales(&mut self) {
+        let scale = self.active_scale();
+        let visible: Vec<_> = self
+            .render_roots()
+            .into_iter()
+            .map(|(surface, _, _)| surface)
+            .collect();
+        for surface in &self.output_surfaces {
+            if !visible.contains(surface) {
+                self.wayland_output.leave(surface);
+            }
+        }
+        for surface in &visible {
+            if !self.output_surfaces.contains(surface) {
+                self.wayland_output.enter(surface);
+            }
+            with_states(surface, |states| {
+                with_fractional_scale(states, |fractional| {
+                    fractional.set_preferred_scale(scale);
+                });
+            });
+        }
+        self.output_surfaces = visible;
     }
 
     pub fn remove_dead_windows(&mut self) {
@@ -707,6 +789,7 @@ impl Astera {
                     .apply_window(workspace, WindowTransaction::Remove { id });
             }
         }
+        self.refresh_visible_scales();
     }
 
     pub fn execute_command(&mut self, command: Command) -> Response<DesktopSnapshot> {
@@ -720,6 +803,7 @@ impl Astera {
                     self.configure_window_mode(window, mode);
                 }
                 self.configure_fullscreen_windows();
+                self.refresh_visible_scales();
                 self.sync_keyboard_focus();
                 Response::Ok(
                     DesktopSnapshot::from(&self.desktop)
@@ -989,6 +1073,19 @@ impl BufferHandler for Astera {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
 }
 
+impl OutputHandler for Astera {}
+
+impl FractionalScaleHandler for Astera {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        let scale = self.active_scale();
+        with_states(&surface, |states| {
+            with_fractional_scale(states, |fractional| {
+                fractional.set_preferred_scale(scale);
+            });
+        });
+    }
+}
+
 impl CompositorHandler for Astera {
     fn compositor_state(&mut self) -> &mut CompositorState {
         &mut self.compositor_state
@@ -1034,6 +1131,7 @@ impl WlrLayerShellHandler for Astera {
             output: self.active_output,
         });
         self.configure_layer_surface(&surface);
+        self.refresh_visible_scales();
     }
 
     fn new_popup(&mut self, _parent: LayerSurface, popup: PopupSurface) {
@@ -1048,6 +1146,7 @@ impl WlrLayerShellHandler for Astera {
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
         self.layers.retain(|mapped| mapped.surface != surface);
+        self.refresh_visible_scales();
         self.sync_keyboard_focus();
     }
 }
@@ -1096,6 +1195,7 @@ impl XdgShellHandler for Astera {
         });
         surface.send_configure();
         self.windows.push(MappedWindow { id, surface });
+        self.refresh_visible_scales();
         self.sync_keyboard_focus();
     }
 
@@ -1228,6 +1328,9 @@ impl ClientData for ClientState {
 
 delegate_xdg_shell!(Astera);
 delegate_layer_shell!(Astera);
+delegate_fractional_scale!(Astera);
+delegate_viewporter!(Astera);
+delegate_output!(Astera);
 delegate_compositor!(Astera);
 delegate_shm!(Astera);
 delegate_seat!(Astera);
