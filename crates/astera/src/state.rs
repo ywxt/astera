@@ -10,11 +10,11 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::{
     backend::{
         input::{
-            AbsolutePositionEvent, ButtonState as BackendButtonState, Event, InputEvent, KeyState,
-            KeyboardKeyEvent, MouseButton, PointerButtonEvent,
+            AbsolutePositionEvent, ButtonState as BackendButtonState, Event, InputBackend,
+            InputEvent, KeyState, KeyboardKeyEvent, MouseButton, PointerButtonEvent,
+            PointerMotionEvent,
         },
         renderer::utils::on_commit_buffer_handler,
-        winit::WinitInput,
     },
     delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_layer_shell,
     delegate_output, delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_shell,
@@ -275,7 +275,10 @@ impl Astera {
         Ok(())
     }
 
-    pub fn process_input(&mut self, event: InputEvent<WinitInput>) {
+    pub fn process_input<B: InputBackend>(&mut self, event: InputEvent<B>) {
+        if !self.desktop.outputs.contains_key(&self.active_output) {
+            return;
+        }
         match event {
             InputEvent::Keyboard { event } => {
                 let pressed = event.state() == KeyState::Pressed;
@@ -306,6 +309,32 @@ impl Astera {
                 let location = event.position_transformed(
                     (saturating_i32(size.width), saturating_i32(size.height)).into(),
                 );
+                self.pointer_location = location;
+                if self.drag.is_some() {
+                    self.update_drag(location);
+                } else {
+                    let focus = self.surface_under(location);
+                    let pointer = self.pointer.clone();
+                    let serial = self.next_serial();
+                    pointer.motion(
+                        self,
+                        focus.map(|(surface, origin, _)| (surface, origin)),
+                        &MotionEvent {
+                            location,
+                            serial,
+                            time: event.time_msec(),
+                        },
+                    );
+                    pointer.frame(self);
+                }
+            }
+            InputEvent::PointerMotion { event } => {
+                let size = self.desktop.outputs[&self.active_output].logical_size;
+                let delta = event.delta_unaccel();
+                let location = SmithayPoint::from((
+                    (self.pointer_location.x + delta.x).clamp(0.0, size.width as f64 - 1.0),
+                    (self.pointer_location.y + delta.y).clamp(0.0, size.height as f64 - 1.0),
+                ));
                 self.pointer_location = location;
                 if self.drag.is_some() {
                     self.update_drag(location);

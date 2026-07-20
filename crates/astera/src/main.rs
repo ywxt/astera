@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     init_tracing();
     match BackendKind::from_args()? {
         BackendKind::Winit => backend::winit::run(Config::default()),
-        BackendKind::Native => Err("native DRM/KMS backend is not available yet".into()),
+        BackendKind::Native => backend::native::run(Config::default()),
     }
 }
 
