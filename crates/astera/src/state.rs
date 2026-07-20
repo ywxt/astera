@@ -16,7 +16,8 @@ use smithay::{
         renderer::utils::on_commit_buffer_handler,
         winit::WinitInput,
     },
-    delegate_compositor, delegate_data_device, delegate_seat, delegate_shm, delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_seat, delegate_shm,
+    delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, find_popup_root_surface,
     },
@@ -28,14 +29,14 @@ use smithay::{
     reexports::wayland_server::{
         Client, DisplayHandle,
         backend::{ClientData, ClientId, DisconnectReason},
-        protocol::{wl_buffer, wl_seat, wl_surface::WlSurface},
+        protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
     },
     utils::{Physical, Point as SmithayPoint, Serial},
     wayland::{
         buffer::BufferHandler,
         compositor::{
             CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-            TraversalAction, with_surface_tree_downward,
+            TraversalAction, with_states, with_surface_tree_downward,
         },
         selection::{
             SelectionHandler,
@@ -45,6 +46,10 @@ use smithay::{
         },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+        },
+        shell::wlr_layer::{
+            Anchor, KeyboardInteractivity, Layer, LayerSurface, LayerSurfaceCachedState,
+            WlrLayerShellHandler, WlrLayerShellState,
         },
         shm::{ShmHandler, ShmState},
     },
@@ -67,9 +72,17 @@ struct DragState {
     start: Point,
 }
 
+#[derive(Clone, Debug)]
+struct MappedLayer {
+    surface: LayerSurface,
+    layer: Layer,
+    output: OutputId,
+}
+
 pub struct Astera {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
+    layer_shell_state: WlrLayerShellState,
     shm_state: ShmState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
@@ -80,6 +93,7 @@ pub struct Astera {
     desktop: Desktop,
     active_output: OutputId,
     windows: Vec<MappedWindow>,
+    layers: Vec<MappedLayer>,
     next_window_id: u64,
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
     drag: Option<DragState>,
@@ -90,6 +104,7 @@ impl Astera {
     pub fn new(display: &DisplayHandle, config: Config) -> Self {
         let compositor_state = CompositorState::new::<Self>(display);
         let xdg_shell_state = XdgShellState::new::<Self>(display);
+        let layer_shell_state = WlrLayerShellState::new::<Self>(display);
         let shm_state = ShmState::new::<Self>(display, Vec::new());
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(display, "astera-seat");
@@ -125,6 +140,7 @@ impl Astera {
         Self {
             compositor_state,
             xdg_shell_state,
+            layer_shell_state,
             shm_state,
             seat_state,
             data_device_state,
@@ -135,6 +151,7 @@ impl Astera {
             desktop,
             active_output,
             windows: Vec::new(),
+            layers: Vec::new(),
             next_window_id: 1,
             pointer_location: (0.0, 0.0).into(),
             drag: None,
@@ -503,7 +520,7 @@ impl Astera {
                 Some((layer, &mapped.surface, origin, scale))
             })
             .collect();
-        instances.sort_by_key(|(layer, _, _, _)| *layer);
+        instances.sort_by_key(|(layer, _, _, _)| std::cmp::Reverse(*layer));
         instances.into_iter().map(|(_, surface, origin, scale)| {
             (
                 surface,
@@ -511,6 +528,96 @@ impl Astera {
                 scale,
             )
         })
+    }
+
+    pub fn render_roots(
+        &self,
+    ) -> Vec<(WlSurface, SmithayPoint<i32, Physical>, f64)> {
+        let mut roots = Vec::new();
+        for layer in [Layer::Overlay] {
+            roots.extend(self.layer_roots(layer));
+        }
+        roots.extend(
+            self.mapped_windows()
+                .filter(|(surface, _, _)| self.window_mode_for_surface(surface.wl_surface()) == Some(WindowMode::Fullscreen))
+                .map(|(surface, location, scale)| (surface.wl_surface().clone(), location, scale)),
+        );
+        roots.extend(self.layer_roots(Layer::Top));
+        roots.extend(
+            self.mapped_windows()
+                .filter(|(surface, _, _)| {
+                    matches!(
+                        self.window_mode_for_surface(surface.wl_surface()),
+                        Some(WindowMode::Floating | WindowMode::Tiled)
+                    )
+                })
+                .map(|(surface, location, scale)| (surface.wl_surface().clone(), location, scale)),
+        );
+        roots.extend(self.layer_roots(Layer::Bottom));
+        roots.extend(self.layer_roots(Layer::Background));
+        roots
+    }
+
+    fn window_mode_for_surface(&self, surface: &WlSurface) -> Option<WindowMode> {
+        let id = self
+            .windows
+            .iter()
+            .find(|mapped| mapped.surface.wl_surface() == surface)?
+            .id;
+        self.desktop
+            .workspace_for_output(self.active_output)?
+            .window_mode(id)
+    }
+
+    fn layer_roots(
+        &self,
+        wanted: Layer,
+    ) -> impl Iterator<Item = (WlSurface, SmithayPoint<i32, Physical>, f64)> + '_ {
+        self.layers
+            .iter()
+            .filter(move |mapped| mapped.output == self.active_output && mapped.layer == wanted)
+            .filter_map(|mapped| {
+                let (origin, _) = self.layer_geometry(mapped)?;
+                Some((
+                    mapped.surface.wl_surface().clone(),
+                    (saturating_i32(origin.x), saturating_i32(origin.y)).into(),
+                    1.0,
+                ))
+            })
+    }
+
+    fn layer_geometry(&self, mapped: &MappedLayer) -> Option<(Point, Size)> {
+        let output = self.desktop.outputs.get(&mapped.output)?;
+        let requested = with_states(mapped.surface.wl_surface(), |states| {
+            *states.cached_state.get::<LayerSurfaceCachedState>().current()
+        });
+        let width = if requested.size.w == 0 {
+            (output.logical_size.width - i64::from(requested.margin.left + requested.margin.right))
+                .max(1)
+        } else {
+            i64::from(requested.size.w)
+        };
+        let height = if requested.size.h == 0 {
+            (output.logical_size.height - i64::from(requested.margin.top + requested.margin.bottom))
+                .max(1)
+        } else {
+            i64::from(requested.size.h)
+        };
+        let x = if requested.anchor.contains(Anchor::LEFT) {
+            i64::from(requested.margin.left)
+        } else if requested.anchor.contains(Anchor::RIGHT) {
+            output.logical_size.width - width - i64::from(requested.margin.right)
+        } else {
+            (output.logical_size.width - width) / 2
+        };
+        let y = if requested.anchor.contains(Anchor::TOP) {
+            i64::from(requested.margin.top)
+        } else if requested.anchor.contains(Anchor::BOTTOM) {
+            output.logical_size.height - height - i64::from(requested.margin.bottom)
+        } else {
+            (output.logical_size.height - height) / 2
+        };
+        Some((Point::new(x, y), Size::new(width, height)))
     }
 
     pub fn update_output_size(&mut self, width: i64, height: i64) {
