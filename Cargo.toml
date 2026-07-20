@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "crates/astera-core",
+    "crates/astera-config",
+    "crates/astera-ipc",
+    "crates/astera",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+astera-core = { path = "crates/astera-core" }
+astera-config = { path = "crates/astera-config" }
+astera-ipc = { path = "crates/astera-ipc" }
+ron = "0.12"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+

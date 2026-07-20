@@ -1,0 +1,12 @@
+[package]
+name = "astera"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+astera-config.workspace = true
+astera-core.workspace = true
+astera-ipc.workspace = true
+
