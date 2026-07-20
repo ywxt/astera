@@ -19,8 +19,9 @@ use smithay::{
         },
         winit::{self, WinitEvent},
     },
+    desktop::PopupManager,
     reexports::wayland_server::{Display, ListeningSocket},
-    utils::{Rectangle, Transform},
+    utils::{Physical, Point, Rectangle, Transform},
 };
 
 use crate::ipc_server::IpcServer;
@@ -84,14 +85,34 @@ fn run_nested(config: Config) -> Result<(), Box<dyn Error>> {
             let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
                 .mapped_windows()
                 .flat_map(|(surface, location, scale)| {
-                    render_elements_from_surface_tree(
+                    let mut elements = Vec::new();
+                    for (popup, popup_offset) in
+                        PopupManager::popups_for_surface(surface.wl_surface())
+                    {
+                        let geometry = popup.geometry();
+                        let offset: Point<i32, Physical> = (
+                            ((popup_offset.x - geometry.loc.x) as f64 * scale).round() as i32,
+                            ((popup_offset.y - geometry.loc.y) as f64 * scale).round() as i32,
+                        )
+                            .into();
+                        elements.extend(render_elements_from_surface_tree(
+                            renderer,
+                            popup.wl_surface(),
+                            location + offset,
+                            scale,
+                            1.0,
+                            Kind::Unspecified,
+                        ));
+                    }
+                    elements.extend(render_elements_from_surface_tree(
                         renderer,
                         surface.wl_surface(),
                         location,
                         scale,
                         1.0,
                         Kind::Unspecified,
-                    )
+                    ));
+                    elements
                 })
                 .collect();
 
@@ -103,6 +124,9 @@ fn run_nested(config: Config) -> Result<(), Box<dyn Error>> {
             let frame_time = started.elapsed().as_millis() as u32;
             for (surface, _, _) in state.mapped_windows() {
                 send_frames_surface_tree(surface.wl_surface(), frame_time);
+                for (popup, _) in PopupManager::popups_for_surface(surface.wl_surface()) {
+                    send_frames_surface_tree(popup.wl_surface(), frame_time);
+                }
             }
             display.flush_clients()?;
         }

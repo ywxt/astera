@@ -17,10 +17,13 @@ use smithay::{
         winit::WinitInput,
     },
     delegate_compositor, delegate_data_device, delegate_seat, delegate_shm, delegate_xdg_shell,
+    desktop::{
+        PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, find_popup_root_surface,
+    },
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::{FilterResult, ModifiersState, keysyms},
-        pointer::{ButtonEvent, MotionEvent, PointerHandle},
+        pointer::{ButtonEvent, Focus as PointerFocusMode, MotionEvent, PointerHandle},
     },
     reexports::wayland_server::{
         Client, DisplayHandle,
@@ -70,7 +73,8 @@ pub struct Astera {
     shm_state: ShmState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
-    _seat: Seat<Self>,
+    popup_manager: PopupManager,
+    seat: Seat<Self>,
     keyboard: smithay::input::keyboard::KeyboardHandle<Self>,
     pointer: PointerHandle<Self>,
     desktop: Desktop,
@@ -124,7 +128,8 @@ impl Astera {
             shm_state,
             seat_state,
             data_device_state,
-            _seat: seat,
+            popup_manager: PopupManager::default(),
+            seat,
             keyboard,
             pointer,
             desktop,
@@ -211,24 +216,40 @@ impl Astera {
         SmithayPoint<f64, smithay::utils::Logical>,
         WindowId,
     )> {
-        self.windows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, mapped)| {
-                let (origin, size, scale, mode) = self.visual_geometry(mapped.id)?;
-                let width = size.width as f64 * scale;
-                let height = size.height as f64 * scale;
-                let inside = location.x >= origin.x as f64
-                    && location.x < origin.x as f64 + width
-                    && location.y >= origin.y as f64
-                    && location.y < origin.y as f64 + height;
-                inside.then_some((
-                    (mode_layer(mode), index),
+        let mut candidates = Vec::new();
+        for (index, mapped) in self.windows.iter().enumerate() {
+            let Some((origin, size, scale, mode)) = self.visual_geometry(mapped.id) else {
+                continue;
+            };
+            if point_inside(location, origin, size, scale) {
+                candidates.push((
+                    (mode_layer(mode), index, 0usize),
                     mapped.surface.wl_surface().clone(),
                     (origin.x as f64, origin.y as f64).into(),
                     mapped.id,
-                ))
-            })
+                ));
+            }
+            for (popup_index, (popup, popup_offset)) in
+                PopupManager::popups_for_surface(mapped.surface.wl_surface()).enumerate()
+            {
+                let geometry = popup.geometry();
+                let popup_origin = Point::new(
+                    origin.x + ((popup_offset.x - geometry.loc.x) as f64 * scale).round() as i64,
+                    origin.y + ((popup_offset.y - geometry.loc.y) as f64 * scale).round() as i64,
+                );
+                let popup_size = Size::new(i64::from(geometry.size.w), i64::from(geometry.size.h));
+                if point_inside(location, popup_origin, popup_size, scale) {
+                    candidates.push((
+                        (mode_layer(mode), index, popup_index + 1),
+                        popup.wl_surface().clone(),
+                        (popup_origin.x as f64, popup_origin.y as f64).into(),
+                        mapped.id,
+                    ));
+                }
+            }
+        }
+        candidates
+            .into_iter()
             .max_by_key(|(order, _, _, _)| *order)
             .map(|(_, surface, origin, id)| (surface, origin, id))
     }
@@ -501,6 +522,7 @@ impl Astera {
     }
 
     pub fn remove_dead_windows(&mut self) {
+        self.popup_manager.cleanup();
         let dead: Vec<_> = self
             .windows
             .iter()
@@ -736,6 +758,18 @@ fn mode_layer(mode: WindowMode) -> u8 {
     }
 }
 
+fn point_inside(
+    point: SmithayPoint<f64, smithay::utils::Logical>,
+    origin: Point,
+    size: Size,
+    scale: f64,
+) -> bool {
+    point.x >= origin.x as f64
+        && point.x < origin.x as f64 + size.width as f64 * scale
+        && point.y >= origin.y as f64
+        && point.y < origin.y as f64 + size.height as f64 * scale
+}
+
 fn saturating_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
@@ -758,6 +792,7 @@ impl CompositorHandler for Astera {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        self.popup_manager.commit(surface);
     }
 }
 
@@ -808,16 +843,54 @@ impl XdgShellHandler for Astera {
         self.sync_keyboard_focus();
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        surface.with_pending_state(|state| {
+            state.positioner = positioner;
+            state.geometry = positioner.get_geometry();
+        });
+        if let Err(error) = self.popup_manager.track_popup(surface.clone().into()) {
+            tracing::warn!(%error, "could not track xdg popup");
+            return;
+        }
+        if let Err(error) = surface.send_configure() {
+            tracing::warn!(%error, "could not configure xdg popup");
+        }
+    }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
+    fn grab(&mut self, surface: PopupSurface, _seat: wl_seat::WlSeat, serial: Serial) {
+        let popup = PopupKind::from(surface);
+        let Ok(root) = find_popup_root_surface(&popup) else {
+            return;
+        };
+        let seat = self.seat.clone();
+        let Ok(grab) = self
+            .popup_manager
+            .grab_popup::<Self>(root, popup, &seat, serial)
+        else {
+            return;
+        };
+        let keyboard = self.keyboard.clone();
+        keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        let pointer = self.pointer.clone();
+        pointer.set_grab(
+            self,
+            PopupPointerGrab::new(&grab),
+            serial,
+            PointerFocusMode::Keep,
+        );
+    }
 
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
+        surface.with_pending_state(|state| {
+            state.positioner = positioner;
+            state.geometry = positioner.get_geometry();
+        });
+        surface.send_repositioned(token);
     }
 }
 

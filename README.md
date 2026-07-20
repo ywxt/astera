@@ -67,5 +67,7 @@ the world camera. Workspace swaps restore focus and xdg activation on the output
 that receives the workspace.
 
 This backend is an integration milestone rather than a complete desktop:
-configurable binding files, animation, popups, layer shell and DRM/KMS are still
-to be implemented.
+configurable binding files, animation, layer shell and DRM/KMS are still to be
+implemented. XDG popups are tracked as children of their toplevel, rendered and
+hit-tested with the parent transform, receive frame callbacks, and support nested
+keyboard/pointer grabs and reactive repositioning.
