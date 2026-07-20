@@ -231,7 +231,7 @@ impl Astera {
     ) -> Option<(
         WlSurface,
         SmithayPoint<f64, smithay::utils::Logical>,
-        WindowId,
+        Option<WindowId>,
     )> {
         let mut candidates = Vec::new();
         for (index, mapped) in self.windows.iter().enumerate() {
@@ -243,7 +243,7 @@ impl Astera {
                     (mode_layer(mode), index, 0usize),
                     mapped.surface.wl_surface().clone(),
                     (origin.x as f64, origin.y as f64).into(),
-                    mapped.id,
+                    Some(mapped.id),
                 ));
             }
             for (popup_index, (popup, popup_offset)) in
@@ -260,7 +260,42 @@ impl Astera {
                         (mode_layer(mode), index, popup_index + 1),
                         popup.wl_surface().clone(),
                         (popup_origin.x as f64, popup_origin.y as f64).into(),
-                        mapped.id,
+                        Some(mapped.id),
+                    ));
+                }
+            }
+        }
+        for (index, mapped) in self.layers.iter().enumerate() {
+            if mapped.output != self.active_output {
+                continue;
+            }
+            let Some((origin, size)) = self.layer_geometry(mapped) else {
+                continue;
+            };
+            let order = layer_rank(mapped.layer);
+            if point_inside(location, origin, size, 1.0) {
+                candidates.push((
+                    (order, index, 0),
+                    mapped.surface.wl_surface().clone(),
+                    (origin.x as f64, origin.y as f64).into(),
+                    None,
+                ));
+            }
+            for (popup_index, (popup, popup_offset)) in
+                PopupManager::popups_for_surface(mapped.surface.wl_surface()).enumerate()
+            {
+                let geometry = popup.geometry();
+                let popup_origin = Point::new(
+                    origin.x + i64::from(popup_offset.x - geometry.loc.x),
+                    origin.y + i64::from(popup_offset.y - geometry.loc.y),
+                );
+                let popup_size = Size::new(i64::from(geometry.size.w), i64::from(geometry.size.h));
+                if point_inside(location, popup_origin, popup_size, 1.0) {
+                    candidates.push((
+                        (order, index, popup_index + 1),
+                        popup.wl_surface().clone(),
+                        (popup_origin.x as f64, popup_origin.y as f64).into(),
+                        None,
                     ));
                 }
             }
@@ -325,11 +360,17 @@ impl Astera {
         }
 
         if state == BackendButtonState::Pressed {
-            if let Some((_surface, _, window)) = self.surface_under(self.pointer_location) {
-                if self.desktop.find_window(window).is_ok() {
-                    let _ = self.desktop.focus_window(window);
+            if let Some((surface, _, window)) = self.surface_under(self.pointer_location) {
+                if let Some(window) = window {
+                    if self.desktop.find_window(window).is_ok() {
+                        let _ = self.desktop.focus_window(window);
+                    }
+                    self.sync_keyboard_focus();
+                } else if self.layer_accepts_keyboard(&surface) {
+                    let keyboard = self.keyboard.clone();
+                    let serial = self.next_serial();
+                    keyboard.set_focus(self, Some(surface), serial);
                 }
-                self.sync_keyboard_focus();
             }
         }
         let pointer = self.pointer.clone();
@@ -348,6 +389,9 @@ impl Astera {
 
     fn begin_drag(&mut self) {
         let Some((_surface, origin, window)) = self.surface_under(self.pointer_location) else {
+            return;
+        };
+        let Some(window) = window else {
             return;
         };
         let Some((_, _, _, mode)) = self.visual_geometry(window) else {
@@ -375,6 +419,21 @@ impl Astera {
         });
         let _ = self.desktop.focus_window(window);
         self.sync_keyboard_focus();
+    }
+
+    fn layer_accepts_keyboard(&self, surface: &WlSurface) -> bool {
+        self.layers.iter().any(|mapped| {
+            if mapped.surface.wl_surface() != surface {
+                return false;
+            }
+            let state = with_states(surface, |states| {
+                *states
+                    .cached_state
+                    .get::<LayerSurfaceCachedState>()
+                    .current()
+            });
+            state.keyboard_interactivity != KeyboardInteractivity::None
+        })
     }
 
     fn update_drag(&mut self, location: SmithayPoint<f64, smithay::utils::Logical>) {
@@ -895,9 +954,18 @@ fn map_desktop_error(error: astera_core::DesktopError) -> (ErrorCode, String) {
 
 fn mode_layer(mode: WindowMode) -> u8 {
     match mode {
-        WindowMode::Tiled => 0,
-        WindowMode::Floating => 1,
-        WindowMode::Fullscreen => 2,
+        WindowMode::Tiled => 2,
+        WindowMode::Floating => 3,
+        WindowMode::Fullscreen => 5,
+    }
+}
+
+fn layer_rank(layer: Layer) -> u8 {
+    match layer {
+        Layer::Background => 0,
+        Layer::Bottom => 1,
+        Layer::Top => 4,
+        Layer::Overlay => 6,
     }
 }
 
