@@ -822,27 +822,57 @@ impl Astera {
     pub fn update_output_size(&mut self, width: i64, height: i64) {
         let size = Size::new(width, height);
         if self.desktop.outputs[&self.active_output].logical_size != size {
-            let _ = self.desktop.resize_output(self.active_output, size);
-            let mode = Mode {
-                size: (saturating_i32(width), saturating_i32(height)).into(),
-                refresh: 60_000,
-            };
-            let scale = self.active_scale();
-            let runtime = self
-                .output_runtime
-                .get(&self.active_output)
-                .expect("desktop output has a Wayland runtime");
-            runtime.wayland.change_current_state(
-                Some(mode),
-                None,
-                Some(Scale::Fractional(scale)),
-                None,
-            );
-            runtime.wayland.set_preferred(mode);
-            self.configure_fullscreen_windows();
-            self.configure_layer_surfaces();
-            self.refresh_visible_scales();
+            let current = self.desktop.outputs[&self.active_output].clone();
+            if let Err(error) = self.configure_output(
+                self.active_output,
+                size,
+                size,
+                current.native_scale,
+                current.transform,
+            ) {
+                tracing::error!(%error, "could not resize nested output");
+            }
         }
+    }
+
+    pub fn configure_output(
+        &mut self,
+        output: OutputId,
+        physical_size: Size,
+        logical_size: Size,
+        native_scale: astera_core::Scale120,
+        transform: OutputTransform,
+    ) -> Result<(), astera_core::DesktopError> {
+        self.desktop.configure_output(
+            output,
+            physical_size,
+            logical_size,
+            native_scale,
+            transform,
+        )?;
+        let mode = Mode {
+            size: (
+                saturating_i32(physical_size.width),
+                saturating_i32(physical_size.height),
+            )
+                .into(),
+            refresh: 60_000,
+        };
+        let runtime = self
+            .output_runtime
+            .get(&output)
+            .expect("desktop output has a Wayland runtime");
+        runtime.wayland.change_current_state(
+            Some(mode),
+            Some(output_transform(transform)),
+            Some(Scale::Fractional(native_scale.0 as f64 / 120.0)),
+            None,
+        );
+        runtime.wayland.set_preferred(mode);
+        self.configure_fullscreen_windows();
+        self.configure_layer_surfaces();
+        self.refresh_visible_scales();
+        Ok(())
     }
 
     fn active_scale(&self) -> f64 {
@@ -1491,6 +1521,10 @@ mod tests {
         second.transform = OutputTransform::Rotate90;
 
         state.connect_output(second).unwrap();
+        let runtime = &state.output_runtime[&OutputId(1)].wayland;
+        assert_eq!(runtime.current_mode().unwrap().size, (3840, 2160).into());
+        assert_eq!(runtime.current_scale().fractional_scale(), 1.5);
+        assert_eq!(runtime.current_transform(), smithay::utils::Transform::_90);
         state
             .desktop
             .apply(WorkspaceTransaction::Bind {
@@ -1507,5 +1541,40 @@ mod tests {
             state.desktop.outputs[&OutputId(1)].current_workspace,
             Some(WorkspaceId(1))
         );
+    }
+
+    #[test]
+    fn output_reconfigure_preserves_camera_and_updates_protocol_state() {
+        let display = Display::<Astera>::new().unwrap();
+        let mut state = Astera::new(&display.handle(), Config::default());
+        state
+            .desktop
+            .workspaces
+            .get_mut(&WorkspaceId(0))
+            .unwrap()
+            .camera
+            .center = Point::new(740, -320);
+
+        state
+            .configure_output(
+                OutputId(0),
+                Size::new(3000, 2000),
+                Size::new(2000, 1333),
+                Scale120(180),
+                OutputTransform::Rotate180,
+            )
+            .unwrap();
+
+        let output = &state.desktop.outputs[&OutputId(0)];
+        assert_eq!(output.physical_size, Size::new(3000, 2000));
+        assert_eq!(output.logical_size, Size::new(2000, 1333));
+        assert_eq!(
+            state.desktop.workspaces[&WorkspaceId(0)].camera.center,
+            Point::new(740, -320)
+        );
+        let runtime = &state.output_runtime[&OutputId(0)].wayland;
+        assert_eq!(runtime.current_mode().unwrap().size, (3000, 2000).into());
+        assert_eq!(runtime.current_scale().fractional_scale(), 1.5);
+        assert_eq!(runtime.current_transform(), smithay::utils::Transform::_180);
     }
 }
