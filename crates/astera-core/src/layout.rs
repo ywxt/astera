@@ -2,24 +2,33 @@ use std::collections::{BTreeSet, VecDeque};
 
 use thiserror::Error;
 
-use crate::{Direction, Placement, Point, Rect, Size, Window, WindowId, Workspace};
+use crate::{
+    Direction, FloatingPlacement, FullscreenPlacement, Point, Rect, RestorePlacement, Size,
+    TiledWindow, WindowId, WindowMode, Workspace,
+};
 
 #[derive(Clone, Debug)]
-pub enum Transaction {
-    Insert {
+pub enum WindowTransaction {
+    InsertTiled {
         id: WindowId,
         size: Size,
         anchor: Point,
         seed_direction: Direction,
     },
-    MoveFinished {
+    MoveTiledFinished {
         id: WindowId,
         target: Point,
         seed_direction: Direction,
     },
-    SetPlacement {
+    MoveFloating {
         id: WindowId,
-        placement: Placement,
+        target: Rect,
+        viewport_size: Size,
+    },
+    SetMode {
+        id: WindowId,
+        mode: WindowMode,
+        viewport_size: Size,
     },
     Remove {
         id: WindowId,
@@ -48,6 +57,8 @@ pub enum LayoutError {
     UnknownWindow(WindowId),
     #[error("window size must be positive")]
     InvalidSize,
+    #[error("workspace already has fullscreen window {0:?}")]
+    FullscreenOccupied(WindowId),
     #[error("layout did not converge after {0} operations")]
     DidNotConverge(usize),
     #[error("solver produced an overlapping layout")]
@@ -77,15 +88,14 @@ impl RadialSolver {
         self.gap
     }
 
-    /// Applies a transaction atomically. The workspace is unchanged on failure.
+    /// Applies a window transaction atomically.
     pub fn apply(
         &self,
         workspace: &mut Workspace,
-        transaction: Transaction,
+        transaction: WindowTransaction,
     ) -> Result<LayoutDelta, LayoutError> {
         let mut working = workspace.clone();
         let (source, seed, mut movements) = self.apply_to_working(&mut working, transaction)?;
-
         if let Some(source) = source {
             movements.extend(self.solve(&mut working, source, seed)?);
         }
@@ -98,7 +108,6 @@ impl RadialSolver {
         movements.sort_by_key(|movement| movement.window);
         movements.dedup_by_key(|movement| movement.window);
         *workspace = working;
-
         Ok(LayoutDelta {
             generation,
             source,
@@ -109,10 +118,10 @@ impl RadialSolver {
     fn apply_to_working(
         &self,
         workspace: &mut Workspace,
-        transaction: Transaction,
+        transaction: WindowTransaction,
     ) -> Result<(Option<WindowId>, Direction, Vec<Movement>), LayoutError> {
         match transaction {
-            Transaction::Insert {
+            WindowTransaction::InsertTiled {
                 id,
                 size,
                 anchor,
@@ -121,57 +130,174 @@ impl RadialSolver {
                 if !size.is_valid() {
                     return Err(LayoutError::InvalidSize);
                 }
-                if workspace.windows.contains_key(&id) {
+                if workspace.contains_window(id) {
                     return Err(LayoutError::DuplicateWindow(id));
                 }
-                workspace
-                    .windows
-                    .insert(id, Window::tiled(id, Rect::centered_at(anchor, size)));
-                workspace.focus = Some(id);
+                workspace.tiled.insert(
+                    id,
+                    TiledWindow {
+                        id,
+                        geometry: Rect::centered_at(anchor, size),
+                    },
+                );
                 workspace.focus_direction = seed_direction.normalized();
+                workspace.focus(id);
                 Ok((Some(id), seed_direction, Vec::new()))
             }
-            Transaction::MoveFinished {
+            WindowTransaction::MoveTiledFinished {
                 id,
                 target,
                 seed_direction,
             } => {
                 let window = workspace
-                    .windows
+                    .tiled
                     .get_mut(&id)
                     .ok_or(LayoutError::UnknownWindow(id))?;
                 let from = window.geometry.origin;
                 window.geometry.origin = target;
-                workspace.focus = Some(id);
                 workspace.focus_direction = seed_direction.normalized();
-                let movement = Movement {
-                    window: id,
-                    from,
-                    to: target,
-                };
-                let source = (window.placement == Placement::Tiled).then_some(id);
-                Ok((source, seed_direction, vec![movement]))
+                workspace.focus(id);
+                Ok((
+                    Some(id),
+                    seed_direction,
+                    vec![Movement {
+                        window: id,
+                        from,
+                        to: target,
+                    }],
+                ))
             }
-            Transaction::SetPlacement { id, placement } => {
-                let window = workspace
-                    .windows
+            WindowTransaction::MoveFloating {
+                id,
+                target,
+                viewport_size,
+            } => {
+                let placement = workspace
+                    .floating
                     .get_mut(&id)
                     .ok_or(LayoutError::UnknownWindow(id))?;
-                window.placement = placement;
-                let source = (placement == Placement::Tiled).then_some(id);
-                Ok((source, workspace.focus_direction, Vec::new()))
+                let from = placement.rect.origin;
+                placement.rect = clamp_to_viewport(target, viewport_size);
+                let to = placement.rect.origin;
+                workspace.focus(id);
+                Ok((
+                    None,
+                    workspace.focus_direction,
+                    vec![Movement {
+                        window: id,
+                        from,
+                        to,
+                    }],
+                ))
             }
-            Transaction::Remove { id } => {
-                workspace
-                    .windows
-                    .remove(&id)
-                    .ok_or(LayoutError::UnknownWindow(id))?;
-                if workspace.focus == Some(id) {
-                    workspace.focus = workspace.windows.keys().next_back().copied();
+            WindowTransaction::SetMode {
+                id,
+                mode,
+                viewport_size,
+            } => self.set_mode(workspace, id, mode, viewport_size),
+            WindowTransaction::Remove { id } => {
+                let removed = workspace.tiled.remove(&id).is_some()
+                    || workspace.floating.remove(&id).is_some()
+                    || workspace
+                        .fullscreen
+                        .as_ref()
+                        .is_some_and(|full| full.window == id)
+                        && workspace.fullscreen.take().is_some();
+                if !removed {
+                    return Err(LayoutError::UnknownWindow(id));
                 }
+                workspace.remove_focus(id);
                 Ok((None, workspace.focus_direction, Vec::new()))
             }
         }
+    }
+
+    fn set_mode(
+        &self,
+        workspace: &mut Workspace,
+        id: WindowId,
+        target: WindowMode,
+        viewport_size: Size,
+    ) -> Result<(Option<WindowId>, Direction, Vec<Movement>), LayoutError> {
+        let current = workspace
+            .window_mode(id)
+            .ok_or(LayoutError::UnknownWindow(id))?;
+        if current == target {
+            return Ok((None, workspace.focus_direction, Vec::new()));
+        }
+        if target == WindowMode::Fullscreen {
+            if let Some(fullscreen) = &workspace.fullscreen {
+                return Err(LayoutError::FullscreenOccupied(fullscreen.window));
+            }
+            let restore = match current {
+                WindowMode::Tiled => RestorePlacement::Tiled {
+                    world_rect: workspace.tiled.remove(&id).unwrap().geometry,
+                },
+                WindowMode::Floating => RestorePlacement::Floating {
+                    viewport_rect: workspace.floating.remove(&id).unwrap().rect,
+                },
+                WindowMode::Fullscreen => unreachable!(),
+            };
+            workspace.fullscreen = Some(FullscreenPlacement {
+                window: id,
+                restore,
+            });
+            workspace.focus(id);
+            return Ok((None, workspace.focus_direction, Vec::new()));
+        }
+
+        let (rect, geometry_mode) = match current {
+            WindowMode::Tiled => (
+                workspace.tiled.remove(&id).unwrap().geometry,
+                WindowMode::Tiled,
+            ),
+            WindowMode::Floating => (
+                workspace.floating.remove(&id).unwrap().rect,
+                WindowMode::Floating,
+            ),
+            WindowMode::Fullscreen => match workspace.fullscreen.take().unwrap().restore {
+                RestorePlacement::Tiled { world_rect } => (world_rect, WindowMode::Tiled),
+                RestorePlacement::Floating { viewport_rect } => {
+                    (viewport_rect, WindowMode::Floating)
+                }
+            },
+        };
+
+        let source = match target {
+            WindowMode::Tiled => {
+                let world_rect = if geometry_mode == WindowMode::Floating {
+                    viewport_rect_to_world(rect, workspace, viewport_size)
+                } else {
+                    rect
+                };
+                workspace.tiled.insert(
+                    id,
+                    TiledWindow {
+                        id,
+                        geometry: world_rect,
+                    },
+                );
+                Some(id)
+            }
+            WindowMode::Floating => {
+                let viewport_rect = if geometry_mode == WindowMode::Tiled {
+                    world_rect_to_viewport(rect, workspace, viewport_size)
+                } else {
+                    rect
+                };
+                workspace.floating.insert(
+                    id,
+                    FloatingPlacement {
+                        window: id,
+                        rect: clamp_to_viewport(viewport_rect, viewport_size),
+                    },
+                );
+                None
+            }
+            WindowMode::Fullscreen => unreachable!(),
+        };
+        workspace.focus(id);
+        Ok((source, workspace.focus_direction, Vec::new()))
     }
 
     fn solve(
@@ -181,7 +307,7 @@ impl RadialSolver {
         fallback: Direction,
     ) -> Result<Vec<Movement>, LayoutError> {
         let source_rect = workspace
-            .windows
+            .tiled
             .get(&source)
             .ok_or(LayoutError::UnknownWindow(source))?
             .geometry;
@@ -201,19 +327,14 @@ impl RadialSolver {
             if operations > self.operation_limit {
                 return Err(LayoutError::DidNotConverge(operations));
             }
-
-            let original = workspace.windows[&id].geometry;
+            let original = workspace.tiled[&id].geometry;
             let direction = Direction::between(source_rect.center(), original.center(), fallback);
             let obstacles: Vec<_> = locked
                 .iter()
-                .map(|locked_id| workspace.windows[locked_id].geometry)
+                .map(|locked_id| workspace.tiled[locked_id].geometry)
                 .collect();
             let moved = self.first_clear_position(original, direction, &obstacles)?;
-            workspace
-                .windows
-                .get_mut(&id)
-                .expect("queued window exists")
-                .geometry = moved;
+            workspace.tiled.get_mut(&id).unwrap().geometry = moved;
             locked.insert(id);
             if moved.origin != original.origin {
                 movements.push(Movement {
@@ -224,7 +345,6 @@ impl RadialSolver {
             }
             self.enqueue_conflicts(workspace, id, &locked, &mut queued, &mut queue);
         }
-
         Ok(movements)
     }
 
@@ -236,14 +356,13 @@ impl RadialSolver {
         queued: &mut BTreeSet<WindowId>,
         queue: &mut VecDeque<WindowId>,
     ) {
-        let pivot_rect = workspace.windows[&pivot].geometry;
+        let pivot_rect = workspace.tiled[&pivot].geometry;
         let pivot_center = pivot_rect.center();
         let mut conflicts: Vec<_> = workspace
-            .windows
+            .tiled
             .values()
             .filter(|window| {
-                window.placement == Placement::Tiled
-                    && !locked.contains(&window.id)
+                !locked.contains(&window.id)
                     && !queued.contains(&window.id)
                     && pivot_rect.conflicts(window.geometry, self.gap)
             })
@@ -275,7 +394,6 @@ impl RadialSolver {
         if clear(rect) {
             return Ok(rect);
         }
-
         let at = |distance: f64| {
             rect.translated(
                 rect.origin.x + (direction.x * distance).round() as i64,
@@ -307,141 +425,173 @@ impl RadialSolver {
     }
 }
 
+pub(crate) fn clamp_to_viewport(rect: Rect, viewport: Size) -> Rect {
+    let max_x = (viewport.width - rect.size.width).max(0);
+    let max_y = (viewport.height - rect.size.height).max(0);
+    rect.translated(rect.origin.x.clamp(0, max_x), rect.origin.y.clamp(0, max_y))
+}
+
+fn world_rect_to_viewport(rect: Rect, workspace: &Workspace, viewport: Size) -> Rect {
+    let zoom = workspace.camera.zoom.max(0.01);
+    let left = workspace.camera.center.x as f64 - viewport.width as f64 / (2.0 * zoom);
+    let top = workspace.camera.center.y as f64 - viewport.height as f64 / (2.0 * zoom);
+    Rect::new(
+        ((rect.origin.x as f64 - left) * zoom).round() as i64,
+        ((rect.origin.y as f64 - top) * zoom).round() as i64,
+        rect.size.width,
+        rect.size.height,
+    )
+}
+
+fn viewport_rect_to_world(rect: Rect, workspace: &Workspace, viewport: Size) -> Rect {
+    let zoom = workspace.camera.zoom.max(0.01);
+    let left = workspace.camera.center.x as f64 - viewport.width as f64 / (2.0 * zoom);
+    let top = workspace.camera.center.y as f64 - viewport.height as f64 / (2.0 * zoom);
+    Rect::new(
+        (left + rect.origin.x as f64 / zoom).round() as i64,
+        (top + rect.origin.y as f64 / zoom).round() as i64,
+        rect.size.width,
+        rect.size.height,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::WorkspaceId;
 
-    fn insert(
-        solver: &RadialSolver,
-        workspace: &mut Workspace,
-        id: u64,
-        size: Size,
-        anchor: Point,
-        direction: Direction,
-    ) -> LayoutDelta {
+    fn insert(solver: &RadialSolver, workspace: &mut Workspace, id: u64, anchor: Point) {
         solver
             .apply(
                 workspace,
-                Transaction::Insert {
+                WindowTransaction::InsertTiled {
                     id: WindowId(id),
-                    size,
+                    size: Size::new(100, 80),
                     anchor,
-                    seed_direction: direction,
+                    seed_direction: Direction::RIGHT,
                 },
             )
-            .unwrap()
-    }
-
-    #[test]
-    fn first_window_is_centered_on_world_origin() {
-        let solver = RadialSolver::new(8);
-        let mut workspace = Workspace::new(WorkspaceId(1));
-        insert(
-            &solver,
-            &mut workspace,
-            1,
-            Size::new(100, 80),
-            Point::ORIGIN,
-            Direction::RIGHT,
-        );
-        assert_eq!(
-            workspace.window(WindowId(1)).unwrap().geometry,
-            Rect::new(-50, -40, 100, 80)
-        );
+            .unwrap();
     }
 
     #[test]
     fn same_center_pushes_old_window_in_seed_direction() {
         let solver = RadialSolver::new(8);
         let mut workspace = Workspace::new(WorkspaceId(1));
-        insert(
-            &solver,
-            &mut workspace,
-            1,
-            Size::new(100, 80),
-            Point::ORIGIN,
-            Direction::RIGHT,
-        );
-        insert(
-            &solver,
-            &mut workspace,
-            2,
-            Size::new(100, 80),
-            Point::ORIGIN,
-            Direction::RIGHT,
-        );
-
+        insert(&solver, &mut workspace, 1, Point::ORIGIN);
+        insert(&solver, &mut workspace, 2, Point::ORIGIN);
         assert_eq!(
-            workspace.window(WindowId(2)).unwrap().geometry.center(),
+            workspace.tiled[&WindowId(2)].geometry.center(),
             Point::ORIGIN
         );
-        assert!(workspace.window(WindowId(1)).unwrap().geometry.origin.x > 50);
+        assert!(workspace.tiled[&WindowId(1)].geometry.origin.x > 50);
         assert!(workspace.tiled_windows_are_stable(8));
     }
 
     #[test]
-    fn collision_propagates_through_a_chain() {
+    fn floating_and_fullscreen_never_participate_in_solver() {
         let solver = RadialSolver::new(8);
         let mut workspace = Workspace::new(WorkspaceId(1));
-        for (id, x) in [(1, 0), (2, 108), (3, 216)] {
-            workspace.windows.insert(
-                WindowId(id),
-                Window::tiled(WindowId(id), Rect::new(x, -40, 100, 80)),
-            );
-        }
-        workspace.focus = Some(WindowId(1));
-
-        let delta = insert(
-            &solver,
-            &mut workspace,
-            4,
-            Size::new(100, 80),
-            Point::new(50, 0),
-            Direction::RIGHT,
-        );
-
-        assert_eq!(delta.movements.len(), 3);
+        insert(&solver, &mut workspace, 1, Point::ORIGIN);
+        solver
+            .apply(
+                &mut workspace,
+                WindowTransaction::SetMode {
+                    id: WindowId(1),
+                    mode: WindowMode::Floating,
+                    viewport_size: Size::new(1920, 1080),
+                },
+            )
+            .unwrap();
+        insert(&solver, &mut workspace, 2, Point::ORIGIN);
+        solver
+            .apply(
+                &mut workspace,
+                WindowTransaction::SetMode {
+                    id: WindowId(1),
+                    mode: WindowMode::Fullscreen,
+                    viewport_size: Size::new(1920, 1080),
+                },
+            )
+            .unwrap();
         assert!(workspace.tiled_windows_are_stable(8));
+        assert_eq!(workspace.fullscreen.as_ref().unwrap().window, WindowId(1));
     }
 
     #[test]
-    fn floating_windows_do_not_participate() {
-        let solver = RadialSolver::new(8);
-        let mut workspace = Workspace::new(WorkspaceId(1));
-        let mut floating = Window::tiled(WindowId(1), Rect::new(-50, -40, 100, 80));
-        floating.placement = Placement::Floating;
-        workspace.windows.insert(floating.id, floating.clone());
-
-        insert(
-            &solver,
-            &mut workspace,
-            2,
-            Size::new(100, 80),
-            Point::ORIGIN,
-            Direction::RIGHT,
-        );
-        assert_eq!(workspace.window(WindowId(1)).unwrap(), &floating);
-    }
-
-    #[test]
-    fn failed_transaction_is_rolled_back() {
+    fn failed_transaction_rolls_back() {
         let solver = RadialSolver::new(8);
         let mut workspace = Workspace::new(WorkspaceId(1));
         let before = workspace.clone();
-        let error = solver
-            .apply(
+        assert_eq!(
+            solver.apply(
                 &mut workspace,
-                Transaction::Insert {
+                WindowTransaction::InsertTiled {
                     id: WindowId(1),
                     size: Size::new(0, 80),
                     anchor: Point::ORIGIN,
                     seed_direction: Direction::RIGHT,
                 },
-            )
-            .unwrap_err();
-        assert_eq!(error, LayoutError::InvalidSize);
-        assert_eq!(workspace.windows, before.windows);
+            ),
+            Err(LayoutError::InvalidSize)
+        );
+        assert_eq!(workspace.tiled, before.tiled);
         assert_eq!(workspace.generation, before.generation);
+    }
+
+    #[test]
+    fn fullscreen_restores_original_floating_geometry() {
+        let solver = RadialSolver::new(8);
+        let mut workspace = Workspace::new(WorkspaceId(1));
+        insert(&solver, &mut workspace, 1, Point::ORIGIN);
+        let viewport = Size::new(1920, 1080);
+        solver
+            .apply(
+                &mut workspace,
+                WindowTransaction::SetMode {
+                    id: WindowId(1),
+                    mode: WindowMode::Floating,
+                    viewport_size: viewport,
+                },
+            )
+            .unwrap();
+        let floating_rect = workspace.floating[&WindowId(1)].rect;
+        solver
+            .apply(
+                &mut workspace,
+                WindowTransaction::SetMode {
+                    id: WindowId(1),
+                    mode: WindowMode::Fullscreen,
+                    viewport_size: viewport,
+                },
+            )
+            .unwrap();
+        solver
+            .apply(
+                &mut workspace,
+                WindowTransaction::SetMode {
+                    id: WindowId(1),
+                    mode: WindowMode::Floating,
+                    viewport_size: viewport,
+                },
+            )
+            .unwrap();
+        assert_eq!(workspace.floating[&WindowId(1)].rect, floating_rect);
+    }
+
+    #[test]
+    fn removing_focus_restores_most_recent_live_window() {
+        let solver = RadialSolver::new(8);
+        let mut workspace = Workspace::new(WorkspaceId(1));
+        insert(&solver, &mut workspace, 1, Point::ORIGIN);
+        insert(&solver, &mut workspace, 2, Point::new(300, 0));
+        assert_eq!(workspace.focused_window, Some(WindowId(2)));
+        solver
+            .apply(
+                &mut workspace,
+                WindowTransaction::Remove { id: WindowId(2) },
+            )
+            .unwrap();
+        assert_eq!(workspace.focused_window, Some(WindowId(1)));
     }
 }

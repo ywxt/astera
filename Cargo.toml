@@ -20,4 +20,7 @@ astera-ipc = { path = "crates/astera-ipc" }
 ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-
+smithay = { version = "0.7", default-features = false, features = ["backend_winit", "desktop", "renderer_gl", "renderer_pixman", "wayland_frontend"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+winit = { version = "0.30", default-features = false, features = ["wayland", "x11", "rwh_06"] }
