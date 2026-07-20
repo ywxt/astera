@@ -1139,14 +1139,22 @@ impl WlrLayerShellHandler for Astera {
     fn new_layer_surface(
         &mut self,
         surface: LayerSurface,
-        _output: Option<WlOutput>,
+        output: Option<WlOutput>,
         layer: Layer,
         _namespace: String,
     ) {
+        let output = output
+            .as_ref()
+            .and_then(|requested| {
+                self.output_runtime
+                    .iter()
+                    .find_map(|(id, runtime)| runtime.wayland.owns(requested).then_some(*id))
+            })
+            .unwrap_or(self.active_output);
         self.layers.push(MappedLayer {
             surface: surface.clone(),
             layer,
-            output: self.active_output,
+            output,
         });
         self.configure_layer_surface(&surface);
         self.refresh_visible_scales();
