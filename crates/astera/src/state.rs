@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, os::fd::OwnedFd};
 
 use astera_config::Config;
 use astera_core::{
-    Desktop, Output, OutputId, Point, Size, WindowId, WindowMode, WindowTransaction, Workspace,
-    WorkspaceId, WorkspaceTransaction,
+    Desktop, Output, OutputId, OutputTransform, Point, Size, WindowId, WindowMode,
+    WindowTransaction, Workspace, WorkspaceId, WorkspaceTransaction,
 };
 use astera_ipc::{Command, DesktopSnapshot, ErrorCode, Response};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -29,7 +29,7 @@ use smithay::{
     output::{Mode, Output as SmithayOutput, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::{
         Client, DisplayHandle,
-        backend::{ClientData, ClientId, DisconnectReason},
+        backend::{ClientData, ClientId, DisconnectReason, GlobalId},
         protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
     },
     utils::{Physical, Point as SmithayPoint, Serial},
@@ -88,10 +88,12 @@ struct MappedLayer {
 #[derive(Debug)]
 struct OutputRuntime {
     wayland: SmithayOutput,
+    global: GlobalId,
     entered_surfaces: Vec<WlSurface>,
 }
 
 pub struct Astera {
+    display: DisplayHandle,
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
     layer_shell_state: WlrLayerShellState,
@@ -133,7 +135,7 @@ impl Astera {
                 model: "Nested Output".into(),
             },
         );
-        wayland_output.create_global::<Self>(display);
+        let output_global = wayland_output.create_global::<Self>(display);
         let initial_mode = Mode {
             size: (1, 1).into(),
             refresh: 60_000,
@@ -178,6 +180,7 @@ impl Astera {
             .expect("initial workspace can bind");
 
         Self {
+            display: display.clone(),
             compositor_state,
             xdg_shell_state,
             layer_shell_state,
@@ -188,6 +191,7 @@ impl Astera {
                 active_output,
                 OutputRuntime {
                     wayland: wayland_output,
+                    global: output_global,
                     entered_surfaces: Vec::new(),
                 },
             )]),
@@ -207,6 +211,68 @@ impl Astera {
             drag: None,
             serial: 1,
         }
+    }
+
+    #[allow(dead_code)] // Used by the native backend's hotplug path.
+    pub fn connect_output(&mut self, output: Output) -> Result<(), astera_core::DesktopError> {
+        self.desktop.connect_output(output.clone())?;
+        let wayland = SmithayOutput::new(
+            output.stable_key.clone(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "Astera".into(),
+                model: output.stable_key.clone(),
+            },
+        );
+        let global = wayland.create_global::<Self>(&self.display);
+        let mode = Mode {
+            size: (
+                saturating_i32(output.physical_size.width),
+                saturating_i32(output.physical_size.height),
+            )
+                .into(),
+            refresh: 60_000,
+        };
+        wayland.change_current_state(
+            Some(mode),
+            Some(output_transform(output.transform)),
+            Some(Scale::Fractional(output.native_scale.0 as f64 / 120.0)),
+            Some((0, 0).into()),
+        );
+        wayland.set_preferred(mode);
+        self.output_runtime.insert(
+            output.id,
+            OutputRuntime {
+                wayland,
+                global,
+                entered_surfaces: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Used by the native backend's hotplug path.
+    pub fn disconnect_output(&mut self, output: OutputId) -> Result<(), astera_core::DesktopError> {
+        let event = self.desktop.disconnect_output(output)?;
+        let runtime = self
+            .output_runtime
+            .remove(&output)
+            .expect("desktop output has a Wayland runtime");
+        for surface in runtime.entered_surfaces {
+            runtime.wayland.leave(&surface);
+        }
+        self.display.disable_global::<Self>(runtime.global);
+        self.layers.retain(|mapped| mapped.output != output);
+        if self.active_output == output {
+            if let Some(next) = self.desktop.outputs.keys().next().copied() {
+                self.active_output = next;
+            }
+        }
+        tracing::info!(?output, ?event, "output disconnected");
+        self.refresh_visible_scales();
+        self.sync_keyboard_focus();
+        Ok(())
     }
 
     pub fn process_input(&mut self, event: InputEvent<WinitInput>) {
@@ -357,13 +423,24 @@ impl Astera {
     }
 
     fn visual_geometry(&self, id: WindowId) -> Option<(Point, Size, f64, WindowMode)> {
-        let output = self.desktop.outputs.get(&self.active_output)?;
-        let workspace = self.desktop.workspace_for_output(self.active_output)?;
+        self.visual_geometry_for_output(self.active_output, id)
+    }
+
+    fn visual_geometry_for_output(
+        &self,
+        output_id: OutputId,
+        id: WindowId,
+    ) -> Option<(Point, Size, f64, WindowMode)> {
+        let output = self.desktop.outputs.get(&output_id)?;
+        let workspace = self.desktop.workspace_for_output(output_id)?;
         let mode = workspace.window_mode(id)?;
         match mode {
             WindowMode::Tiled => {
                 let mut rect = workspace.tiled[&id].geometry;
-                if let Some(drag) = self.drag.filter(|drag| drag.window == id) {
+                if let Some(drag) = self
+                    .drag
+                    .filter(|drag| drag.window == id && output_id == self.active_output)
+                {
                     rect.origin = drag.target;
                 }
                 let zoom = workspace.camera.zoom.max(0.01);
@@ -383,7 +460,10 @@ impl Astera {
             }
             WindowMode::Floating => {
                 let mut rect = workspace.floating[&id].rect;
-                if let Some(drag) = self.drag.filter(|drag| drag.window == id) {
+                if let Some(drag) = self
+                    .drag
+                    .filter(|drag| drag.window == id && output_id == self.active_output)
+                {
                     rect.origin = drag.target;
                 }
                 Some((rect.origin, rect.size, 1.0, mode))
@@ -617,14 +697,16 @@ impl Astera {
         true
     }
 
-    pub fn mapped_windows(
+    fn mapped_windows_for_output(
         &self,
+        output: OutputId,
     ) -> impl Iterator<Item = (&ToplevelSurface, SmithayPoint<i32, Physical>, f64)> {
         let mut instances: Vec<_> = self
             .windows
             .iter()
             .filter_map(|mapped| {
-                let (origin, _, scale, mode) = self.visual_geometry(mapped.id)?;
+                let (origin, _, scale, mode) =
+                    self.visual_geometry_for_output(output, mapped.id)?;
                 let layer = mode_layer(mode);
                 Some((layer, &mapped.surface, origin, scale))
             })
@@ -640,50 +722,56 @@ impl Astera {
     }
 
     pub fn render_roots(&self) -> Vec<(WlSurface, SmithayPoint<i32, Physical>, f64)> {
+        self.render_roots_for_output(self.active_output)
+    }
+
+    pub fn render_roots_for_output(
+        &self,
+        output: OutputId,
+    ) -> Vec<(WlSurface, SmithayPoint<i32, Physical>, f64)> {
         let mut roots = Vec::new();
-        roots.extend(self.layer_roots(Layer::Overlay));
+        roots.extend(self.layer_roots(output, Layer::Overlay));
         roots.extend(
-            self.mapped_windows()
+            self.mapped_windows_for_output(output)
                 .filter(|(surface, _, _)| {
-                    self.window_mode_for_surface(surface.wl_surface())
+                    self.window_mode_for_surface(output, surface.wl_surface())
                         == Some(WindowMode::Fullscreen)
                 })
                 .map(|(surface, location, scale)| (surface.wl_surface().clone(), location, scale)),
         );
-        roots.extend(self.layer_roots(Layer::Top));
+        roots.extend(self.layer_roots(output, Layer::Top));
         roots.extend(
-            self.mapped_windows()
+            self.mapped_windows_for_output(output)
                 .filter(|(surface, _, _)| {
                     matches!(
-                        self.window_mode_for_surface(surface.wl_surface()),
+                        self.window_mode_for_surface(output, surface.wl_surface()),
                         Some(WindowMode::Floating | WindowMode::Tiled)
                     )
                 })
                 .map(|(surface, location, scale)| (surface.wl_surface().clone(), location, scale)),
         );
-        roots.extend(self.layer_roots(Layer::Bottom));
-        roots.extend(self.layer_roots(Layer::Background));
+        roots.extend(self.layer_roots(output, Layer::Bottom));
+        roots.extend(self.layer_roots(output, Layer::Background));
         roots
     }
 
-    fn window_mode_for_surface(&self, surface: &WlSurface) -> Option<WindowMode> {
+    fn window_mode_for_surface(&self, output: OutputId, surface: &WlSurface) -> Option<WindowMode> {
         let id = self
             .windows
             .iter()
             .find(|mapped| mapped.surface.wl_surface() == surface)?
             .id;
-        self.desktop
-            .workspace_for_output(self.active_output)?
-            .window_mode(id)
+        self.desktop.workspace_for_output(output)?.window_mode(id)
     }
 
     fn layer_roots(
         &self,
+        output: OutputId,
         wanted: Layer,
     ) -> impl Iterator<Item = (WlSurface, SmithayPoint<i32, Physical>, f64)> + '_ {
         self.layers
             .iter()
-            .filter(move |mapped| mapped.output == self.active_output && mapped.layer == wanted)
+            .filter(move |mapped| mapped.output == output && mapped.layer == wanted)
             .filter_map(|mapped| {
                 let (origin, _) = self.layer_geometry(mapped)?;
                 Some((
@@ -758,36 +846,50 @@ impl Astera {
     }
 
     fn active_scale(&self) -> f64 {
-        self.desktop.outputs[&self.active_output].native_scale.0 as f64 / 120.0
+        self.output_scale(self.active_output)
+    }
+
+    fn output_scale(&self, output: OutputId) -> f64 {
+        self.desktop.outputs[&output].native_scale.0 as f64 / 120.0
     }
 
     fn refresh_visible_scales(&mut self) {
-        let scale = self.active_scale();
-        let visible: Vec<_> = self
-            .render_roots()
-            .into_iter()
-            .map(|(surface, _, _)| surface)
-            .collect();
-        let runtime = self
+        let scenes: BTreeMap<_, _> = self
             .output_runtime
-            .get_mut(&self.active_output)
-            .expect("desktop output has a Wayland runtime");
-        for surface in &runtime.entered_surfaces {
-            if !visible.contains(surface) {
-                runtime.wayland.leave(surface);
+            .keys()
+            .copied()
+            .map(|output| {
+                let scale = self.output_scale(output);
+                let visible = self
+                    .render_roots_for_output(output)
+                    .into_iter()
+                    .map(|(surface, _, _)| surface)
+                    .collect::<Vec<_>>();
+                (output, (scale, visible))
+            })
+            .collect();
+        for (output, (scale, visible)) in scenes {
+            let runtime = self
+                .output_runtime
+                .get_mut(&output)
+                .expect("scene output has a Wayland runtime");
+            for surface in &runtime.entered_surfaces {
+                if !visible.contains(surface) {
+                    runtime.wayland.leave(surface);
+                }
             }
-        }
-        for surface in &visible {
-            if !runtime.entered_surfaces.contains(surface) {
-                runtime.wayland.enter(surface);
-            }
-            with_states(surface, |states| {
-                with_fractional_scale(states, |fractional| {
-                    fractional.set_preferred_scale(scale);
+            for surface in &visible {
+                if !runtime.entered_surfaces.contains(surface) {
+                    runtime.wayland.enter(surface);
+                }
+                with_states(surface, |states| {
+                    with_fractional_scale(states, |fractional| {
+                        fractional.set_preferred_scale(scale);
+                    });
                 });
-            });
+            }
+            runtime.entered_surfaces = visible;
         }
-        runtime.entered_surfaces = visible;
     }
 
     pub fn remove_dead_windows(&mut self) {
@@ -1068,6 +1170,16 @@ fn layer_rank(layer: Layer) -> u8 {
         Layer::Bottom => 1,
         Layer::Top => 4,
         Layer::Overlay => 6,
+    }
+}
+
+fn output_transform(transform: OutputTransform) -> smithay::utils::Transform {
+    match transform {
+        OutputTransform::Normal => smithay::utils::Transform::Normal,
+        OutputTransform::Rotate90 => smithay::utils::Transform::_90,
+        OutputTransform::Rotate180 => smithay::utils::Transform::_180,
+        OutputTransform::Rotate270 => smithay::utils::Transform::_270,
+        OutputTransform::Flipped => smithay::utils::Transform::Flipped,
     }
 }
 
@@ -1361,3 +1473,39 @@ delegate_compositor!(Astera);
 delegate_shm!(Astera);
 delegate_seat!(Astera);
 delegate_data_device!(Astera);
+
+#[cfg(test)]
+mod tests {
+    use astera_core::{Scale120, WorkspaceTransaction};
+    use smithay::reexports::wayland_server::Display;
+
+    use super::*;
+
+    #[test]
+    fn hotplug_keeps_disconnected_workspace_in_background() {
+        let display = Display::<Astera>::new().unwrap();
+        let mut state = Astera::new(&display.handle(), Config::default());
+        let mut second = Output::new(OutputId(1), "test-output-2", Size::new(2560, 1440));
+        second.physical_size = Size::new(3840, 2160);
+        second.native_scale = Scale120(180);
+        second.transform = OutputTransform::Rotate90;
+
+        state.connect_output(second).unwrap();
+        state
+            .desktop
+            .apply(WorkspaceTransaction::Bind {
+                workspace: WorkspaceId(1),
+                output: OutputId(1),
+            })
+            .unwrap();
+        state.disconnect_output(OutputId(0)).unwrap();
+
+        assert_eq!(state.active_output, OutputId(1));
+        assert!(!state.output_runtime.contains_key(&OutputId(0)));
+        assert_eq!(state.desktop.workspaces[&WorkspaceId(0)].bound_output, None);
+        assert_eq!(
+            state.desktop.outputs[&OutputId(1)].current_workspace,
+            Some(WorkspaceId(1))
+        );
+    }
+}
