@@ -9,12 +9,15 @@ use astera_ipc::{Command, DesktopSnapshot, ErrorCode, Response};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::{
     backend::{
-        input::{InputEvent, KeyboardKeyEvent},
+        input::{InputEvent, KeyState, KeyboardKeyEvent},
         renderer::utils::on_commit_buffer_handler,
         winit::WinitInput,
     },
     delegate_compositor, delegate_data_device, delegate_seat, delegate_shm, delegate_xdg_shell,
-    input::{Seat, SeatHandler, SeatState, keyboard::FilterResult},
+    input::{
+        Seat, SeatHandler, SeatState,
+        keyboard::{FilterResult, ModifiersState, keysyms},
+    },
     reexports::wayland_server::{
         Client, DisplayHandle,
         backend::{ClientData, ClientId, DisconnectReason},
@@ -114,6 +117,7 @@ impl Astera {
 
     pub fn process_input(&mut self, event: InputEvent<WinitInput>) {
         if let InputEvent::Keyboard { event } = event {
+            let pressed = event.state() == KeyState::Pressed;
             let keyboard = self.keyboard.clone();
             keyboard.input::<(), _>(
                 self,
@@ -121,9 +125,86 @@ impl Astera {
                 event.state(),
                 0.into(),
                 0,
-                |_, _, _| FilterResult::Forward,
+                move |state, modifiers, key| {
+                    let symbol = key
+                        .raw_latin_sym_or_raw_current_sym()
+                        .map(|symbol| symbol.raw());
+                    if symbol
+                        .is_some_and(|symbol| state.handle_shortcut(modifiers, symbol, pressed))
+                    {
+                        FilterResult::Intercept(())
+                    } else {
+                        FilterResult::Forward
+                    }
+                },
             );
         }
+    }
+
+    fn handle_shortcut(&mut self, modifiers: &ModifiersState, symbol: u32, pressed: bool) -> bool {
+        if !modifiers.logo {
+            return false;
+        }
+        let workspace_id = self.desktop.outputs[&self.active_output].current_workspace;
+        let focused_window =
+            workspace_id.and_then(|workspace| self.desktop.workspaces[&workspace].focused_window);
+        let command = if (keysyms::KEY_1..=keysyms::KEY_9).contains(&symbol) {
+            let target = WorkspaceId(symbol - keysyms::KEY_1);
+            if modifiers.shift {
+                focused_window.map(|window| Command::SendWindowToWorkspace { window, target })
+            } else {
+                Some(Command::BindWorkspace {
+                    workspace: target,
+                    output: self.active_output,
+                })
+            }
+        } else {
+            match symbol {
+                keysyms::KEY_space => focused_window.and_then(|window| {
+                    let workspace = self.desktop.find_window(window).ok()?;
+                    let mode = match self.desktop.workspaces[&workspace].window_mode(window)? {
+                        WindowMode::Tiled | WindowMode::Fullscreen => WindowMode::Floating,
+                        WindowMode::Floating => WindowMode::Tiled,
+                    };
+                    Some(Command::SetWindowMode { window, mode })
+                }),
+                keysyms::KEY_f => focused_window.and_then(|window| {
+                    let workspace = self.desktop.find_window(window).ok()?;
+                    let state = &self.desktop.workspaces[&workspace];
+                    let mode = match state.window_mode(window)? {
+                        WindowMode::Fullscreen => match &state.fullscreen.as_ref()?.restore {
+                            astera_core::RestorePlacement::Tiled { .. } => WindowMode::Tiled,
+                            astera_core::RestorePlacement::Floating { .. } => WindowMode::Floating,
+                        },
+                        WindowMode::Tiled | WindowMode::Floating => WindowMode::Fullscreen,
+                    };
+                    Some(Command::SetWindowMode { window, mode })
+                }),
+                keysyms::KEY_Left | keysyms::KEY_Right | keysyms::KEY_Up | keysyms::KEY_Down => {
+                    workspace_id.map(|workspace| {
+                        let step = 160;
+                        let (dx, dy) = match symbol {
+                            keysyms::KEY_Left => (-step, 0),
+                            keysyms::KEY_Right => (step, 0),
+                            keysyms::KEY_Up => (0, -step),
+                            keysyms::KEY_Down => (0, step),
+                            _ => unreachable!(),
+                        };
+                        Command::PanCamera { workspace, dx, dy }
+                    })
+                }
+                _ => None,
+            }
+        };
+        let Some(command) = command else {
+            return false;
+        };
+        if pressed {
+            if let Response::Error { code, message } = self.execute_command(command) {
+                tracing::warn!(?code, %message, "shortcut command failed");
+            }
+        }
+        true
     }
 
     pub fn mapped_windows(

@@ -40,6 +40,15 @@ half) and returns a RON-encoded `Response<DesktopSnapshot>`. Protocol v2 exposes
 output focus, workspace bind/swap, window transfer, mode changes and camera
 commands. `GetState` reports both visible and background workspaces.
 
+Default nested-backend bindings use the logo/Super modifier:
+
+- `Super+1` through `Super+9`: show that workspace on the active output, swapping
+  with the workspace already there;
+- `Super+Shift+1` through `Super+Shift+9`: send the focused window;
+- `Super+Space`: toggle tiled/floating;
+- `Super+F`: enter fullscreen or restore the previous mode;
+- `Super+Arrow`: pan the current workspace camera by 160 logical units.
+
 This backend is an integration milestone rather than a complete desktop: pointer
-focus, configurable keyboard bindings, animation, popups, layer shell and DRM/KMS
-are still to be implemented.
+focus, configurable binding files, animation, popups, layer shell and DRM/KMS are
+still to be implemented.
