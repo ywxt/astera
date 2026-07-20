@@ -287,17 +287,11 @@ impl Astera {
         }
 
         if state == BackendButtonState::Pressed {
-            if let Some((surface, _, window)) = self.surface_under(self.pointer_location) {
-                if let Ok(workspace) = self.desktop.find_window(window) {
-                    self.desktop
-                        .workspaces
-                        .get_mut(&workspace)
-                        .unwrap()
-                        .focus(window);
+            if let Some((_surface, _, window)) = self.surface_under(self.pointer_location) {
+                if self.desktop.find_window(window).is_ok() {
+                    let _ = self.desktop.focus_window(window);
                 }
-                let keyboard = self.keyboard.clone();
-                let serial = self.next_serial();
-                keyboard.set_focus(self, Some(surface), serial);
+                self.sync_keyboard_focus();
             }
         }
         let pointer = self.pointer.clone();
@@ -315,7 +309,7 @@ impl Astera {
     }
 
     fn begin_drag(&mut self) {
-        let Some((surface, origin, window)) = self.surface_under(self.pointer_location) else {
+        let Some((_surface, origin, window)) = self.surface_under(self.pointer_location) else {
             return;
         };
         let Some((_, _, _, mode)) = self.visual_geometry(window) else {
@@ -341,14 +335,8 @@ impl Astera {
             target: start,
             start,
         });
-        self.desktop
-            .workspaces
-            .get_mut(&workspace_id)
-            .unwrap()
-            .focus(window);
-        let keyboard = self.keyboard.clone();
-        let serial = self.next_serial();
-        keyboard.set_focus(self, Some(surface), serial);
+        let _ = self.desktop.focus_window(window);
+        self.sync_keyboard_focus();
     }
 
     fn update_drag(&mut self, location: SmithayPoint<f64, smithay::utils::Logical>) {
@@ -540,6 +528,7 @@ impl Astera {
                     self.configure_window_mode(window, mode);
                 }
                 self.configure_fullscreen_windows();
+                self.sync_keyboard_focus();
                 Response::Ok(
                     DesktopSnapshot::from(&self.desktop)
                         .with_active_output(Some(self.active_output)),
@@ -598,6 +587,33 @@ impl Astera {
             });
             mapped.surface.send_pending_configure();
         }
+    }
+
+    fn sync_keyboard_focus(&mut self) {
+        let focused = self
+            .desktop
+            .workspace_for_output(self.active_output)
+            .and_then(|workspace| workspace.focused_window);
+        let target = focused.and_then(|id| {
+            self.windows
+                .iter()
+                .find(|mapped| mapped.id == id)
+                .map(|mapped| mapped.surface.wl_surface().clone())
+        });
+        for mapped in &self.windows {
+            let activated = Some(mapped.surface.wl_surface()) == target.as_ref();
+            mapped.surface.with_pending_state(|state| {
+                if activated {
+                    state.states.set(xdg_toplevel::State::Activated);
+                } else {
+                    state.states.unset(xdg_toplevel::State::Activated);
+                }
+            });
+            mapped.surface.send_pending_configure();
+        }
+        let keyboard = self.keyboard.clone();
+        let serial = self.next_serial();
+        keyboard.set_focus(self, target, serial);
     }
 
     fn execute_command_inner(&mut self, command: Command) -> Result<(), (ErrorCode, String)> {
@@ -674,11 +690,9 @@ impl Astera {
             Command::FocusWindow(window) => {
                 let workspace_id = self
                     .desktop
-                    .find_window(window)
+                    .focus_window(window)
                     .map_err(map_desktop_error)?;
-                let workspace = self.desktop.workspaces.get_mut(&workspace_id).unwrap();
-                workspace.focus(window);
-                if let Some(output) = workspace.bound_output {
+                if let Some(output) = self.desktop.workspaces[&workspace_id].bound_output {
                     self.active_output = output;
                 }
                 Ok(())
@@ -790,9 +804,8 @@ impl XdgShellHandler for Astera {
             state.states.set(xdg_toplevel::State::Activated);
         });
         surface.send_configure();
-        let keyboard = self.keyboard.clone();
-        keyboard.set_focus(self, Some(surface.wl_surface().clone()), 0.into());
         self.windows.push(MappedWindow { id, surface });
+        self.sync_keyboard_focus();
     }
 
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}

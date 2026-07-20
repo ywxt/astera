@@ -59,6 +59,13 @@ Pointer behavior:
 - floating movement is clamped to the current viewport; fullscreen windows cannot
   be dragged.
 
+Camera policy is stored by the workspace and follows it between outputs.
+`Centered` places the focused tiled window at the viewport center;
+`KeepVisible` performs only the minimum pan required to keep the complete window
+inside the configured margin. Focusing floating or fullscreen content never moves
+the world camera. Workspace swaps restore focus and xdg activation on the output
+that receives the workspace.
+
 This backend is an integration milestone rather than a complete desktop:
 configurable binding files, animation, popups, layer shell and DRM/KMS are still
 to be implemented.

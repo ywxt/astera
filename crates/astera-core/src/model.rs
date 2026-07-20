@@ -161,6 +161,58 @@ impl Workspace {
         }
     }
 
+    /// Moves the camera according to its policy so the focused tiled window is visible.
+    /// Floating and fullscreen windows are viewport-local and never move the camera.
+    pub fn follow_focus(&mut self, viewport_size: Size) -> bool {
+        let Some(focused) = self.focused_window else {
+            return false;
+        };
+        let Some(rect) = self.tiled.get(&focused).map(|window| window.geometry) else {
+            return false;
+        };
+        let old_center = self.camera.center;
+        match self.camera.policy {
+            CameraPolicy::Centered => self.camera.center = rect.center(),
+            CameraPolicy::KeepVisible { margin } => {
+                let zoom = self.camera.zoom.max(0.01);
+                let half_width = viewport_size.width as f64 / (2.0 * zoom);
+                let half_height = viewport_size.height as f64 / (2.0 * zoom);
+                let margin = margin.max(0) as f64 / zoom;
+                let available_width = (half_width * 2.0 - margin * 2.0).max(0.0);
+                let available_height = (half_height * 2.0 - margin * 2.0).max(0.0);
+                if rect.size.width as f64 > available_width {
+                    self.camera.center.x = rect.center().x;
+                } else {
+                    let left = self.camera.center.x as f64 - half_width + margin;
+                    let right = self.camera.center.x as f64 + half_width - margin;
+                    if (rect.origin.x as f64) < left {
+                        self.camera.center.x =
+                            (rect.origin.x as f64 - margin + half_width).round() as i64;
+                    } else if (rect.origin.x + rect.size.width) as f64 > right {
+                        self.camera.center.x =
+                            (rect.origin.x as f64 + rect.size.width as f64 + margin - half_width)
+                                .round() as i64;
+                    }
+                }
+                if rect.size.height as f64 > available_height {
+                    self.camera.center.y = rect.center().y;
+                } else {
+                    let top = self.camera.center.y as f64 - half_height + margin;
+                    let bottom = self.camera.center.y as f64 + half_height - margin;
+                    if (rect.origin.y as f64) < top {
+                        self.camera.center.y =
+                            (rect.origin.y as f64 - margin + half_height).round() as i64;
+                    } else if (rect.origin.y + rect.size.height) as f64 > bottom {
+                        self.camera.center.y =
+                            (rect.origin.y as f64 + rect.size.height as f64 + margin - half_height)
+                                .round() as i64;
+                    }
+                }
+            }
+        }
+        self.camera.center != old_center
+    }
+
     pub fn tiled_windows_are_stable(&self, gap: i64) -> bool {
         let tiled: Vec<_> = self.tiled.values().collect();
         tiled.iter().enumerate().all(|(index, window)| {

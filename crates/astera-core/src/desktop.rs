@@ -144,11 +144,20 @@ impl Desktop {
         transaction: WindowTransaction,
     ) -> Result<(), DesktopError> {
         let mut working = self.clone();
+        let viewport_size = working
+            .workspaces
+            .get(&workspace)
+            .and_then(|workspace| workspace.bound_output)
+            .and_then(|output| working.outputs.get(&output))
+            .map(|output| output.logical_size);
         let workspace = working
             .workspaces
             .get_mut(&workspace)
             .ok_or(DesktopError::UnknownWorkspace(workspace))?;
         working.solver.apply(workspace, transaction)?;
+        if let Some(viewport_size) = viewport_size {
+            workspace.follow_focus(viewport_size);
+        }
         working.validate()?;
         *self = working;
         Ok(())
@@ -230,6 +239,20 @@ impl Desktop {
             }
         }
         found.ok_or(DesktopError::UnknownWindow(window))
+    }
+
+    pub fn focus_window(&mut self, window: WindowId) -> Result<WorkspaceId, DesktopError> {
+        let mut working = self.clone();
+        let workspace_id = working.find_window(window)?;
+        let viewport_size = working.workspace_viewport_size(workspace_id);
+        let workspace = working.workspaces.get_mut(&workspace_id).unwrap();
+        workspace.focus(window);
+        if let Some(viewport_size) = viewport_size {
+            workspace.follow_focus(viewport_size);
+        }
+        working.validate()?;
+        *self = working;
+        Ok(workspace_id)
     }
 
     fn apply_working(
@@ -449,6 +472,12 @@ impl Desktop {
                 target_workspace.focus(window);
                 target_workspace.generation = target_workspace.generation.wrapping_add(1);
             }
+        }
+        if let Some(viewport_size) = self.workspace_viewport_size(target) {
+            self.workspaces
+                .get_mut(&target)
+                .unwrap()
+                .follow_focus(viewport_size);
         }
         Ok(DesktopEvent::WindowSent {
             window,
@@ -786,5 +815,41 @@ mod tests {
             workspace.tiled[&WindowId(4)].geometry,
             Rect::new(50, 60, 800, 600)
         );
+    }
+
+    #[test]
+    fn centered_policy_moves_camera_to_focused_tiled_window() {
+        let mut desktop = desktop();
+        let workspace = desktop.workspaces.get_mut(&WorkspaceId(1)).unwrap();
+        workspace.camera.policy = crate::CameraPolicy::Centered;
+        workspace.tiled.insert(
+            WindowId(5),
+            TiledWindow {
+                id: WindowId(5),
+                geometry: Rect::new(1000, -400, 200, 100),
+            },
+        );
+        desktop.focus_window(WindowId(5)).unwrap();
+        assert_eq!(
+            desktop.workspaces[&WorkspaceId(1)].camera.center,
+            Point::new(1100, -350)
+        );
+    }
+
+    #[test]
+    fn keep_visible_policy_only_moves_camera_by_required_distance() {
+        let mut desktop = desktop();
+        let workspace = desktop.workspaces.get_mut(&WorkspaceId(1)).unwrap();
+        workspace.camera.policy = crate::CameraPolicy::KeepVisible { margin: 32 };
+        workspace.tiled.insert(
+            WindowId(6),
+            TiledWindow {
+                id: WindowId(6),
+                geometry: Rect::new(950, 0, 200, 100),
+            },
+        );
+        desktop.focus_window(WindowId(6)).unwrap();
+        assert_eq!(desktop.workspaces[&WorkspaceId(1)].camera.center.x, 222);
+        assert_eq!(desktop.workspaces[&WorkspaceId(1)].camera.center.y, 0);
     }
 }
