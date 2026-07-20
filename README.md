@@ -66,8 +66,19 @@ inside the configured margin. Focusing floating or fullscreen content never move
 the world camera. Workspace swaps restore focus and xdg activation on the output
 that receives the workspace.
 
-This backend is an integration milestone rather than a complete desktop:
-configurable binding files, animation, layer shell and DRM/KMS are still to be
-implemented. XDG popups are tracked as children of their toplevel, rendered and
-hit-tested with the parent transform, receive frame callbacks, and support nested
-keyboard/pointer grabs and reactive repositioning.
+XDG popups are tracked as children of their parent, rendered and hit-tested with
+the parent transform, receive frame callbacks, and support nested keyboard and
+pointer grabs. The compositor also implements wlr-layer-shell: background,
+bottom, top and overlay surfaces remain output-local, while fullscreen windows
+sit below overlay and above top-layer content. Exclusive layer surfaces take
+keyboard focus; `OnDemand` surfaces can take it on click.
+
+The nested output advertises `wl_output`, xdg-output, viewporter and fractional
+scale protocols. Only surfaces in the workspace currently owned by that output
+receive output-enter and preferred-scale events; background workspaces receive
+neither. This preserves the single-output ownership invariant and avoids asking
+one surface to satisfy two output scales simultaneously.
+
+This backend remains an integration milestone rather than a complete desktop.
+Configurable binding files, animation and the native DRM/KMS multi-output backend
+are still to be implemented.
