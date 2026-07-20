@@ -68,6 +68,7 @@ pub enum LayoutError {
 #[derive(Clone, Debug)]
 pub struct RadialSolver {
     gap: i64,
+    snap_distance: i64,
     operation_limit: usize,
 }
 
@@ -75,12 +76,18 @@ impl RadialSolver {
     pub fn new(gap: i64) -> Self {
         Self {
             gap: gap.max(0),
+            snap_distance: 24,
             operation_limit: 16_384,
         }
     }
 
     pub fn with_operation_limit(mut self, limit: usize) -> Self {
         self.operation_limit = limit.max(1);
+        self
+    }
+
+    pub fn with_snap_distance(mut self, distance: i64) -> Self {
+        self.snap_distance = distance.max(0);
         self
     }
 
@@ -149,12 +156,23 @@ impl RadialSolver {
                 target,
                 seed_direction,
             } => {
-                let window = workspace
+                let size = workspace
                     .tiled
-                    .get_mut(&id)
-                    .ok_or(LayoutError::UnknownWindow(id))?;
+                    .get(&id)
+                    .ok_or(LayoutError::UnknownWindow(id))?
+                    .geometry
+                    .size;
+                let target = self.snap_target(
+                    workspace,
+                    id,
+                    Rect {
+                        origin: target,
+                        size,
+                    },
+                );
+                let window = workspace.tiled.get_mut(&id).unwrap();
                 let from = window.geometry.origin;
-                window.geometry.origin = target;
+                window.geometry = target;
                 workspace.focus_direction = seed_direction.normalized();
                 workspace.focus(id);
                 Ok((
@@ -163,7 +181,7 @@ impl RadialSolver {
                     vec![Movement {
                         window: id,
                         from,
-                        to: target,
+                        to: target.origin,
                     }],
                 ))
             }
@@ -210,6 +228,47 @@ impl RadialSolver {
                 Ok((None, workspace.focus_direction, Vec::new()))
             }
         }
+    }
+
+    fn snap_target(&self, workspace: &Workspace, id: WindowId, rect: Rect) -> Rect {
+        let mut best_x: Option<(i64, WindowId, i64)> = None;
+        let mut best_y: Option<(i64, WindowId, i64)> = None;
+        for other in workspace.tiled.values().filter(|other| other.id != id) {
+            let vertical_overlap = rect.origin.y
+                < other.geometry.origin.y + other.geometry.size.height
+                && rect.origin.y + rect.size.height > other.geometry.origin.y;
+            if vertical_overlap {
+                for candidate in [
+                    other.geometry.origin.x - rect.size.width - self.gap,
+                    other.geometry.origin.x + other.geometry.size.width + self.gap,
+                ] {
+                    let distance = (candidate - rect.origin.x).abs();
+                    let value = (distance, other.id, candidate);
+                    if distance <= self.snap_distance && best_x.is_none_or(|best| value < best) {
+                        best_x = Some(value);
+                    }
+                }
+            }
+            let horizontal_overlap = rect.origin.x
+                < other.geometry.origin.x + other.geometry.size.width
+                && rect.origin.x + rect.size.width > other.geometry.origin.x;
+            if horizontal_overlap {
+                for candidate in [
+                    other.geometry.origin.y - rect.size.height - self.gap,
+                    other.geometry.origin.y + other.geometry.size.height + self.gap,
+                ] {
+                    let distance = (candidate - rect.origin.y).abs();
+                    let value = (distance, other.id, candidate);
+                    if distance <= self.snap_distance && best_y.is_none_or(|best| value < best) {
+                        best_y = Some(value);
+                    }
+                }
+            }
+        }
+        rect.translated(
+            best_x.map_or(rect.origin.x, |(_, _, value)| value),
+            best_y.map_or(rect.origin.y, |(_, _, value)| value),
+        )
     }
 
     fn set_mode(
@@ -593,5 +652,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(workspace.focused_window, Some(WindowId(1)));
+    }
+
+    #[test]
+    fn finished_tiled_drag_snaps_to_nearby_edge_before_solving() {
+        let solver = RadialSolver::new(8).with_snap_distance(24);
+        let mut workspace = Workspace::new(WorkspaceId(1));
+        insert(&solver, &mut workspace, 1, Point::new(50, 40));
+        insert(&solver, &mut workspace, 2, Point::new(400, 40));
+        solver
+            .apply(
+                &mut workspace,
+                WindowTransaction::MoveTiledFinished {
+                    id: WindowId(2),
+                    target: Point::new(112, 0),
+                    seed_direction: Direction::RIGHT,
+                },
+            )
+            .unwrap();
+        assert_eq!(workspace.tiled[&WindowId(2)].geometry.origin.x, 108);
+        assert!(workspace.tiled_windows_are_stable(8));
     }
 }

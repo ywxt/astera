@@ -49,6 +49,16 @@ Default nested-backend bindings use the logo/Super modifier:
 - `Super+F`: enter fullscreen or restore the previous mode;
 - `Super+Arrow`: pan the current workspace camera by 160 logical units.
 
-This backend is an integration milestone rather than a complete desktop: pointer
-focus, configurable binding files, animation, popups, layer shell and DRM/KMS are
-still to be implemented.
+Pointer behavior:
+
+- a normal left click focuses the topmost surface and is forwarded to the client;
+- `Super+Left Drag` moves tiled or floating windows without sending the drag to
+  the client;
+- tiled movement is previewed during the drag, snaps to a neighboring edge within
+  24 logical units, then runs the radial solver once on release;
+- floating movement is clamped to the current viewport; fullscreen windows cannot
+  be dragged.
+
+This backend is an integration milestone rather than a complete desktop:
+configurable binding files, animation, popups, layer shell and DRM/KMS are still
+to be implemented.

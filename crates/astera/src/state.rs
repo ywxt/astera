@@ -9,7 +9,10 @@ use astera_ipc::{Command, DesktopSnapshot, ErrorCode, Response};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::{
     backend::{
-        input::{InputEvent, KeyState, KeyboardKeyEvent},
+        input::{
+            AbsolutePositionEvent, ButtonState as BackendButtonState, Event, InputEvent, KeyState,
+            KeyboardKeyEvent, MouseButton, PointerButtonEvent,
+        },
         renderer::utils::on_commit_buffer_handler,
         winit::WinitInput,
     },
@@ -17,6 +20,7 @@ use smithay::{
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::{FilterResult, ModifiersState, keysyms},
+        pointer::{ButtonEvent, MotionEvent, PointerHandle},
     },
     reexports::wayland_server::{
         Client, DisplayHandle,
@@ -51,6 +55,15 @@ struct MappedWindow {
     surface: ToplevelSurface,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DragState {
+    window: WindowId,
+    mode: WindowMode,
+    grab_offset: (f64, f64),
+    target: Point,
+    start: Point,
+}
+
 pub struct Astera {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -59,10 +72,14 @@ pub struct Astera {
     data_device_state: DataDeviceState,
     _seat: Seat<Self>,
     keyboard: smithay::input::keyboard::KeyboardHandle<Self>,
+    pointer: PointerHandle<Self>,
     desktop: Desktop,
     active_output: OutputId,
     windows: Vec<MappedWindow>,
     next_window_id: u64,
+    pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
+    drag: Option<DragState>,
+    serial: u32,
 }
 
 impl Astera {
@@ -75,6 +92,7 @@ impl Astera {
         let keyboard = seat
             .add_keyboard(Default::default(), 200, 25)
             .expect("default keyboard map must compile");
+        let pointer = seat.add_pointer();
         let data_device_state = DataDeviceState::new::<Self>(display);
 
         let active_output = OutputId(0);
@@ -108,36 +126,293 @@ impl Astera {
             data_device_state,
             _seat: seat,
             keyboard,
+            pointer,
             desktop,
             active_output,
             windows: Vec::new(),
             next_window_id: 1,
+            pointer_location: (0.0, 0.0).into(),
+            drag: None,
+            serial: 1,
         }
     }
 
     pub fn process_input(&mut self, event: InputEvent<WinitInput>) {
-        if let InputEvent::Keyboard { event } = event {
-            let pressed = event.state() == KeyState::Pressed;
-            let keyboard = self.keyboard.clone();
-            keyboard.input::<(), _>(
-                self,
-                event.key_code(),
+        match event {
+            InputEvent::Keyboard { event } => {
+                let pressed = event.state() == KeyState::Pressed;
+                let keyboard = self.keyboard.clone();
+                let serial = self.next_serial();
+                keyboard.input::<(), _>(
+                    self,
+                    event.key_code(),
+                    event.state(),
+                    serial,
+                    event.time_msec(),
+                    move |state, modifiers, key| {
+                        let symbol = key
+                            .raw_latin_sym_or_raw_current_sym()
+                            .map(|symbol| symbol.raw());
+                        if symbol
+                            .is_some_and(|symbol| state.handle_shortcut(modifiers, symbol, pressed))
+                        {
+                            FilterResult::Intercept(())
+                        } else {
+                            FilterResult::Forward
+                        }
+                    },
+                );
+            }
+            InputEvent::PointerMotionAbsolute { event } => {
+                let size = self.desktop.outputs[&self.active_output].logical_size;
+                let location = event.position_transformed(
+                    (saturating_i32(size.width), saturating_i32(size.height)).into(),
+                );
+                self.pointer_location = location;
+                if self.drag.is_some() {
+                    self.update_drag(location);
+                } else {
+                    let focus = self.surface_under(location);
+                    let pointer = self.pointer.clone();
+                    let serial = self.next_serial();
+                    pointer.motion(
+                        self,
+                        focus.map(|(surface, origin, _)| (surface, origin)),
+                        &MotionEvent {
+                            location,
+                            serial,
+                            time: event.time_msec(),
+                        },
+                    );
+                    pointer.frame(self);
+                }
+            }
+            InputEvent::PointerButton { event } => self.handle_pointer_button(
+                event.button(),
+                event.button_code(),
                 event.state(),
-                0.into(),
-                0,
-                move |state, modifiers, key| {
-                    let symbol = key
-                        .raw_latin_sym_or_raw_current_sym()
-                        .map(|symbol| symbol.raw());
-                    if symbol
-                        .is_some_and(|symbol| state.handle_shortcut(modifiers, symbol, pressed))
-                    {
-                        FilterResult::Intercept(())
-                    } else {
-                        FilterResult::Forward
-                    }
-                },
-            );
+                event.time_msec(),
+            ),
+            _ => {}
+        }
+    }
+
+    fn next_serial(&mut self) -> Serial {
+        let serial = self.serial;
+        self.serial = self.serial.wrapping_add(1).max(1);
+        serial.into()
+    }
+
+    fn surface_under(
+        &self,
+        location: SmithayPoint<f64, smithay::utils::Logical>,
+    ) -> Option<(
+        WlSurface,
+        SmithayPoint<f64, smithay::utils::Logical>,
+        WindowId,
+    )> {
+        self.windows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, mapped)| {
+                let (origin, size, scale, mode) = self.visual_geometry(mapped.id)?;
+                let width = size.width as f64 * scale;
+                let height = size.height as f64 * scale;
+                let inside = location.x >= origin.x as f64
+                    && location.x < origin.x as f64 + width
+                    && location.y >= origin.y as f64
+                    && location.y < origin.y as f64 + height;
+                inside.then_some((
+                    (mode_layer(mode), index),
+                    mapped.surface.wl_surface().clone(),
+                    (origin.x as f64, origin.y as f64).into(),
+                    mapped.id,
+                ))
+            })
+            .max_by_key(|(order, _, _, _)| *order)
+            .map(|(_, surface, origin, id)| (surface, origin, id))
+    }
+
+    fn visual_geometry(&self, id: WindowId) -> Option<(Point, Size, f64, WindowMode)> {
+        let output = self.desktop.outputs.get(&self.active_output)?;
+        let workspace = self.desktop.workspace_for_output(self.active_output)?;
+        let mode = workspace.window_mode(id)?;
+        match mode {
+            WindowMode::Tiled => {
+                let mut rect = workspace.tiled[&id].geometry;
+                if let Some(drag) = self.drag.filter(|drag| drag.window == id) {
+                    rect.origin = drag.target;
+                }
+                let zoom = workspace.camera.zoom.max(0.01);
+                let left = workspace.camera.center.x as f64
+                    - output.logical_size.width as f64 / (2.0 * zoom);
+                let top = workspace.camera.center.y as f64
+                    - output.logical_size.height as f64 / (2.0 * zoom);
+                Some((
+                    Point::new(
+                        ((rect.origin.x as f64 - left) * zoom).round() as i64,
+                        ((rect.origin.y as f64 - top) * zoom).round() as i64,
+                    ),
+                    rect.size,
+                    zoom,
+                    mode,
+                ))
+            }
+            WindowMode::Floating => {
+                let mut rect = workspace.floating[&id].rect;
+                if let Some(drag) = self.drag.filter(|drag| drag.window == id) {
+                    rect.origin = drag.target;
+                }
+                Some((rect.origin, rect.size, 1.0, mode))
+            }
+            WindowMode::Fullscreen => Some((Point::ORIGIN, output.logical_size, 1.0, mode)),
+        }
+    }
+
+    fn handle_pointer_button(
+        &mut self,
+        button: Option<MouseButton>,
+        button_code: u32,
+        state: BackendButtonState,
+        time: u32,
+    ) {
+        let compositor_drag = button == Some(MouseButton::Left)
+            && (self.drag.is_some() || self.keyboard.modifier_state().logo);
+        if compositor_drag {
+            match state {
+                BackendButtonState::Pressed => self.begin_drag(),
+                BackendButtonState::Released => self.finish_drag(),
+            }
+            return;
+        }
+
+        if state == BackendButtonState::Pressed {
+            if let Some((surface, _, window)) = self.surface_under(self.pointer_location) {
+                if let Ok(workspace) = self.desktop.find_window(window) {
+                    self.desktop
+                        .workspaces
+                        .get_mut(&workspace)
+                        .unwrap()
+                        .focus(window);
+                }
+                let keyboard = self.keyboard.clone();
+                let serial = self.next_serial();
+                keyboard.set_focus(self, Some(surface), serial);
+            }
+        }
+        let pointer = self.pointer.clone();
+        let serial = self.next_serial();
+        pointer.button(
+            self,
+            &ButtonEvent {
+                serial,
+                time,
+                button: button_code,
+                state,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn begin_drag(&mut self) {
+        let Some((surface, origin, window)) = self.surface_under(self.pointer_location) else {
+            return;
+        };
+        let Some((_, _, _, mode)) = self.visual_geometry(window) else {
+            return;
+        };
+        if mode == WindowMode::Fullscreen {
+            return;
+        }
+        let workspace_id = self.desktop.find_window(window).unwrap();
+        let workspace = &self.desktop.workspaces[&workspace_id];
+        let start = match mode {
+            WindowMode::Tiled => workspace.tiled[&window].geometry.origin,
+            WindowMode::Floating => workspace.floating[&window].rect.origin,
+            WindowMode::Fullscreen => unreachable!(),
+        };
+        self.drag = Some(DragState {
+            window,
+            mode,
+            grab_offset: (
+                self.pointer_location.x - origin.x,
+                self.pointer_location.y - origin.y,
+            ),
+            target: start,
+            start,
+        });
+        self.desktop
+            .workspaces
+            .get_mut(&workspace_id)
+            .unwrap()
+            .focus(window);
+        let keyboard = self.keyboard.clone();
+        let serial = self.next_serial();
+        keyboard.set_focus(self, Some(surface), serial);
+    }
+
+    fn update_drag(&mut self, location: SmithayPoint<f64, smithay::utils::Logical>) {
+        let Some(mut drag) = self.drag else {
+            return;
+        };
+        let viewport_x = location.x - drag.grab_offset.0;
+        let viewport_y = location.y - drag.grab_offset.1;
+        drag.target = if drag.mode == WindowMode::Floating {
+            Point::new(viewport_x.round() as i64, viewport_y.round() as i64)
+        } else {
+            let output = &self.desktop.outputs[&self.active_output];
+            let workspace = self
+                .desktop
+                .workspace_for_output(self.active_output)
+                .unwrap();
+            let zoom = workspace.camera.zoom.max(0.01);
+            let left =
+                workspace.camera.center.x as f64 - output.logical_size.width as f64 / (2.0 * zoom);
+            let top =
+                workspace.camera.center.y as f64 - output.logical_size.height as f64 / (2.0 * zoom);
+            Point::new(
+                (left + viewport_x / zoom).round() as i64,
+                (top + viewport_y / zoom).round() as i64,
+            )
+        };
+        self.drag = Some(drag);
+    }
+
+    fn finish_drag(&mut self) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        let Ok(workspace) = self.desktop.find_window(drag.window) else {
+            return;
+        };
+        let viewport_size = self.desktop.outputs[&self.active_output].logical_size;
+        let transaction = match drag.mode {
+            WindowMode::Tiled => WindowTransaction::MoveTiledFinished {
+                id: drag.window,
+                target: drag.target,
+                seed_direction: astera_core::Direction::between(
+                    drag.start,
+                    drag.target,
+                    self.desktop.workspaces[&workspace].focus_direction,
+                ),
+            },
+            WindowMode::Floating => {
+                let size = self.desktop.workspaces[&workspace].floating[&drag.window]
+                    .rect
+                    .size;
+                WindowTransaction::MoveFloating {
+                    id: drag.window,
+                    target: astera_core::Rect {
+                        origin: drag.target,
+                        size,
+                    },
+                    viewport_size,
+                }
+            }
+            WindowMode::Fullscreen => return,
+        };
+        if let Err(error) = self.desktop.apply_window(workspace, transaction) {
+            tracing::warn!(%error, window = ?drag.window, "drag transaction failed");
         }
     }
 
@@ -210,39 +485,12 @@ impl Astera {
     pub fn mapped_windows(
         &self,
     ) -> impl Iterator<Item = (&ToplevelSurface, SmithayPoint<i32, Physical>, f64)> {
-        let output = self.desktop.outputs.get(&self.active_output);
-        let workspace = self.desktop.workspace_for_output(self.active_output);
         let mut instances: Vec<_> = self
             .windows
             .iter()
-            .filter_map(move |mapped| {
-                let output = output?;
-                let workspace = workspace?;
-                let mode = workspace.window_mode(mapped.id)?;
-                let (origin, scale) = match mode {
-                    WindowMode::Tiled => {
-                        let rect = workspace.tiled[&mapped.id].geometry;
-                        let zoom = workspace.camera.zoom.max(0.01);
-                        let left = workspace.camera.center.x as f64
-                            - output.logical_size.width as f64 / (2.0 * zoom);
-                        let top = workspace.camera.center.y as f64
-                            - output.logical_size.height as f64 / (2.0 * zoom);
-                        (
-                            Point::new(
-                                ((rect.origin.x as f64 - left) * zoom).round() as i64,
-                                ((rect.origin.y as f64 - top) * zoom).round() as i64,
-                            ),
-                            zoom,
-                        )
-                    }
-                    WindowMode::Floating => (workspace.floating[&mapped.id].rect.origin, 1.0),
-                    WindowMode::Fullscreen => (Point::ORIGIN, 1.0),
-                };
-                let layer = match mode {
-                    WindowMode::Tiled => 0,
-                    WindowMode::Floating => 1,
-                    WindowMode::Fullscreen => 2,
-                };
+            .filter_map(|mapped| {
+                let (origin, _, scale, mode) = self.visual_geometry(mapped.id)?;
+                let layer = mode_layer(mode);
                 Some((layer, &mapped.surface, origin, scale))
             })
             .collect();
@@ -464,6 +712,14 @@ fn map_desktop_error(error: astera_core::DesktopError) -> (ErrorCode, String) {
         | astera_core::DesktopError::Layout(_) => ErrorCode::Conflict,
     };
     (code, error.to_string())
+}
+
+fn mode_layer(mode: WindowMode) -> u8 {
+    match mode {
+        WindowMode::Tiled => 0,
+        WindowMode::Floating => 1,
+        WindowMode::Fullscreen => 2,
+    }
 }
 
 fn saturating_i32(value: i64) -> i32 {
