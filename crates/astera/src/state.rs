@@ -44,12 +44,12 @@ use smithay::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
             },
         },
-        shell::xdg::{
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-        },
         shell::wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerSurface, LayerSurfaceCachedState,
             WlrLayerShellHandler, WlrLayerShellState,
+        },
+        shell::xdg::{
+            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
         },
         shm::{ShmHandler, ShmState},
     },
@@ -530,16 +530,15 @@ impl Astera {
         })
     }
 
-    pub fn render_roots(
-        &self,
-    ) -> Vec<(WlSurface, SmithayPoint<i32, Physical>, f64)> {
+    pub fn render_roots(&self) -> Vec<(WlSurface, SmithayPoint<i32, Physical>, f64)> {
         let mut roots = Vec::new();
-        for layer in [Layer::Overlay] {
-            roots.extend(self.layer_roots(layer));
-        }
+        roots.extend(self.layer_roots(Layer::Overlay));
         roots.extend(
             self.mapped_windows()
-                .filter(|(surface, _, _)| self.window_mode_for_surface(surface.wl_surface()) == Some(WindowMode::Fullscreen))
+                .filter(|(surface, _, _)| {
+                    self.window_mode_for_surface(surface.wl_surface())
+                        == Some(WindowMode::Fullscreen)
+                })
                 .map(|(surface, location, scale)| (surface.wl_surface().clone(), location, scale)),
         );
         roots.extend(self.layer_roots(Layer::Top));
@@ -589,7 +588,10 @@ impl Astera {
     fn layer_geometry(&self, mapped: &MappedLayer) -> Option<(Point, Size)> {
         let output = self.desktop.outputs.get(&mapped.output)?;
         let requested = with_states(mapped.surface.wl_surface(), |states| {
-            *states.cached_state.get::<LayerSurfaceCachedState>().current()
+            *states
+                .cached_state
+                .get::<LayerSurfaceCachedState>()
+                .current()
         });
         let width = if requested.size.w == 0 {
             (output.logical_size.width - i64::from(requested.margin.left + requested.margin.right))
@@ -625,11 +627,13 @@ impl Astera {
         if self.desktop.outputs[&self.active_output].logical_size != size {
             let _ = self.desktop.resize_output(self.active_output, size);
             self.configure_fullscreen_windows();
+            self.configure_layer_surfaces();
         }
     }
 
     pub fn remove_dead_windows(&mut self) {
         self.popup_manager.cleanup();
+        self.layers.retain(|mapped| mapped.surface.alive());
         let dead: Vec<_> = self
             .windows
             .iter()
@@ -718,17 +722,49 @@ impl Astera {
         }
     }
 
+    fn configure_layer_surface(&self, surface: &LayerSurface) {
+        let Some(mapped) = self.layers.iter().find(|mapped| mapped.surface == *surface) else {
+            return;
+        };
+        let Some((_, size)) = self.layer_geometry(mapped) else {
+            return;
+        };
+        surface.with_pending_state(|state| {
+            state.size = Some((saturating_i32(size.width), saturating_i32(size.height)).into());
+        });
+        surface.send_pending_configure();
+    }
+
+    fn configure_layer_surfaces(&self) {
+        for mapped in &self.layers {
+            self.configure_layer_surface(&mapped.surface);
+        }
+    }
+
     fn sync_keyboard_focus(&mut self) {
+        let layer_target = self.layers.iter().rev().find_map(|mapped| {
+            let state = with_states(mapped.surface.wl_surface(), |states| {
+                *states
+                    .cached_state
+                    .get::<LayerSurfaceCachedState>()
+                    .current()
+            });
+            (mapped.output == self.active_output
+                && mapped.surface.alive()
+                && state.keyboard_interactivity == KeyboardInteractivity::Exclusive)
+                .then(|| mapped.surface.wl_surface().clone())
+        });
         let focused = self
             .desktop
             .workspace_for_output(self.active_output)
             .and_then(|workspace| workspace.focused_window);
-        let target = focused.and_then(|id| {
+        let window_target = focused.and_then(|id| {
             self.windows
                 .iter()
                 .find(|mapped| mapped.id == id)
                 .map(|mapped| mapped.surface.wl_surface().clone())
         });
+        let target = layer_target.or(window_target);
         for mapped in &self.windows {
             let activated = Some(mapped.surface.wl_surface()) == target.as_ref();
             mapped.surface.with_pending_state(|state| {
@@ -900,6 +936,51 @@ impl CompositorHandler for Astera {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
         self.popup_manager.commit(surface);
+        if let Some(layer) = self
+            .layers
+            .iter()
+            .find(|mapped| mapped.surface.wl_surface() == surface)
+            .map(|mapped| mapped.surface.clone())
+        {
+            self.configure_layer_surface(&layer);
+            self.sync_keyboard_focus();
+        }
+    }
+}
+
+impl WlrLayerShellHandler for Astera {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: LayerSurface,
+        _output: Option<WlOutput>,
+        layer: Layer,
+        _namespace: String,
+    ) {
+        self.layers.push(MappedLayer {
+            surface: surface.clone(),
+            layer,
+            output: self.active_output,
+        });
+        self.configure_layer_surface(&surface);
+    }
+
+    fn new_popup(&mut self, _parent: LayerSurface, popup: PopupSurface) {
+        if let Err(error) = self.popup_manager.track_popup(popup.clone().into()) {
+            tracing::warn!(%error, "could not track layer popup");
+            return;
+        }
+        if let Err(error) = popup.send_configure() {
+            tracing::warn!(%error, "could not configure layer popup");
+        }
+    }
+
+    fn layer_destroyed(&mut self, surface: LayerSurface) {
+        self.layers.retain(|mapped| mapped.surface != surface);
+        self.sync_keyboard_focus();
     }
 }
 
@@ -1078,6 +1159,7 @@ impl ClientData for ClientState {
 }
 
 delegate_xdg_shell!(Astera);
+delegate_layer_shell!(Astera);
 delegate_compositor!(Astera);
 delegate_shm!(Astera);
 delegate_seat!(Astera);

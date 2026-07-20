@@ -83,12 +83,11 @@ fn run_nested(config: Config) -> Result<(), Box<dyn Error>> {
         {
             let (renderer, mut framebuffer) = backend.bind()?;
             let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
-                .mapped_windows()
+                .render_roots()
+                .into_iter()
                 .flat_map(|(surface, location, scale)| {
                     let mut elements = Vec::new();
-                    for (popup, popup_offset) in
-                        PopupManager::popups_for_surface(surface.wl_surface())
-                    {
+                    for (popup, popup_offset) in PopupManager::popups_for_surface(&surface) {
                         let geometry = popup.geometry();
                         let offset: Point<i32, Physical> = (
                             ((popup_offset.x - geometry.loc.x) as f64 * scale).round() as i32,
@@ -106,7 +105,7 @@ fn run_nested(config: Config) -> Result<(), Box<dyn Error>> {
                     }
                     elements.extend(render_elements_from_surface_tree(
                         renderer,
-                        surface.wl_surface(),
+                        &surface,
                         location,
                         scale,
                         1.0,
@@ -122,9 +121,9 @@ fn run_nested(config: Config) -> Result<(), Box<dyn Error>> {
             let _sync = frame.finish()?;
 
             let frame_time = started.elapsed().as_millis() as u32;
-            for (surface, _, _) in state.mapped_windows() {
-                send_frames_surface_tree(surface.wl_surface(), frame_time);
-                for (popup, _) in PopupManager::popups_for_surface(surface.wl_surface()) {
+            for (surface, _, _) in state.render_roots() {
+                send_frames_surface_tree(&surface, frame_time);
+                for (popup, _) in PopupManager::popups_for_surface(&surface) {
                     send_frames_surface_tree(popup.wl_surface(), frame_time);
                 }
             }
