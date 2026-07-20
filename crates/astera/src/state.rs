@@ -1,4 +1,4 @@
-use std::os::fd::OwnedFd;
+use std::{collections::BTreeMap, os::fd::OwnedFd};
 
 use astera_config::Config;
 use astera_core::{
@@ -85,6 +85,12 @@ struct MappedLayer {
     output: OutputId,
 }
 
+#[derive(Debug)]
+struct OutputRuntime {
+    wayland: SmithayOutput,
+    entered_surfaces: Vec<WlSurface>,
+}
+
 pub struct Astera {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -92,8 +98,7 @@ pub struct Astera {
     _fractional_scale_state: FractionalScaleManagerState,
     _viewporter_state: ViewporterState,
     _output_manager_state: OutputManagerState,
-    wayland_output: SmithayOutput,
-    output_surfaces: Vec<WlSurface>,
+    output_runtime: BTreeMap<OutputId, OutputRuntime>,
     shm_state: ShmState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
@@ -179,8 +184,13 @@ impl Astera {
             _fractional_scale_state: fractional_scale_state,
             _viewporter_state: viewporter_state,
             _output_manager_state: output_manager_state,
-            wayland_output,
-            output_surfaces: Vec::new(),
+            output_runtime: BTreeMap::from([(
+                active_output,
+                OutputRuntime {
+                    wayland: wayland_output,
+                    entered_surfaces: Vec::new(),
+                },
+            )]),
             shm_state,
             seat_state,
             data_device_state,
@@ -730,13 +740,17 @@ impl Astera {
                 refresh: 60_000,
             };
             let scale = self.active_scale();
-            self.wayland_output.change_current_state(
+            let runtime = self
+                .output_runtime
+                .get(&self.active_output)
+                .expect("desktop output has a Wayland runtime");
+            runtime.wayland.change_current_state(
                 Some(mode),
                 None,
                 Some(Scale::Fractional(scale)),
                 None,
             );
-            self.wayland_output.set_preferred(mode);
+            runtime.wayland.set_preferred(mode);
             self.configure_fullscreen_windows();
             self.configure_layer_surfaces();
             self.refresh_visible_scales();
@@ -754,14 +768,18 @@ impl Astera {
             .into_iter()
             .map(|(surface, _, _)| surface)
             .collect();
-        for surface in &self.output_surfaces {
+        let runtime = self
+            .output_runtime
+            .get_mut(&self.active_output)
+            .expect("desktop output has a Wayland runtime");
+        for surface in &runtime.entered_surfaces {
             if !visible.contains(surface) {
-                self.wayland_output.leave(surface);
+                runtime.wayland.leave(surface);
             }
         }
         for surface in &visible {
-            if !self.output_surfaces.contains(surface) {
-                self.wayland_output.enter(surface);
+            if !runtime.entered_surfaces.contains(surface) {
+                runtime.wayland.enter(surface);
             }
             with_states(surface, |states| {
                 with_fractional_scale(states, |fractional| {
@@ -769,7 +787,7 @@ impl Astera {
                 });
             });
         }
-        self.output_surfaces = visible;
+        runtime.entered_surfaces = visible;
     }
 
     pub fn remove_dead_windows(&mut self) {
