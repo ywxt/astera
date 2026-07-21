@@ -800,6 +800,12 @@ impl Astera {
         roots
     }
 
+    pub(crate) fn protocol_output(&self, output: OutputId) -> Option<SmithayOutput> {
+        self.output_runtime
+            .get(&output)
+            .map(|runtime| runtime.wayland.clone())
+    }
+
     fn window_mode_for_surface(&self, output: OutputId, surface: &WlSurface) -> Option<WindowMode> {
         let id = self
             .windows
