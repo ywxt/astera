@@ -27,6 +27,20 @@ cargo test --workspace
 cargo run -p astera
 ```
 
+The default is the nested winit backend. To run directly on DRM/KMS through
+libseat, use:
+
+```sh
+cargo run -p astera -- --backend=native
+```
+
+The native backend requires an active seat (for example seatd or logind) and
+permission to open the DRM and input devices. It discovers GPUs and connectors
+through udev, assigns a CRTC and preferred mode to every usable connector, and
+renders each output with its own GBM/KMS swapchain. Connector removal unbinds
+the workspace without destroying it; reconnecting an output binds the first
+available background workspace.
+
 Astera prints the socket name when it starts. Launch a client from another
 terminal with the printed value, for example:
 
@@ -75,12 +89,17 @@ bottom, top and overlay surfaces remain output-local, while fullscreen windows
 sit below overlay and above top-layer content. Exclusive layer surfaces take
 keyboard focus; `OnDemand` surfaces can take it on click.
 
-The nested output advertises `wl_output`, xdg-output, viewporter and fractional
-scale protocols. Only surfaces in the workspace currently owned by that output
+Both backends advertise `wl_output`, xdg-output, viewporter and fractional scale
+protocols. Only surfaces in the workspace currently owned by an output
 receive output-enter and preferred-scale events; background workspaces receive
 neither. This preserves the single-output ownership invariant and avoids asking
 one surface to satisfy two output scales simultaneously.
 
-This backend remains an integration milestone rather than a complete desktop.
-Configurable binding files, animation and the native DRM/KMS multi-output backend
-are still to be implemented.
+Native outputs are arranged left-to-right for pointer traversal. Relative pointer
+motion crosses output boundaries and changes the active output; compositor window
+drags remain clamped to their source output. Per-output physical size, logical
+size, fractional scale and transform can be changed atomically with the protocol
+v3 `ConfigureOutput` IPC command.
+
+Astera remains experimental. Configurable binding files and animated layout
+transitions are not implemented yet.
