@@ -45,16 +45,13 @@ fn format_overview(snapshot: &DesktopSnapshot) -> String {
         } else {
             ""
         };
-        let workspace = output
-            .workspace
-            .map(|id| id.0.to_string())
-            .unwrap_or_else(|| "none".to_owned());
         let scale = output.native_scale.0 as f64 / 120.0;
         text.push_str(&format!(
-            "  {}{}: workspace {}, {}x{} logical, {:.2}x, {:?}\n",
+            "  {}{}: workspace {}, {} total, {}x{} logical, {:.2}x, {:?}\n",
             output.stable_key,
             active,
-            workspace,
+            output.active_workspace.0,
+            output.workspaces.len(),
             output.logical_size.width,
             output.logical_size.height,
             scale,
@@ -71,11 +68,18 @@ fn format_overview(snapshot: &DesktopSnapshot) -> String {
 fn format_workspace(workspace: &WorkspaceSnapshot) -> String {
     let location = workspace
         .output
-        .map(|id| format!("output {}", id.0))
+        .zip(workspace.local_index)
+        .map(|(id, index)| format!("output {} index {}", id.0, index))
         .unwrap_or_else(|| "background".to_owned());
+    let label = workspace
+        .name
+        .as_deref()
+        .map(|name| format!(" ({name})"))
+        .unwrap_or_default();
     format!(
-        "  {}: {}, focus {:?}, tiled {}, floating {}, fullscreen {:?}\n",
+        "  {}{}: {}, focus {:?}, tiled {}, floating {}, fullscreen {:?}\n",
         workspace.id.0,
+        label,
         location,
         workspace.focused_window.map(|id| id.0),
         workspace.tiled_count,
@@ -95,10 +99,12 @@ mod tests {
     fn overview_marks_active_output_and_background_workspace() {
         let snapshot = DesktopSnapshot {
             active_output: Some(OutputId(2)),
+            primary_output: Some(OutputId(2)),
             outputs: vec![OutputSnapshot {
                 id: OutputId(2),
                 stable_key: "DP-1".to_owned(),
-                workspace: Some(WorkspaceId(3)),
+                active_workspace: WorkspaceId(3),
+                workspaces: vec![WorkspaceId(3), WorkspaceId(4)],
                 physical_size: Size::new(3840, 2160),
                 logical_size: Size::new(2560, 1440),
                 native_scale: Scale120(180),
@@ -107,7 +113,10 @@ mod tests {
             workspaces: vec![
                 WorkspaceSnapshot {
                     id: WorkspaceId(3),
+                    name: Some("code".into()),
+                    original_output: Some("DP-1".into()),
                     output: Some(OutputId(2)),
+                    local_index: Some(1),
                     focused_window: Some(WindowId(9)),
                     tiled_count: 2,
                     floating_count: 1,
@@ -115,7 +124,10 @@ mod tests {
                 },
                 WorkspaceSnapshot {
                     id: WorkspaceId(4),
+                    name: None,
+                    original_output: Some("DP-1".into()),
                     output: None,
+                    local_index: None,
                     focused_window: None,
                     tiled_count: 1,
                     floating_count: 0,
@@ -125,7 +137,7 @@ mod tests {
         };
 
         let overview = format_overview(&snapshot);
-        assert!(overview.contains("DP-1 *: workspace 3, 2560x1440 logical, 1.50x"));
+        assert!(overview.contains("DP-1 *: workspace 3, 2 total, 2560x1440 logical, 1.50x"));
         assert!(overview.contains("4: background"));
     }
 }

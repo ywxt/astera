@@ -3,9 +3,11 @@ use std::{collections::BTreeMap, os::fd::OwnedFd};
 use astera_config::Config;
 use astera_core::{
     Desktop, Output, OutputId, OutputTransform, Point, Size, WindowId, WindowMode,
-    WindowTransaction, Workspace, WorkspaceId, WorkspaceTransaction,
+    WindowTransaction, WorkspaceId, WorkspaceTransaction,
 };
-use astera_ipc::{Command, DesktopSnapshot, ErrorCode, Response};
+use astera_ipc::{
+    Command, DesktopSnapshot, ErrorCode, OutputSelector, Response, WorkspaceSelector,
+};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::{
     backend::{
@@ -166,19 +168,11 @@ impl Astera {
                 Size::new(1280, 720),
             ))
             .expect("initial output is valid");
-        for id in 0..config.workspace_count {
-            let mut workspace = Workspace::new(WorkspaceId(id));
-            workspace.camera.policy = config.camera;
-            desktop
-                .add_workspace(workspace)
-                .expect("initial workspace is valid");
-        }
         desktop
-            .apply(WorkspaceTransaction::Bind {
-                workspace: WorkspaceId(0),
-                output: active_output,
-            })
-            .expect("initial workspace can bind");
+            .workspace_mut(desktop.active_workspace_id(active_output).unwrap())
+            .unwrap()
+            .camera
+            .policy = config.camera;
 
         Self {
             display: display.clone(),
@@ -252,18 +246,6 @@ impl Astera {
                 location: Point::ORIGIN,
             },
         );
-        if let Some(workspace) = self
-            .desktop
-            .workspaces
-            .values()
-            .find(|workspace| workspace.bound_output.is_none())
-            .map(|workspace| workspace.id)
-        {
-            self.desktop.apply(WorkspaceTransaction::Bind {
-                workspace,
-                output: output.id,
-            })?;
-        }
         if self.desktop.outputs.len() == 1 {
             self.active_output = output.id;
         }
@@ -326,7 +308,9 @@ impl Astera {
                 );
             }
             InputEvent::PointerMotionAbsolute { event } => {
-                let size = self.desktop.outputs[&self.active_output].logical_size;
+                let size = self.desktop.outputs[&self.active_output]
+                    .output
+                    .logical_size;
                 let location = event.position_transformed(
                     (saturating_i32(size.width), saturating_i32(size.height)).into(),
                 );
@@ -397,7 +381,10 @@ impl Astera {
         let y = self.pointer_location.y + dy;
         if self.drag.is_none() {
             loop {
-                let width = self.desktop.outputs[&self.active_output].logical_size.width as f64;
+                let width = self.desktop.outputs[&self.active_output]
+                    .output
+                    .logical_size
+                    .width as f64;
                 if x >= width {
                     let Some(next) = self.adjacent_output(self.active_output, true) else {
                         x = width - 1.0;
@@ -411,13 +398,15 @@ impl Astera {
                         break;
                     };
                     self.active_output = previous;
-                    x += self.desktop.outputs[&previous].logical_size.width as f64;
+                    x += self.desktop.outputs[&previous].output.logical_size.width as f64;
                 } else {
                     break;
                 }
             }
         }
-        let size = self.desktop.outputs[&self.active_output].logical_size;
+        let size = self.desktop.outputs[&self.active_output]
+            .output
+            .logical_size;
         let location = SmithayPoint::from((
             x.clamp(0.0, size.width as f64 - 1.0),
             y.clamp(0.0, size.height as f64 - 1.0),
@@ -543,18 +532,17 @@ impl Astera {
                 {
                     rect.origin = drag.target;
                 }
-                let zoom = workspace.camera.zoom.max(0.01);
                 let left = workspace.camera.center.x as f64
-                    - output.logical_size.width as f64 / (2.0 * zoom);
+                    - output.output.logical_size.width as f64 / 2.0;
                 let top = workspace.camera.center.y as f64
-                    - output.logical_size.height as f64 / (2.0 * zoom);
+                    - output.output.logical_size.height as f64 / 2.0;
                 Some((
                     Point::new(
-                        ((rect.origin.x as f64 - left) * zoom).round() as i64,
-                        ((rect.origin.y as f64 - top) * zoom).round() as i64,
+                        (rect.origin.x as f64 - left).round() as i64,
+                        (rect.origin.y as f64 - top).round() as i64,
                     ),
                     rect.size,
-                    zoom,
+                    1.0,
                     mode,
                 ))
             }
@@ -568,7 +556,7 @@ impl Astera {
                 }
                 Some((rect.origin, rect.size, 1.0, mode))
             }
-            WindowMode::Fullscreen => Some((Point::ORIGIN, output.logical_size, 1.0, mode)),
+            WindowMode::Fullscreen => Some((Point::ORIGIN, output.output.logical_size, 1.0, mode)),
         }
     }
 
@@ -631,7 +619,9 @@ impl Astera {
             return;
         }
         let workspace_id = self.desktop.find_window(window).unwrap();
-        let workspace = &self.desktop.workspaces[&workspace_id];
+        let Ok(workspace) = self.desktop.workspace(workspace_id) else {
+            return;
+        };
         let start = match mode {
             WindowMode::Tiled => workspace.tiled[&window].geometry.origin,
             WindowMode::Floating => workspace.floating[&window].rect.origin,
@@ -680,14 +670,13 @@ impl Astera {
                 .desktop
                 .workspace_for_output(self.active_output)
                 .unwrap();
-            let zoom = workspace.camera.zoom.max(0.01);
             let left =
-                workspace.camera.center.x as f64 - output.logical_size.width as f64 / (2.0 * zoom);
+                workspace.camera.center.x as f64 - output.output.logical_size.width as f64 / 2.0;
             let top =
-                workspace.camera.center.y as f64 - output.logical_size.height as f64 / (2.0 * zoom);
+                workspace.camera.center.y as f64 - output.output.logical_size.height as f64 / 2.0;
             Point::new(
-                (left + viewport_x / zoom).round() as i64,
-                (top + viewport_y / zoom).round() as i64,
+                (left + viewport_x).round() as i64,
+                (top + viewport_y).round() as i64,
             )
         };
         self.drag = Some(drag);
@@ -700,7 +689,9 @@ impl Astera {
         let Ok(workspace) = self.desktop.find_window(drag.window) else {
             return;
         };
-        let viewport_size = self.desktop.outputs[&self.active_output].logical_size;
+        let viewport_size = self.desktop.outputs[&self.active_output]
+            .output
+            .logical_size;
         let transaction = match drag.mode {
             WindowMode::Tiled => WindowTransaction::MoveTiledFinished {
                 id: drag.window,
@@ -708,11 +699,11 @@ impl Astera {
                 seed_direction: astera_core::Direction::between(
                     drag.start,
                     drag.target,
-                    self.desktop.workspaces[&workspace].focus_direction,
+                    self.desktop.workspace(workspace).unwrap().focus_direction,
                 ),
             },
             WindowMode::Floating => {
-                let size = self.desktop.workspaces[&workspace].floating[&drag.window]
+                let size = self.desktop.workspace(workspace).unwrap().floating[&drag.window]
                     .rect
                     .size;
                 WindowTransaction::MoveFloating {
@@ -735,24 +726,38 @@ impl Astera {
         if !modifiers.logo {
             return false;
         }
-        let workspace_id = self.desktop.outputs[&self.active_output].current_workspace;
-        let focused_window =
-            workspace_id.and_then(|workspace| self.desktop.workspaces[&workspace].focused_window);
+        let workspace_id = self.desktop.active_workspace_id(self.active_output);
+        let focused_window = workspace_id
+            .and_then(|workspace| self.desktop.workspace(workspace).ok()?.focused_window);
         let command = if (keysyms::KEY_1..=keysyms::KEY_9).contains(&symbol) {
-            let target = WorkspaceId(symbol - keysyms::KEY_1);
+            let index = (symbol - keysyms::KEY_1 + 1) as usize;
+            let target = self
+                .desktop
+                .workspace_by_local_index(self.active_output, index)
+                .map(|workspace| workspace.id);
             if modifiers.shift {
-                focused_window.map(|window| Command::SendWindowToWorkspace { window, target })
+                focused_window
+                    .zip(target)
+                    .map(|(window, target)| Command::MoveWindow {
+                        window,
+                        target: WorkspaceSelector::Id(target),
+                        activate: false,
+                    })
             } else {
-                Some(Command::BindWorkspace {
-                    workspace: target,
-                    output: self.active_output,
+                target.map(|workspace| Command::FocusWorkspace {
+                    workspace: WorkspaceSelector::Id(workspace),
                 })
             }
         } else {
             match symbol {
                 keysyms::KEY_space => focused_window.and_then(|window| {
                     let workspace = self.desktop.find_window(window).ok()?;
-                    let mode = match self.desktop.workspaces[&workspace].window_mode(window)? {
+                    let mode = match self
+                        .desktop
+                        .workspace(workspace)
+                        .ok()?
+                        .window_mode(window)?
+                    {
                         WindowMode::Tiled | WindowMode::Fullscreen => WindowMode::Floating,
                         WindowMode::Floating => WindowMode::Tiled,
                     };
@@ -760,7 +765,7 @@ impl Astera {
                 }),
                 keysyms::KEY_f => focused_window.and_then(|window| {
                     let workspace = self.desktop.find_window(window).ok()?;
-                    let state = &self.desktop.workspaces[&workspace];
+                    let state = self.desktop.workspace(workspace).ok()?;
                     let mode = match state.window_mode(window)? {
                         WindowMode::Fullscreen => match &state.fullscreen.as_ref()?.restore {
                             astera_core::RestorePlacement::Tiled { .. } => WindowMode::Tiled,
@@ -901,44 +906,50 @@ impl Astera {
                 .current()
         });
         let width = if requested.size.w == 0 {
-            (output.logical_size.width - i64::from(requested.margin.left + requested.margin.right))
-                .max(1)
+            (output.output.logical_size.width
+                - i64::from(requested.margin.left + requested.margin.right))
+            .max(1)
         } else {
             i64::from(requested.size.w)
         };
         let height = if requested.size.h == 0 {
-            (output.logical_size.height - i64::from(requested.margin.top + requested.margin.bottom))
-                .max(1)
+            (output.output.logical_size.height
+                - i64::from(requested.margin.top + requested.margin.bottom))
+            .max(1)
         } else {
             i64::from(requested.size.h)
         };
         let x = if requested.anchor.contains(Anchor::LEFT) {
             i64::from(requested.margin.left)
         } else if requested.anchor.contains(Anchor::RIGHT) {
-            output.logical_size.width - width - i64::from(requested.margin.right)
+            output.output.logical_size.width - width - i64::from(requested.margin.right)
         } else {
-            (output.logical_size.width - width) / 2
+            (output.output.logical_size.width - width) / 2
         };
         let y = if requested.anchor.contains(Anchor::TOP) {
             i64::from(requested.margin.top)
         } else if requested.anchor.contains(Anchor::BOTTOM) {
-            output.logical_size.height - height - i64::from(requested.margin.bottom)
+            output.output.logical_size.height - height - i64::from(requested.margin.bottom)
         } else {
-            (output.logical_size.height - height) / 2
+            (output.output.logical_size.height - height) / 2
         };
         Some((Point::new(x, y), Size::new(width, height)))
     }
 
     pub fn update_output_size(&mut self, width: i64, height: i64) {
         let size = Size::new(width, height);
-        if self.desktop.outputs[&self.active_output].logical_size != size {
+        if self.desktop.outputs[&self.active_output]
+            .output
+            .logical_size
+            != size
+        {
             let current = self.desktop.outputs[&self.active_output].clone();
             if let Err(error) = self.configure_output(
                 self.active_output,
                 size,
                 size,
-                current.native_scale,
-                current.transform,
+                current.output.native_scale,
+                current.output.transform,
             ) {
                 tracing::error!(%error, "could not resize nested output");
             }
@@ -994,7 +1005,7 @@ impl Astera {
             .iter()
             .map(|(id, output)| {
                 let placement = (*id, Point::new(x, 0));
-                x = x.saturating_add(output.logical_size.width);
+                x = x.saturating_add(output.output.logical_size.width);
                 placement
             })
             .collect::<Vec<_>>();
@@ -1018,7 +1029,7 @@ impl Astera {
     }
 
     fn output_scale(&self, output: OutputId) -> f64 {
-        self.desktop.outputs[&output].native_scale.0 as f64 / 120.0
+        self.desktop.outputs[&output].output.native_scale.0 as f64 / 120.0
     }
 
     fn refresh_visible_scales(&mut self) {
@@ -1106,15 +1117,17 @@ impl Astera {
         let Ok(workspace_id) = self.desktop.find_window(window) else {
             return;
         };
-        let workspace = &self.desktop.workspaces[&workspace_id];
+        let workspace = self.desktop.workspace(workspace_id).unwrap();
         let Some(mapped) = self.windows.iter().find(|mapped| mapped.id == window) else {
             return;
         };
         let size = if mode == WindowMode::Fullscreen {
-            workspace
-                .bound_output
+            self.desktop
+                .workspace_location(workspace_id)
+                .ok()
+                .and_then(|location| location.output)
                 .and_then(|output| self.desktop.outputs.get(&output))
-                .map(|output| output.logical_size)
+                .map(|output| output.output.logical_size)
         } else {
             workspace.window_size(window)
         };
@@ -1131,9 +1144,13 @@ impl Astera {
     }
 
     fn configure_fullscreen_windows(&self) {
-        for workspace in self.desktop.workspaces.values() {
-            let (Some(fullscreen), Some(output_id)) =
-                (workspace.fullscreen.as_ref(), workspace.bound_output)
+        for workspace in self.desktop.workspaces() {
+            let output = self
+                .desktop
+                .workspace_location(workspace.id)
+                .ok()
+                .and_then(|location| location.output);
+            let (Some(fullscreen), Some(output_id)) = (workspace.fullscreen.as_ref(), output)
             else {
                 continue;
             };
@@ -1144,7 +1161,7 @@ impl Astera {
             else {
                 continue;
             };
-            let size = self.desktop.outputs[&output_id].logical_size;
+            let size = self.desktop.outputs[&output_id].output.logical_size;
             mapped.surface.with_pending_state(|state| {
                 state.size = Some((saturating_i32(size.width), saturating_i32(size.height)).into());
                 state.states.set(xdg_toplevel::State::Fullscreen);
@@ -1212,13 +1229,50 @@ impl Astera {
         keyboard.set_focus(self, target, serial);
     }
 
+    fn resolve_output(&self, selector: OutputSelector) -> Result<OutputId, (ErrorCode, String)> {
+        let output = match selector {
+            OutputSelector::Id(output) => Some(output),
+            OutputSelector::Key(key) => self
+                .desktop
+                .outputs
+                .iter()
+                .find_map(|(id, set)| (set.output.stable_key == key).then_some(*id)),
+            OutputSelector::Active => Some(self.active_output),
+        };
+        output
+            .filter(|output| self.desktop.outputs.contains_key(output))
+            .ok_or_else(|| (ErrorCode::NotFound, "unknown output".to_owned()))
+    }
+
+    fn resolve_workspace(
+        &self,
+        selector: WorkspaceSelector,
+    ) -> Result<WorkspaceId, (ErrorCode, String)> {
+        let workspace = match selector {
+            WorkspaceSelector::Id(workspace) => self
+                .desktop
+                .workspace(workspace)
+                .ok()
+                .map(|workspace| workspace.id),
+            WorkspaceSelector::Name(name) => self
+                .desktop
+                .workspace_by_name(&name)
+                .map(|workspace| workspace.id),
+            WorkspaceSelector::LocalIndex { output, index } => {
+                let output = self.resolve_output(output)?;
+                self.desktop
+                    .workspace_by_local_index(output, index)
+                    .map(|workspace| workspace.id)
+            }
+        };
+        workspace.ok_or_else(|| (ErrorCode::NotFound, "unknown workspace".to_owned()))
+    }
+
     fn execute_command_inner(&mut self, command: Command) -> Result<(), (ErrorCode, String)> {
         match command {
             Command::GetState => Ok(()),
             Command::FocusOutput(output) => {
-                if !self.desktop.outputs.contains_key(&output) {
-                    return Err((ErrorCode::NotFound, format!("unknown output {output:?}")));
-                }
+                let output = self.resolve_output(output)?;
                 self.active_output = output;
                 Ok(())
             }
@@ -1228,25 +1282,63 @@ impl Astera {
                 logical_size,
                 native_scale,
                 transform,
-            } => self
-                .configure_output(output, physical_size, logical_size, native_scale, transform)
-                .map_err(map_desktop_error),
-            Command::BindWorkspace { workspace, output }
-            | Command::MoveWorkspaceToOutput { workspace, output } => self
+            } => {
+                let output = self.resolve_output(output)?;
+                self.configure_output(output, physical_size, logical_size, native_scale, transform)
+                    .map_err(map_desktop_error)
+            }
+            Command::FocusWorkspace { workspace } => {
+                let workspace = self.resolve_workspace(workspace)?;
+                let location = self
+                    .desktop
+                    .workspace_location(workspace)
+                    .map_err(map_desktop_error)?;
+                let output = location
+                    .output
+                    .ok_or_else(|| (ErrorCode::Conflict, "workspace is detached".to_owned()))?;
+                self.desktop
+                    .apply(WorkspaceTransaction::Focus { output, workspace })
+                    .map_err(map_desktop_error)?;
+                self.active_output = output;
+                Ok(())
+            }
+            Command::MoveWorkspace {
+                workspace,
+                target_output,
+                target_index,
+                activate,
+            } => {
+                let target_output = self.resolve_output(target_output)?;
+                self.desktop
+                    .apply(WorkspaceTransaction::Move {
+                        workspace,
+                        target_output,
+                        target_index,
+                        activate,
+                    })
+                    .map(|_| ())
+                    .map_err(map_desktop_error)
+            }
+            Command::SetWorkspaceName { workspace, name } => self
                 .desktop
-                .apply(WorkspaceTransaction::Bind { workspace, output })
+                .apply(WorkspaceTransaction::SetName { workspace, name })
                 .map(|_| ())
                 .map_err(map_desktop_error),
-            Command::SwapWorkspaces { first, second } => self
-                .desktop
-                .apply(WorkspaceTransaction::Swap { first, second })
-                .map(|_| ())
-                .map_err(map_desktop_error),
-            Command::SendWindowToWorkspace { window, target } => self
-                .desktop
-                .apply(WorkspaceTransaction::SendWindow { window, target })
-                .map(|_| ())
-                .map_err(map_desktop_error),
+            Command::MoveWindow {
+                window,
+                target,
+                activate,
+            } => {
+                let target = self.resolve_workspace(target)?;
+                self.desktop
+                    .apply(WorkspaceTransaction::SendWindow {
+                        window,
+                        target,
+                        activate,
+                    })
+                    .map(|_| ())
+                    .map_err(map_desktop_error)
+            }
             Command::SetWindowMode { window, mode } => {
                 let workspace = self
                     .desktop
@@ -1254,10 +1346,10 @@ impl Astera {
                     .map_err(map_desktop_error)?;
                 let viewport_size = self
                     .desktop
-                    .workspaces
-                    .get(&workspace)
-                    .and_then(|workspace| workspace.bound_output)
-                    .and_then(|output| self.desktop.outputs.get(&output))
+                    .workspace_location(workspace)
+                    .ok()
+                    .and_then(|location| location.output)
+                    .and_then(|output| self.desktop.output(output))
                     .map(|output| output.logical_size)
                     .unwrap_or(Size::new(1920, 1080));
                 self.desktop
@@ -1272,22 +1364,18 @@ impl Astera {
                     .map_err(map_desktop_error)
             }
             Command::SetCameraPolicy { workspace, policy } => {
-                let state = self.desktop.workspaces.get_mut(&workspace).ok_or_else(|| {
-                    (
-                        ErrorCode::NotFound,
-                        format!("unknown workspace {workspace:?}"),
-                    )
-                })?;
+                let state = self
+                    .desktop
+                    .workspace_mut(workspace)
+                    .map_err(map_desktop_error)?;
                 state.camera.policy = policy;
                 Ok(())
             }
             Command::PanCamera { workspace, dx, dy } => {
-                let state = self.desktop.workspaces.get_mut(&workspace).ok_or_else(|| {
-                    (
-                        ErrorCode::NotFound,
-                        format!("unknown workspace {workspace:?}"),
-                    )
-                })?;
+                let state = self
+                    .desktop
+                    .workspace_mut(workspace)
+                    .map_err(map_desktop_error)?;
                 state.camera.center.x = state.camera.center.x.saturating_add(dx);
                 state.camera.center.y = state.camera.center.y.saturating_add(dy);
                 Ok(())
@@ -1297,14 +1385,20 @@ impl Astera {
                     .desktop
                     .focus_window(window)
                     .map_err(map_desktop_error)?;
-                if let Some(output) = self.desktop.workspaces[&workspace_id].bound_output {
+                if let Some(output) = self
+                    .desktop
+                    .workspace_location(workspace_id)
+                    .map_err(map_desktop_error)?
+                    .output
+                {
                     self.active_output = output;
                 }
                 Ok(())
             }
             Command::FocusDirection(direction) => {
-                let workspace_id = self.desktop.outputs[&self.active_output]
-                    .current_workspace
+                let workspace_id = self
+                    .desktop
+                    .active_workspace_id(self.active_output)
                     .ok_or_else(|| {
                         (
                             ErrorCode::Conflict,
@@ -1312,9 +1406,8 @@ impl Astera {
                         )
                     })?;
                 self.desktop
-                    .workspaces
-                    .get_mut(&workspace_id)
-                    .unwrap()
+                    .workspace_mut(workspace_id)
+                    .map_err(map_desktop_error)?
                     .focus_direction = direction;
                 Ok(())
             }
@@ -1328,6 +1421,7 @@ fn map_desktop_error(error: astera_core::DesktopError) -> (ErrorCode, String) {
         | astera_core::DesktopError::UnknownOutput(_)
         | astera_core::DesktopError::UnknownWindow(_) => ErrorCode::NotFound,
         astera_core::DesktopError::DuplicateWindow { .. }
+        | astera_core::DesktopError::DuplicateWorkspaceName(_)
         | astera_core::DesktopError::Layout(_) => ErrorCode::Conflict,
     };
     (code, error.to_string())
@@ -1486,10 +1580,11 @@ impl XdgShellHandler for Astera {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let id = WindowId(self.next_window_id);
         self.next_window_id += 1;
-        let workspace_id = self.desktop.outputs[&self.active_output]
-            .current_workspace
+        let workspace_id = self
+            .desktop
+            .active_workspace_id(self.active_output)
             .expect("active output has a workspace");
-        let workspace = &self.desktop.workspaces[&workspace_id];
+        let workspace = self.desktop.workspace(workspace_id).unwrap();
         let anchor = workspace
             .focused_window
             .and_then(|focused| workspace.tiled.get(&focused))
@@ -1671,7 +1766,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hotplug_keeps_disconnected_workspace_in_background() {
+    fn hotplug_moves_disconnected_workspaces_to_primary() {
         let display = Display::<Astera>::new().unwrap();
         let mut state = Astera::new(&display.handle(), Config::default());
         let mut second = Output::new(OutputId(1), "test-output-2", Size::new(2560, 1440));
@@ -1688,21 +1783,25 @@ mod tests {
             state.output_runtime[&OutputId(1)].location,
             Point::new(1280, 0)
         );
+        let disconnected_workspace = state.desktop.active_workspace_id(OutputId(0)).unwrap();
         state
             .desktop
-            .apply(WorkspaceTransaction::Bind {
-                workspace: WorkspaceId(1),
-                output: OutputId(1),
+            .apply(WorkspaceTransaction::SetName {
+                workspace: disconnected_workspace,
+                name: Some("main".into()),
             })
             .unwrap();
         state.disconnect_output(OutputId(0)).unwrap();
 
         assert_eq!(state.active_output, OutputId(1));
         assert!(!state.output_runtime.contains_key(&OutputId(0)));
-        assert_eq!(state.desktop.workspaces[&WorkspaceId(0)].bound_output, None);
         assert_eq!(
-            state.desktop.outputs[&OutputId(1)].current_workspace,
-            Some(WorkspaceId(1))
+            state
+                .desktop
+                .workspace_location(disconnected_workspace)
+                .unwrap()
+                .output,
+            Some(OutputId(1))
         );
     }
 
@@ -1710,10 +1809,10 @@ mod tests {
     fn output_reconfigure_preserves_camera_and_updates_protocol_state() {
         let display = Display::<Astera>::new().unwrap();
         let mut state = Astera::new(&display.handle(), Config::default());
+        let workspace = state.desktop.active_workspace_id(OutputId(0)).unwrap();
         state
             .desktop
-            .workspaces
-            .get_mut(&WorkspaceId(0))
+            .workspace_mut(workspace)
             .unwrap()
             .camera
             .center = Point::new(740, -320);
@@ -1729,10 +1828,10 @@ mod tests {
             .unwrap();
 
         let output = &state.desktop.outputs[&OutputId(0)];
-        assert_eq!(output.physical_size, Size::new(3000, 2000));
-        assert_eq!(output.logical_size, Size::new(2000, 1333));
+        assert_eq!(output.output.physical_size, Size::new(3000, 2000));
+        assert_eq!(output.output.logical_size, Size::new(2000, 1333));
         assert_eq!(
-            state.desktop.workspaces[&WorkspaceId(0)].camera.center,
+            state.desktop.workspace(workspace).unwrap().camera.center,
             Point::new(740, -320)
         );
         let runtime = &state.output_runtime[&OutputId(0)].wayland;

@@ -3,51 +3,66 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::{
-    FloatingPlacement, LayoutError, Output, OutputId, OutputTransform, Point, RadialSolver, Rect,
-    RestorePlacement, Scale120, Size, WindowId, WindowMode, WindowTransaction, Workspace,
-    WorkspaceId,
+    FloatingPlacement, LayoutError, Output, OutputId, OutputTransform, OutputWorkspaceSet, Point,
+    RadialSolver, RestorePlacement, Scale120, Size, WindowId, WindowMode, WindowTransaction,
+    Workspace, WorkspaceId,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceTransaction {
-    Bind {
-        workspace: WorkspaceId,
+    Focus {
         output: OutputId,
-    },
-    Swap {
-        first: WorkspaceId,
-        second: WorkspaceId,
-    },
-    Unbind {
         workspace: WorkspaceId,
+    },
+    Move {
+        workspace: WorkspaceId,
+        target_output: OutputId,
+        target_index: Option<usize>,
+        activate: bool,
+    },
+    SetName {
+        workspace: WorkspaceId,
+        name: Option<String>,
     },
     SendWindow {
         window: WindowId,
         target: WorkspaceId,
+        activate: bool,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DesktopEvent {
-    WorkspaceBound {
+    WorkspaceFocused {
         workspace: WorkspaceId,
         output: OutputId,
     },
-    WorkspaceUnbound {
+    WorkspaceMoved {
         workspace: WorkspaceId,
+        source: Option<OutputId>,
+        target: OutputId,
+    },
+    WorkspaceNamed {
+        workspace: WorkspaceId,
+        name: Option<String>,
+    },
+    OutputConnected {
+        output: OutputId,
     },
     OutputDisconnected {
         output: OutputId,
-    },
-    WorkspacesSwapped {
-        first: WorkspaceId,
-        second: WorkspaceId,
     },
     WindowSent {
         window: WindowId,
         source: WorkspaceId,
         target: WorkspaceId,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkspaceLocation {
+    pub output: Option<OutputId>,
+    pub index: usize,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -58,6 +73,8 @@ pub enum DesktopError {
     UnknownOutput(OutputId),
     #[error("window {0:?} does not exist")]
     UnknownWindow(WindowId),
+    #[error("workspace name {0:?} is already in use")]
+    DuplicateWorkspaceName(String),
     #[error("window {window:?} exists in multiple workspaces {first:?} and {second:?}")]
     DuplicateWindow {
         window: WindowId,
@@ -70,61 +87,107 @@ pub enum DesktopError {
 
 #[derive(Clone, Debug)]
 pub struct Desktop {
-    pub workspaces: BTreeMap<WorkspaceId, Workspace>,
-    pub outputs: BTreeMap<OutputId, Output>,
+    pub outputs: BTreeMap<OutputId, OutputWorkspaceSet>,
+    pub detached: Vec<Workspace>,
+    pub primary_output: Option<OutputId>,
+    pub last_active: BTreeMap<String, WorkspaceId>,
+    next_workspace_id: u32,
     solver: RadialSolver,
 }
 
 impl Desktop {
     pub fn new(gap: i64) -> Self {
         Self {
-            workspaces: BTreeMap::new(),
             outputs: BTreeMap::new(),
+            detached: Vec::new(),
+            primary_output: None,
+            last_active: BTreeMap::new(),
+            next_workspace_id: 0,
             solver: RadialSolver::new(gap),
         }
     }
 
-    pub fn add_workspace(&mut self, workspace: Workspace) -> Result<(), DesktopError> {
-        if let Some(output) = workspace.bound_output {
-            if !self.outputs.contains_key(&output) {
-                return Err(DesktopError::UnknownOutput(output));
-            }
+    pub fn connect_output(&mut self, output: Output) -> Result<DesktopEvent, DesktopError> {
+        let mut working = self.clone();
+        let output_id = output.id;
+        if working.outputs.contains_key(&output.id) {
+            return Err(DesktopError::UnknownOutput(output.id));
         }
-        let mut working = self.clone();
-        working.workspaces.insert(workspace.id, workspace);
+        let key = output.stable_key.clone();
+        let mut workspaces = if working.outputs.is_empty() {
+            std::mem::take(&mut working.detached)
+        } else {
+            let primary = working
+                .primary_output
+                .expect("normal layout has a primary output");
+            let primary_set = working.outputs.get_mut(&primary).unwrap();
+            let mut restored = Vec::new();
+            let mut index = 0;
+            while index < primary_set.workspaces.len() {
+                if primary_set.workspaces[index].original_output.as_deref() == Some(&key) {
+                    let workspace = primary_set.workspaces.remove(index);
+                    if workspace.has_windows_or_name() {
+                        restored.push(workspace);
+                    }
+                    if index <= primary_set.active {
+                        primary_set.active = primary_set.active.saturating_sub(1);
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            restored
+        };
+        workspaces.retain(Workspace::has_windows_or_name);
+        let active_id = working.last_active.remove(&key);
+        let active = active_id
+            .and_then(|id| workspaces.iter().position(|workspace| workspace.id == id))
+            .unwrap_or(0);
+        working.outputs.insert(
+            output.id,
+            OutputWorkspaceSet {
+                output,
+                workspaces,
+                active,
+            },
+        );
+        working
+            .primary_output
+            .get_or_insert_with(|| *working.outputs.keys().next().expect("output was inserted"));
+        working.normalize_all();
         working.validate()?;
         *self = working;
-        Ok(())
+        Ok(DesktopEvent::OutputConnected { output: output_id })
     }
 
-    pub fn connect_output(&mut self, output: Output) -> Result<(), DesktopError> {
-        let mut working = self.clone();
-        working.outputs.insert(output.id, output);
-        working.validate()?;
-        *self = working;
-        Ok(())
-    }
-
-    /// Removes an output and leaves its workspace intact in the background.
     pub fn disconnect_output(&mut self, output: OutputId) -> Result<DesktopEvent, DesktopError> {
         let mut working = self.clone();
-        let removed = working
+        let mut removed = working
             .outputs
             .remove(&output)
             .ok_or(DesktopError::UnknownOutput(output))?;
-        let event = if let Some(workspace) = removed.current_workspace {
+        if let Some(active) = removed.active_workspace() {
             working
-                .workspaces
-                .get_mut(&workspace)
-                .ok_or(DesktopError::UnknownWorkspace(workspace))?
-                .bound_output = None;
-            DesktopEvent::WorkspaceUnbound { workspace }
+                .last_active
+                .insert(removed.output.stable_key.clone(), active.id);
+        }
+        removed.workspaces.retain(Workspace::has_windows_or_name);
+        if working.outputs.is_empty() {
+            working.detached.extend(removed.workspaces);
+            working.primary_output = None;
         } else {
-            DesktopEvent::OutputDisconnected { output }
-        };
+            if working.primary_output == Some(output) {
+                working.primary_output = working.outputs.keys().next().copied();
+            }
+            let primary = working.primary_output.unwrap();
+            let target = working.outputs.get_mut(&primary).unwrap();
+            let insert = target.workspaces.len().saturating_sub(1);
+            target.workspaces.splice(insert..insert, removed.workspaces);
+        }
+        working.normalize_all();
         working.validate()?;
         *self = working;
-        Ok(event)
+        Ok(DesktopEvent::OutputDisconnected { output })
     }
 
     pub fn apply(
@@ -133,6 +196,7 @@ impl Desktop {
     ) -> Result<DesktopEvent, DesktopError> {
         let mut working = self.clone();
         let event = working.apply_working(transaction)?;
+        working.normalize_all();
         working.validate()?;
         *self = working;
         Ok(event)
@@ -144,53 +208,101 @@ impl Desktop {
         transaction: WindowTransaction,
     ) -> Result<(), DesktopError> {
         let mut working = self.clone();
-        let viewport_size = working
-            .workspaces
-            .get(&workspace)
-            .and_then(|workspace| workspace.bound_output)
-            .and_then(|output| working.outputs.get(&output))
-            .map(|output| output.logical_size);
-        let workspace = working
-            .workspaces
-            .get_mut(&workspace)
-            .ok_or(DesktopError::UnknownWorkspace(workspace))?;
-        working.solver.apply(workspace, transaction)?;
+        let viewport_size = working.workspace_viewport_size(workspace);
+        let solver = working.solver.clone();
+        solver.apply(working.workspace_mut(workspace)?, transaction)?;
         if let Some(viewport_size) = viewport_size {
-            workspace.follow_focus(viewport_size);
+            working
+                .workspace_mut(workspace)?
+                .follow_focus(viewport_size);
         }
+        working.reset_original_output_for_ordinary(workspace);
+        working.normalize_all();
         working.validate()?;
         *self = working;
         Ok(())
+    }
+
+    pub fn workspace(&self, id: WorkspaceId) -> Result<&Workspace, DesktopError> {
+        let location = self.workspace_location(id)?;
+        Ok(match location.output {
+            Some(output) => &self.outputs[&output].workspaces[location.index],
+            None => &self.detached[location.index],
+        })
+    }
+
+    pub fn workspace_mut(&mut self, id: WorkspaceId) -> Result<&mut Workspace, DesktopError> {
+        let location = self.workspace_location(id)?;
+        Ok(match location.output {
+            Some(output) => &mut self.outputs.get_mut(&output).unwrap().workspaces[location.index],
+            None => &mut self.detached[location.index],
+        })
+    }
+
+    pub fn workspace_location(&self, id: WorkspaceId) -> Result<WorkspaceLocation, DesktopError> {
+        for (output, set) in &self.outputs {
+            if let Some(index) = set
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == id)
+            {
+                return Ok(WorkspaceLocation {
+                    output: Some(*output),
+                    index,
+                });
+            }
+        }
+        self.detached
+            .iter()
+            .position(|workspace| workspace.id == id)
+            .map(|index| WorkspaceLocation {
+                output: None,
+                index,
+            })
+            .ok_or(DesktopError::UnknownWorkspace(id))
+    }
+
+    pub fn workspaces(&self) -> impl Iterator<Item = &Workspace> {
+        self.outputs
+            .values()
+            .flat_map(|set| set.workspaces.iter())
+            .chain(self.detached.iter())
     }
 
     pub fn workspace_for_output(&self, output: OutputId) -> Option<&Workspace> {
-        let workspace = self.outputs.get(&output)?.current_workspace?;
-        self.workspaces.get(&workspace)
+        self.outputs.get(&output)?.active_workspace()
     }
 
-    pub fn resize_output(
-        &mut self,
+    pub fn active_workspace_id(&self, output: OutputId) -> Option<WorkspaceId> {
+        Some(self.workspace_for_output(output)?.id)
+    }
+
+    pub fn workspace_by_local_index(
+        &self,
         output: OutputId,
-        logical_size: Size,
-    ) -> Result<(), DesktopError> {
-        let mut working = self.clone();
-        let output_state = working
-            .outputs
-            .get_mut(&output)
-            .ok_or(DesktopError::UnknownOutput(output))?;
-        let old_size = output_state.logical_size;
-        output_state.logical_size = logical_size;
-        output_state.physical_size = logical_size;
-        if let Some(workspace) = output_state.current_workspace {
-            remap_floating(
-                working.workspaces.get_mut(&workspace).unwrap(),
-                Some(old_size),
-                logical_size,
-            );
-        }
-        working.validate()?;
-        *self = working;
-        Ok(())
+        one_based_index: usize,
+    ) -> Option<&Workspace> {
+        one_based_index
+            .checked_sub(1)
+            .and_then(|index| self.outputs.get(&output)?.workspaces.get(index))
+    }
+
+    pub fn workspace_local_index(&self, workspace: WorkspaceId) -> Option<usize> {
+        let location = self.workspace_location(workspace).ok()?;
+        location.output.map(|_| location.index + 1)
+    }
+
+    pub fn workspace_by_name(&self, name: &str) -> Option<&Workspace> {
+        self.workspaces()
+            .find(|workspace| workspace.name.as_deref() == Some(name))
+    }
+
+    pub fn output(&self, output: OutputId) -> Option<&Output> {
+        self.outputs.get(&output).map(|set| &set.output)
+    }
+
+    pub fn output_mut(&mut self, output: OutputId) -> Option<&mut Output> {
+        self.outputs.get_mut(&output).map(|set| &mut set.output)
     }
 
     pub fn configure_output(
@@ -202,22 +314,17 @@ impl Desktop {
         transform: OutputTransform,
     ) -> Result<(), DesktopError> {
         let mut working = self.clone();
-        let output_state = working
+        let set = working
             .outputs
             .get_mut(&output)
             .ok_or(DesktopError::UnknownOutput(output))?;
-        let old_size = output_state.logical_size;
-        let workspace = output_state.current_workspace;
-        output_state.physical_size = physical_size;
-        output_state.logical_size = logical_size;
-        output_state.native_scale = native_scale;
-        output_state.transform = transform;
-        if let Some(workspace) = workspace {
-            remap_floating(
-                working.workspaces.get_mut(&workspace).unwrap(),
-                Some(old_size),
-                logical_size,
-            );
+        let old_size = set.output.logical_size;
+        set.output.physical_size = physical_size;
+        set.output.logical_size = logical_size;
+        set.output.native_scale = native_scale;
+        set.output.transform = transform;
+        for workspace in &mut set.workspaces {
+            remap_floating(workspace, Some(old_size), logical_size);
         }
         working.validate()?;
         *self = working;
@@ -226,7 +333,7 @@ impl Desktop {
 
     pub fn find_window(&self, window: WindowId) -> Result<WorkspaceId, DesktopError> {
         let mut found = None;
-        for workspace in self.workspaces.values() {
+        for workspace in self.workspaces() {
             if workspace.contains_window(window) {
                 if let Some(first) = found {
                     return Err(DesktopError::DuplicateWindow {
@@ -243,16 +350,20 @@ impl Desktop {
 
     pub fn focus_window(&mut self, window: WindowId) -> Result<WorkspaceId, DesktopError> {
         let mut working = self.clone();
-        let workspace_id = working.find_window(window)?;
-        let viewport_size = working.workspace_viewport_size(workspace_id);
-        let workspace = working.workspaces.get_mut(&workspace_id).unwrap();
-        workspace.focus(window);
-        if let Some(viewport_size) = viewport_size {
-            workspace.follow_focus(viewport_size);
+        let workspace = working.find_window(window)?;
+        let viewport = working.workspace_viewport_size(workspace);
+        working.workspace_mut(workspace)?.focus(window);
+        if let Some(viewport) = viewport {
+            working.workspace_mut(workspace)?.follow_focus(viewport);
+        }
+        if let Ok(location) = working.workspace_location(workspace) {
+            if let Some(output) = location.output {
+                working.outputs.get_mut(&output).unwrap().active = location.index;
+            }
         }
         working.validate()?;
         *self = working;
-        Ok(workspace_id)
+        Ok(workspace)
     }
 
     fn apply_working(
@@ -260,126 +371,90 @@ impl Desktop {
         transaction: WorkspaceTransaction,
     ) -> Result<DesktopEvent, DesktopError> {
         match transaction {
-            WorkspaceTransaction::Bind { workspace, output } => self.bind(workspace, output),
-            WorkspaceTransaction::Swap { first, second } => self.swap(first, second),
-            WorkspaceTransaction::Unbind { workspace } => self.unbind(workspace),
-            WorkspaceTransaction::SendWindow { window, target } => self.send_window(window, target),
+            WorkspaceTransaction::Focus { output, workspace } => {
+                let location = self.workspace_location(workspace)?;
+                if location.output != Some(output) {
+                    return Err(DesktopError::UnknownWorkspace(workspace));
+                }
+                self.outputs.get_mut(&output).unwrap().active = location.index;
+                Ok(DesktopEvent::WorkspaceFocused { workspace, output })
+            }
+            WorkspaceTransaction::Move {
+                workspace,
+                target_output,
+                target_index,
+                activate,
+            } => self.move_workspace(workspace, target_output, target_index, activate),
+            WorkspaceTransaction::SetName { workspace, name } => {
+                if let Some(name) = name.as_deref() {
+                    if self.workspaces().any(|candidate| {
+                        candidate.id != workspace && candidate.name.as_deref() == Some(name)
+                    }) {
+                        return Err(DesktopError::DuplicateWorkspaceName(name.to_owned()));
+                    }
+                }
+                self.workspace_mut(workspace)?.name = name.clone();
+                Ok(DesktopEvent::WorkspaceNamed { workspace, name })
+            }
+            WorkspaceTransaction::SendWindow {
+                window,
+                target,
+                activate,
+            } => self.send_window(window, target, activate),
         }
     }
 
-    fn bind(
+    fn move_workspace(
         &mut self,
-        workspace_id: WorkspaceId,
-        output_id: OutputId,
+        workspace: WorkspaceId,
+        target_output: OutputId,
+        target_index: Option<usize>,
+        activate: bool,
     ) -> Result<DesktopEvent, DesktopError> {
-        let old_output = self
-            .workspaces
-            .get(&workspace_id)
-            .ok_or(DesktopError::UnknownWorkspace(workspace_id))?
-            .bound_output;
-        let displaced = self
-            .outputs
-            .get(&output_id)
-            .ok_or(DesktopError::UnknownOutput(output_id))?
-            .current_workspace;
-        if old_output == Some(output_id) {
-            return Ok(DesktopEvent::WorkspaceBound {
-                workspace: workspace_id,
-                output: output_id,
-            });
+        if !self.outputs.contains_key(&target_output) {
+            return Err(DesktopError::UnknownOutput(target_output));
         }
-
-        let old_size = old_output.and_then(|id| self.outputs.get(&id).map(|out| out.logical_size));
-        let new_size = self.outputs[&output_id].logical_size;
-        remap_floating(
-            self.workspaces.get_mut(&workspace_id).unwrap(),
-            old_size,
-            new_size,
-        );
-
-        if let Some(old_output) = old_output {
-            self.outputs.get_mut(&old_output).unwrap().current_workspace = displaced;
+        let source = self.workspace_location(workspace)?;
+        let mut value = match source.output {
+            Some(output) => {
+                let set = self.outputs.get_mut(&output).unwrap();
+                let value = set.workspaces.remove(source.index);
+                if source.index < set.active {
+                    set.active -= 1;
+                } else if source.index == set.active {
+                    set.active = source
+                        .index
+                        .saturating_sub(1)
+                        .min(set.workspaces.len().saturating_sub(1));
+                }
+                value
+            }
+            None => self.detached.remove(source.index),
+        };
+        let key = self.outputs[&target_output].output.stable_key.clone();
+        value.original_output = Some(key);
+        let target = self.outputs.get_mut(&target_output).unwrap();
+        let limit = target.workspaces.len().saturating_sub(1);
+        let index = target_index.unwrap_or(target.active + 1).min(limit);
+        target.workspaces.insert(index, value);
+        if activate {
+            target.active = index;
         }
-        if let Some(displaced) = displaced {
-            let displaced_old_size = Some(new_size);
-            let displaced_new_size =
-                old_output.and_then(|id| self.outputs.get(&id).map(|out| out.logical_size));
-            let workspace = self.workspaces.get_mut(&displaced).unwrap();
-            remap_floating_optional(workspace, displaced_old_size, displaced_new_size);
-            workspace.bound_output = old_output;
-        }
-        self.outputs.get_mut(&output_id).unwrap().current_workspace = Some(workspace_id);
-        self.workspaces.get_mut(&workspace_id).unwrap().bound_output = Some(output_id);
-
-        Ok(DesktopEvent::WorkspaceBound {
-            workspace: workspace_id,
-            output: output_id,
+        Ok(DesktopEvent::WorkspaceMoved {
+            workspace,
+            source: source.output,
+            target: target_output,
         })
-    }
-
-    fn swap(
-        &mut self,
-        first: WorkspaceId,
-        second: WorkspaceId,
-    ) -> Result<DesktopEvent, DesktopError> {
-        let first_output = self
-            .workspaces
-            .get(&first)
-            .ok_or(DesktopError::UnknownWorkspace(first))?
-            .bound_output;
-        let second_output = self
-            .workspaces
-            .get(&second)
-            .ok_or(DesktopError::UnknownWorkspace(second))?
-            .bound_output;
-        let first_size =
-            first_output.and_then(|id| self.outputs.get(&id).map(|out| out.logical_size));
-        let second_size =
-            second_output.and_then(|id| self.outputs.get(&id).map(|out| out.logical_size));
-
-        remap_floating_optional(
-            self.workspaces.get_mut(&first).unwrap(),
-            first_size,
-            second_size,
-        );
-        remap_floating_optional(
-            self.workspaces.get_mut(&second).unwrap(),
-            second_size,
-            first_size,
-        );
-        self.workspaces.get_mut(&first).unwrap().bound_output = second_output;
-        self.workspaces.get_mut(&second).unwrap().bound_output = first_output;
-        if let Some(output) = first_output {
-            self.outputs.get_mut(&output).unwrap().current_workspace = Some(second);
-        }
-        if let Some(output) = second_output {
-            self.outputs.get_mut(&output).unwrap().current_workspace = Some(first);
-        }
-        Ok(DesktopEvent::WorkspacesSwapped { first, second })
-    }
-
-    fn unbind(&mut self, workspace: WorkspaceId) -> Result<DesktopEvent, DesktopError> {
-        let output = self
-            .workspaces
-            .get_mut(&workspace)
-            .ok_or(DesktopError::UnknownWorkspace(workspace))?
-            .bound_output
-            .take();
-        if let Some(output) = output {
-            self.outputs.get_mut(&output).unwrap().current_workspace = None;
-        }
-        Ok(DesktopEvent::WorkspaceUnbound { workspace })
     }
 
     fn send_window(
         &mut self,
         window: WindowId,
         target: WorkspaceId,
+        activate: bool,
     ) -> Result<DesktopEvent, DesktopError> {
         let source = self.find_window(window)?;
-        if !self.workspaces.contains_key(&target) {
-            return Err(DesktopError::UnknownWorkspace(target));
-        }
+        self.workspace(target)?;
         if source == target {
             return Ok(DesktopEvent::WindowSent {
                 window,
@@ -387,23 +462,23 @@ impl Desktop {
                 target,
             });
         }
-
-        let mode = self.workspaces[&source].window_mode(window).unwrap();
+        let mode = self.workspace(source)?.window_mode(window).unwrap();
         match mode {
             WindowMode::Tiled => {
-                let size = self.workspaces[&source].tiled[&window].geometry.size;
-                self.solver.apply(
-                    self.workspaces.get_mut(&source).unwrap(),
+                let size = self.workspace(source)?.tiled[&window].geometry.size;
+                let solver = self.solver.clone();
+                solver.apply(
+                    self.workspace_mut(source)?,
                     WindowTransaction::Remove { id: window },
                 )?;
-                let target_workspace = self.workspaces.get_mut(&target).unwrap();
+                let target_workspace = self.workspace_mut(target)?;
                 let anchor = target_workspace
                     .focused_window
                     .and_then(|focused| target_workspace.tiled.get(&focused))
                     .map(|focused| focused.geometry.center())
                     .unwrap_or(Point::ORIGIN);
                 let direction = target_workspace.focus_direction;
-                self.solver.apply(
+                solver.apply(
                     target_workspace,
                     WindowTransaction::InsertTiled {
                         id: window,
@@ -417,16 +492,11 @@ impl Desktop {
                 let source_viewport = self.workspace_viewport_size(source);
                 let target_viewport = self.workspace_viewport_size(target);
                 let placement = self
-                    .workspaces
-                    .get_mut(&source)
-                    .unwrap()
+                    .workspace_mut(source)?
                     .floating
                     .remove(&window)
                     .unwrap();
-                self.workspaces
-                    .get_mut(&source)
-                    .unwrap()
-                    .remove_focus(window);
+                self.workspace_mut(source)?.remove_focus(window);
                 let viewport = target_viewport.unwrap_or(Size::new(1920, 1080));
                 let placement = FloatingPlacement {
                     window,
@@ -436,24 +506,18 @@ impl Desktop {
                             crate::layout::clamp_to_viewport(placement.rect, viewport)
                         }),
                 };
-                let target_workspace = self.workspaces.get_mut(&target).unwrap();
-                target_workspace.floating.insert(window, placement);
-                target_workspace.focus(window);
-                target_workspace.generation = target_workspace.generation.wrapping_add(1);
+                self.workspace_mut(target)?
+                    .floating
+                    .insert(window, placement);
+                self.workspace_mut(target)?.focus(window);
             }
             WindowMode::Fullscreen => {
-                if let Some(fullscreen) = &self.workspaces[&target].fullscreen {
+                if let Some(fullscreen) = &self.workspace(target)?.fullscreen {
                     return Err(LayoutError::FullscreenOccupied(fullscreen.window).into());
                 }
                 let source_viewport = self.workspace_viewport_size(source);
                 let target_viewport = self.workspace_viewport_size(target);
-                let mut fullscreen = self
-                    .workspaces
-                    .get_mut(&source)
-                    .unwrap()
-                    .fullscreen
-                    .take()
-                    .unwrap();
+                let mut fullscreen = self.workspace_mut(source)?.fullscreen.take().unwrap();
                 if let (RestorePlacement::Floating { viewport_rect }, Some(target_size)) =
                     (&mut fullscreen.restore, target_viewport)
                 {
@@ -463,21 +527,18 @@ impl Desktop {
                             crate::layout::clamp_to_viewport(*viewport_rect, target_size)
                         });
                 }
-                self.workspaces
-                    .get_mut(&source)
-                    .unwrap()
-                    .remove_focus(window);
-                let target_workspace = self.workspaces.get_mut(&target).unwrap();
-                target_workspace.fullscreen = Some(fullscreen);
-                target_workspace.focus(window);
-                target_workspace.generation = target_workspace.generation.wrapping_add(1);
+                self.workspace_mut(source)?.remove_focus(window);
+                self.workspace_mut(target)?.fullscreen = Some(fullscreen);
+                self.workspace_mut(target)?.focus(window);
             }
         }
-        if let Some(viewport_size) = self.workspace_viewport_size(target) {
-            self.workspaces
-                .get_mut(&target)
-                .unwrap()
-                .follow_focus(viewport_size);
+        self.reset_original_output_for_ordinary(target);
+        if activate {
+            if let Ok(location) = self.workspace_location(target) {
+                if let Some(output) = location.output {
+                    self.outputs.get_mut(&output).unwrap().active = location.index;
+                }
+            }
         }
         Ok(DesktopEvent::WindowSent {
             window,
@@ -486,36 +547,111 @@ impl Desktop {
         })
     }
 
+    fn reset_original_output_for_ordinary(&mut self, workspace: WorkspaceId) {
+        let Ok(location) = self.workspace_location(workspace) else {
+            return;
+        };
+        let Some(output) = location.output else {
+            return;
+        };
+        if self
+            .workspace(workspace)
+            .ok()
+            .is_some_and(|workspace| workspace.name.is_none())
+        {
+            let key = self.outputs[&output].output.stable_key.clone();
+            self.workspace_mut(workspace).unwrap().original_output = Some(key);
+        }
+    }
+
     fn workspace_viewport_size(&self, workspace: WorkspaceId) -> Option<Size> {
-        let output = self.workspaces.get(&workspace)?.bound_output?;
-        Some(self.outputs.get(&output)?.logical_size)
+        let location = self.workspace_location(workspace).ok()?;
+        let output = location.output?;
+        Some(self.outputs[&output].output.logical_size)
+    }
+
+    fn allocate_workspace(&mut self, original_output: Option<String>) -> Workspace {
+        let id = WorkspaceId(self.next_workspace_id);
+        self.next_workspace_id = self.next_workspace_id.wrapping_add(1);
+        let mut workspace = Workspace::new(id);
+        workspace.original_output = original_output;
+        workspace
+    }
+
+    fn normalize_all(&mut self) {
+        let outputs = self.outputs.keys().copied().collect::<Vec<_>>();
+        for output in outputs {
+            self.normalize_output(output);
+        }
+        self.detached.retain(Workspace::has_windows_or_name);
+    }
+
+    fn normalize_output(&mut self, output: OutputId) {
+        let key = self.outputs[&output].output.stable_key.clone();
+        let set = self.outputs.get_mut(&output).unwrap();
+        let mut index = 0;
+        while index < set.workspaces.len() {
+            let last = index + 1 == set.workspaces.len();
+            if !set.workspaces[index].has_windows_or_name() && index != set.active && !last {
+                set.workspaces.remove(index);
+                if index < set.active {
+                    set.active -= 1;
+                }
+            } else {
+                index += 1;
+            }
+        }
+        let needs_placeholder = set
+            .workspaces
+            .last()
+            .is_none_or(Workspace::has_windows_or_name);
+        if needs_placeholder {
+            let workspace = self.allocate_workspace(Some(key));
+            self.outputs
+                .get_mut(&output)
+                .unwrap()
+                .workspaces
+                .push(workspace);
+        }
+        let set = self.outputs.get_mut(&output).unwrap();
+        set.active = set.active.min(set.workspaces.len() - 1);
     }
 
     fn validate(&self) -> Result<(), DesktopError> {
-        for workspace in self.workspaces.values() {
-            if let Some(output_id) = workspace.bound_output {
-                let output = self
-                    .outputs
-                    .get(&output_id)
-                    .ok_or(DesktopError::UnknownOutput(output_id))?;
-                if output.current_workspace != Some(workspace.id) {
-                    return Err(DesktopError::UnknownWorkspace(workspace.id));
-                }
+        if self.outputs.is_empty() != self.primary_output.is_none() {
+            return Err(DesktopError::UnknownOutput(
+                self.primary_output.unwrap_or(OutputId(u32::MAX)),
+            ));
+        }
+        if let Some(primary) = self.primary_output {
+            if !self.outputs.contains_key(&primary) {
+                return Err(DesktopError::UnknownOutput(primary));
             }
         }
-        for output in self.outputs.values() {
-            if let Some(workspace_id) = output.current_workspace {
-                let workspace = self
-                    .workspaces
-                    .get(&workspace_id)
-                    .ok_or(DesktopError::UnknownWorkspace(workspace_id))?;
-                if workspace.bound_output != Some(output.id) {
-                    return Err(DesktopError::UnknownOutput(output.id));
-                }
-            }
-        }
+        let mut ids = BTreeMap::new();
+        let mut names = BTreeMap::new();
         let mut windows = BTreeMap::new();
-        for workspace in self.workspaces.values() {
+        for (output, set) in &self.outputs {
+            if set.output.id != *output || set.active >= set.workspaces.len() {
+                return Err(DesktopError::UnknownOutput(*output));
+            }
+            if set
+                .workspaces
+                .last()
+                .is_none_or(Workspace::has_windows_or_name)
+            {
+                return Err(DesktopError::UnknownOutput(*output));
+            }
+        }
+        for workspace in self.workspaces() {
+            if ids.insert(workspace.id, ()).is_some() {
+                return Err(DesktopError::UnknownWorkspace(workspace.id));
+            }
+            if let Some(name) = &workspace.name {
+                if names.insert(name, workspace.id).is_some() {
+                    return Err(DesktopError::DuplicateWorkspaceName(name.clone()));
+                }
+            }
             for window in workspace
                 .tiled
                 .keys()
@@ -535,6 +671,15 @@ impl Desktop {
     }
 }
 
+impl Workspace {
+    pub fn has_windows_or_name(&self) -> bool {
+        self.name.is_some()
+            || !self.tiled.is_empty()
+            || !self.floating.is_empty()
+            || self.fullscreen.is_some()
+    }
+}
+
 fn remap_floating(workspace: &mut Workspace, old: Option<Size>, new: Size) {
     if let Some(old) = old {
         for placement in workspace.floating.values_mut() {
@@ -545,31 +690,29 @@ fn remap_floating(workspace: &mut Workspace, old: Option<Size>, new: Size) {
                 *viewport_rect = remap_rect(*viewport_rect, old, new);
             }
         }
+    }
+}
+
+fn remap_rect(rect: crate::Rect, old: Size, new: Size) -> crate::Rect {
+    let center = rect.center();
+    let x = if old.width > 0 {
+        center.x as f64 / old.width as f64
     } else {
-        for placement in workspace.floating.values_mut() {
-            placement.rect = crate::layout::clamp_to_viewport(placement.rect, new);
-        }
-    }
-}
-
-fn remap_floating_optional(workspace: &mut Workspace, old: Option<Size>, new: Option<Size>) {
-    if let Some(new) = new {
-        remap_floating(workspace, old, new);
-    }
-}
-
-fn remap_rect(rect: Rect, old: Size, new: Size) -> Rect {
-    if !old.is_valid() || !new.is_valid() {
-        return rect;
-    }
-    let center_x = rect.origin.x + rect.size.width / 2;
-    let center_y = rect.origin.y + rect.size.height / 2;
-    let mapped_center_x = center_x.saturating_mul(new.width) / old.width;
-    let mapped_center_y = center_y.saturating_mul(new.height) / old.height;
+        0.5
+    };
+    let y = if old.height > 0 {
+        center.y as f64 / old.height as f64
+    } else {
+        0.5
+    };
+    let center = Point::new(
+        (x * new.width as f64).round() as i64,
+        (y * new.height as f64).round() as i64,
+    );
     crate::layout::clamp_to_viewport(
-        Rect::new(
-            mapped_center_x - rect.size.width / 2,
-            mapped_center_y - rect.size.height / 2,
+        crate::Rect::new(
+            center.x - rect.size.width / 2,
+            center.y - rect.size.height / 2,
             rect.size.width,
             rect.size.height,
         ),
@@ -580,276 +723,84 @@ fn remap_rect(rect: Rect, old: Size, new: Size) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CameraState, FullscreenPlacement, TiledWindow};
 
-    fn desktop() -> Desktop {
-        let mut desktop = Desktop::new(8);
-        desktop
-            .connect_output(Output::new(OutputId(1), "A", Size::new(1920, 1080)))
-            .unwrap();
-        desktop
-            .connect_output(Output::new(OutputId(2), "B", Size::new(1280, 720)))
-            .unwrap();
-        desktop
-            .add_workspace(Workspace::new(WorkspaceId(1)))
-            .unwrap();
-        desktop
-            .add_workspace(Workspace::new(WorkspaceId(2)))
-            .unwrap();
-        desktop
-            .apply(WorkspaceTransaction::Bind {
-                workspace: WorkspaceId(1),
-                output: OutputId(1),
-            })
-            .unwrap();
-        desktop
-            .apply(WorkspaceTransaction::Bind {
-                workspace: WorkspaceId(2),
-                output: OutputId(2),
-            })
-            .unwrap();
-        desktop
+    fn output(id: u32, key: &str) -> Output {
+        Output::new(OutputId(id), key, Size::new(1920, 1080))
     }
 
     #[test]
-    fn occupied_bind_swaps_workspace_ownership() {
-        let mut desktop = desktop();
+    fn every_output_has_one_trailing_placeholder() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        let set = &desktop.outputs[&OutputId(1)];
+        assert_eq!(set.workspaces.len(), 1);
+        assert!(!set.workspaces[0].has_windows_or_name());
+    }
+
+    #[test]
+    fn naming_placeholder_creates_another_placeholder() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        let id = desktop.outputs[&OutputId(1)].workspaces[0].id;
         desktop
-            .apply(WorkspaceTransaction::Bind {
-                workspace: WorkspaceId(1),
-                output: OutputId(2),
+            .apply(WorkspaceTransaction::SetName {
+                workspace: id,
+                name: Some("chat".into()),
             })
             .unwrap();
+        let set = &desktop.outputs[&OutputId(1)];
+        assert_eq!(set.workspaces.len(), 2);
+        assert_eq!(set.workspaces[0].name.as_deref(), Some("chat"));
+        assert!(!set.workspaces[1].has_windows_or_name());
+    }
+
+    #[test]
+    fn disconnected_workspaces_move_to_primary_and_restore() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        desktop.connect_output(output(2, "B")).unwrap();
+        let workspace = desktop.outputs[&OutputId(2)].workspaces[0].id;
+        desktop
+            .apply(WorkspaceTransaction::SetName {
+                workspace,
+                name: Some("code".into()),
+            })
+            .unwrap();
+        desktop.disconnect_output(OutputId(2)).unwrap();
         assert_eq!(
-            desktop.workspaces[&WorkspaceId(1)].bound_output,
-            Some(OutputId(2))
-        );
-        assert_eq!(
-            desktop.workspaces[&WorkspaceId(2)].bound_output,
+            desktop.workspace_location(workspace).unwrap().output,
             Some(OutputId(1))
         );
+        desktop.connect_output(output(2, "B")).unwrap();
+        assert_eq!(
+            desktop.workspace_location(workspace).unwrap().output,
+            Some(OutputId(2))
+        );
     }
 
     #[test]
-    fn disconnect_leaves_workspace_in_background_with_state() {
-        let mut desktop = desktop();
-        desktop.workspaces.get_mut(&WorkspaceId(1)).unwrap().camera = CameraState {
-            center: Point::new(500, -200),
-            zoom: 1.5,
-            ..CameraState::default()
-        };
-        desktop.disconnect_output(OutputId(1)).unwrap();
-        let workspace = &desktop.workspaces[&WorkspaceId(1)];
-        assert_eq!(workspace.bound_output, None);
-        assert_eq!(workspace.camera.center, Point::new(500, -200));
-        assert_eq!(workspace.camera.zoom, 1.5);
-    }
-
-    #[test]
-    fn floating_size_is_preserved_and_center_is_remapped() {
-        let mut desktop = desktop();
+    fn duplicate_names_roll_back() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        let first = desktop.outputs[&OutputId(1)].workspaces[0].id;
         desktop
-            .workspaces
-            .get_mut(&WorkspaceId(1))
-            .unwrap()
-            .floating
-            .insert(
-                WindowId(9),
-                FloatingPlacement {
-                    window: WindowId(9),
-                    rect: Rect::new(860, 440, 200, 200),
-                },
-            );
-        desktop
-            .apply(WorkspaceTransaction::Bind {
-                workspace: WorkspaceId(1),
-                output: OutputId(2),
+            .apply(WorkspaceTransaction::SetName {
+                workspace: first,
+                name: Some("one".into()),
             })
             .unwrap();
-        let rect = desktop.workspaces[&WorkspaceId(1)].floating[&WindowId(9)].rect;
-        assert_eq!(rect.size, Size::new(200, 200));
-        assert_eq!(rect.center(), Point::new(640, 360));
-    }
-
-    #[test]
-    fn send_tiled_window_uses_target_focus_anchor() {
-        let mut desktop = desktop();
-        desktop
-            .workspaces
-            .get_mut(&WorkspaceId(1))
-            .unwrap()
-            .tiled
-            .insert(
-                WindowId(1),
-                TiledWindow {
-                    id: WindowId(1),
-                    geometry: Rect::new(0, 0, 100, 80),
-                },
-            );
-        desktop
-            .workspaces
-            .get_mut(&WorkspaceId(2))
-            .unwrap()
-            .tiled
-            .insert(
-                WindowId(2),
-                TiledWindow {
-                    id: WindowId(2),
-                    geometry: Rect::new(400, 300, 100, 80),
-                },
-            );
-        desktop
-            .workspaces
-            .get_mut(&WorkspaceId(2))
-            .unwrap()
-            .focus(WindowId(2));
-        desktop
-            .apply(WorkspaceTransaction::SendWindow {
-                window: WindowId(1),
-                target: WorkspaceId(2),
-            })
-            .unwrap();
-        assert!(!desktop.workspaces[&WorkspaceId(1)].contains_window(WindowId(1)));
+        let second = desktop.outputs[&OutputId(1)].workspaces[1].id;
+        let before = desktop.clone();
         assert_eq!(
-            desktop.workspaces[&WorkspaceId(2)].tiled[&WindowId(1)]
-                .geometry
-                .center(),
-            Point::new(450, 340)
-        );
-        assert!(desktop.workspaces[&WorkspaceId(2)].tiled_windows_are_stable(8));
-    }
-
-    #[test]
-    fn failed_fullscreen_send_is_fully_rolled_back() {
-        let mut desktop = desktop();
-        desktop
-            .workspaces
-            .get_mut(&WorkspaceId(1))
-            .unwrap()
-            .fullscreen = Some(FullscreenPlacement {
-            window: WindowId(1),
-            restore: RestorePlacement::Tiled {
-                world_rect: Rect::new(0, 0, 100, 80),
-            },
-        });
-        desktop
-            .workspaces
-            .get_mut(&WorkspaceId(2))
-            .unwrap()
-            .fullscreen = Some(FullscreenPlacement {
-            window: WindowId(2),
-            restore: RestorePlacement::Tiled {
-                world_rect: Rect::new(0, 0, 100, 80),
-            },
-        });
-        let error = desktop
-            .apply(WorkspaceTransaction::SendWindow {
-                window: WindowId(1),
-                target: WorkspaceId(2),
-            })
-            .unwrap_err();
-        assert_eq!(
-            error,
-            DesktopError::Layout(LayoutError::FullscreenOccupied(WindowId(2)))
+            desktop.apply(WorkspaceTransaction::SetName {
+                workspace: second,
+                name: Some("one".into()),
+            }),
+            Err(DesktopError::DuplicateWorkspaceName("one".into()))
         );
         assert_eq!(
-            desktop.workspaces[&WorkspaceId(1)]
-                .fullscreen
-                .as_ref()
-                .unwrap()
-                .window,
-            WindowId(1)
+            desktop.outputs[&OutputId(1)].workspaces.len(),
+            before.outputs[&OutputId(1)].workspaces.len()
         );
-    }
-
-    #[test]
-    fn sending_floating_window_preserves_size_and_relative_center() {
-        let mut desktop = desktop();
-        desktop
-            .workspaces
-            .get_mut(&WorkspaceId(1))
-            .unwrap()
-            .floating
-            .insert(
-                WindowId(3),
-                FloatingPlacement {
-                    window: WindowId(3),
-                    rect: Rect::new(860, 440, 200, 200),
-                },
-            );
-        desktop
-            .apply(WorkspaceTransaction::SendWindow {
-                window: WindowId(3),
-                target: WorkspaceId(2),
-            })
-            .unwrap();
-        let rect = desktop.workspaces[&WorkspaceId(2)].floating[&WindowId(3)].rect;
-        assert_eq!(rect.size, Size::new(200, 200));
-        assert_eq!(rect.center(), Point::new(640, 360));
-    }
-
-    #[test]
-    fn fractional_scale_change_does_not_modify_workspace_camera_or_tiling() {
-        let mut desktop = desktop();
-        let workspace = desktop.workspaces.get_mut(&WorkspaceId(1)).unwrap();
-        workspace.camera.center = Point::new(700, -300);
-        workspace.tiled.insert(
-            WindowId(4),
-            TiledWindow {
-                id: WindowId(4),
-                geometry: Rect::new(50, 60, 800, 600),
-            },
-        );
-        desktop
-            .configure_output(
-                OutputId(1),
-                Size::new(2400, 1350),
-                Size::new(1920, 1080),
-                Scale120(150),
-                OutputTransform::Normal,
-            )
-            .unwrap();
-        let workspace = &desktop.workspaces[&WorkspaceId(1)];
-        assert_eq!(workspace.camera.center, Point::new(700, -300));
-        assert_eq!(
-            workspace.tiled[&WindowId(4)].geometry,
-            Rect::new(50, 60, 800, 600)
-        );
-    }
-
-    #[test]
-    fn centered_policy_moves_camera_to_focused_tiled_window() {
-        let mut desktop = desktop();
-        let workspace = desktop.workspaces.get_mut(&WorkspaceId(1)).unwrap();
-        workspace.camera.policy = crate::CameraPolicy::Centered;
-        workspace.tiled.insert(
-            WindowId(5),
-            TiledWindow {
-                id: WindowId(5),
-                geometry: Rect::new(1000, -400, 200, 100),
-            },
-        );
-        desktop.focus_window(WindowId(5)).unwrap();
-        assert_eq!(
-            desktop.workspaces[&WorkspaceId(1)].camera.center,
-            Point::new(1100, -350)
-        );
-    }
-
-    #[test]
-    fn keep_visible_policy_only_moves_camera_by_required_distance() {
-        let mut desktop = desktop();
-        let workspace = desktop.workspaces.get_mut(&WorkspaceId(1)).unwrap();
-        workspace.camera.policy = crate::CameraPolicy::KeepVisible { margin: 32 };
-        workspace.tiled.insert(
-            WindowId(6),
-            TiledWindow {
-                id: WindowId(6),
-                geometry: Rect::new(950, 0, 200, 100),
-            },
-        );
-        desktop.focus_window(WindowId(6)).unwrap();
-        assert_eq!(desktop.workspaces[&WorkspaceId(1)].camera.center.x, 222);
-        assert_eq!(desktop.workspaces[&WorkspaceId(1)].camera.center.y, 0);
     }
 }

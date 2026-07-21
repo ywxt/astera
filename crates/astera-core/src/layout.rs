@@ -491,24 +491,22 @@ pub(crate) fn clamp_to_viewport(rect: Rect, viewport: Size) -> Rect {
 }
 
 fn world_rect_to_viewport(rect: Rect, workspace: &Workspace, viewport: Size) -> Rect {
-    let zoom = workspace.camera.zoom.max(0.01);
-    let left = workspace.camera.center.x as f64 - viewport.width as f64 / (2.0 * zoom);
-    let top = workspace.camera.center.y as f64 - viewport.height as f64 / (2.0 * zoom);
+    let left = workspace.camera.center.x as f64 - viewport.width as f64 / 2.0;
+    let top = workspace.camera.center.y as f64 - viewport.height as f64 / 2.0;
     Rect::new(
-        ((rect.origin.x as f64 - left) * zoom).round() as i64,
-        ((rect.origin.y as f64 - top) * zoom).round() as i64,
+        (rect.origin.x as f64 - left).round() as i64,
+        (rect.origin.y as f64 - top).round() as i64,
         rect.size.width,
         rect.size.height,
     )
 }
 
 fn viewport_rect_to_world(rect: Rect, workspace: &Workspace, viewport: Size) -> Rect {
-    let zoom = workspace.camera.zoom.max(0.01);
-    let left = workspace.camera.center.x as f64 - viewport.width as f64 / (2.0 * zoom);
-    let top = workspace.camera.center.y as f64 - viewport.height as f64 / (2.0 * zoom);
+    let left = workspace.camera.center.x as f64 - viewport.width as f64 / 2.0;
+    let top = workspace.camera.center.y as f64 - viewport.height as f64 / 2.0;
     Rect::new(
-        (left + rect.origin.x as f64 / zoom).round() as i64,
-        (top + rect.origin.y as f64 / zoom).round() as i64,
+        (left + rect.origin.x as f64).round() as i64,
+        (top + rect.origin.y as f64).round() as i64,
         rect.size.width,
         rect.size.height,
     )

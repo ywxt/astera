@@ -30,7 +30,6 @@ pub enum CameraPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CameraState {
     pub center: Point,
-    pub zoom: f64,
     pub policy: CameraPolicy,
 }
 
@@ -38,7 +37,6 @@ impl Default for CameraState {
     fn default() -> Self {
         Self {
             center: Point::ORIGIN,
-            zoom: 1.0,
             policy: CameraPolicy::KeepVisible { margin: 32 },
         }
     }
@@ -80,7 +78,8 @@ impl FullscreenPlacement {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: WorkspaceId,
-    pub bound_output: Option<OutputId>,
+    pub name: Option<String>,
+    pub original_output: Option<String>,
     pub tiled: BTreeMap<WindowId, TiledWindow>,
     pub floating: BTreeMap<WindowId, FloatingPlacement>,
     pub fullscreen: Option<FullscreenPlacement>,
@@ -95,7 +94,8 @@ impl Workspace {
     pub fn new(id: WorkspaceId) -> Self {
         Self {
             id,
-            bound_output: None,
+            name: None,
+            original_output: None,
             tiled: BTreeMap::new(),
             floating: BTreeMap::new(),
             fullscreen: None,
@@ -174,10 +174,9 @@ impl Workspace {
         match self.camera.policy {
             CameraPolicy::Centered => self.camera.center = rect.center(),
             CameraPolicy::KeepVisible { margin } => {
-                let zoom = self.camera.zoom.max(0.01);
-                let half_width = viewport_size.width as f64 / (2.0 * zoom);
-                let half_height = viewport_size.height as f64 / (2.0 * zoom);
-                let margin = margin.max(0) as f64 / zoom;
+                let half_width = viewport_size.width as f64 / 2.0;
+                let half_height = viewport_size.height as f64 / 2.0;
+                let margin = margin.max(0) as f64;
                 let available_width = (half_width * 2.0 - margin * 2.0).max(0.0);
                 let available_height = (half_height * 2.0 - margin * 2.0).max(0.0);
                 if rect.size.width as f64 > available_width {
@@ -244,7 +243,6 @@ impl Scale120 {
 pub struct Output {
     pub id: OutputId,
     pub stable_key: String,
-    pub current_workspace: Option<WorkspaceId>,
     pub physical_size: Size,
     pub logical_size: Size,
     pub native_scale: Scale120,
@@ -256,11 +254,27 @@ impl Output {
         Self {
             id,
             stable_key: stable_key.into(),
-            current_workspace: None,
             physical_size: logical_size,
             logical_size,
             native_scale: Scale120::ONE,
             transform: OutputTransform::Normal,
         }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OutputWorkspaceSet {
+    pub output: Output,
+    pub workspaces: Vec<Workspace>,
+    pub active: usize,
+}
+
+impl OutputWorkspaceSet {
+    pub fn active_workspace(&self) -> Option<&Workspace> {
+        self.workspaces.get(self.active)
+    }
+
+    pub fn active_workspace_mut(&mut self) -> Option<&mut Workspace> {
+        self.workspaces.get_mut(self.active)
     }
 }
