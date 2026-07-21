@@ -9,7 +9,7 @@ pub use desktop::{Desktop, DesktopError, DesktopEvent, WorkspaceTransaction};
 pub use geometry::{Direction, Point, Rect, Size};
 pub use layout::{LayoutDelta, LayoutError, Movement, RadialSolver, WindowTransaction};
 pub use model::{
-    CameraPolicy, CameraState, FloatingPlacement, FullscreenPlacement, Output, OutputId,
-    OutputTransform, OutputWorkspaceSet, RestorePlacement, Scale120, TiledWindow, WindowId,
-    WindowMode, Workspace, WorkspaceId,
+    CameraPolicy, CameraState, FloatingPlacement, FullscreenPlacement, NormalizedPoint, Output,
+    OutputId, OutputTransform, OutputWorkspaceSet, RestorePlacement, Scale120, TiledWindow,
+    ViewportPlacement, WindowId, WindowMode, Workspace, WorkspaceId,
 };

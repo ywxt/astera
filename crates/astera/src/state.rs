@@ -547,7 +547,7 @@ impl Astera {
                 ))
             }
             WindowMode::Floating => {
-                let mut rect = workspace.floating[&id].rect;
+                let mut rect = workspace.floating[&id].viewport.rect;
                 if let Some(drag) = self
                     .drag
                     .filter(|drag| drag.window == id && output_id == self.active_output)
@@ -624,7 +624,7 @@ impl Astera {
         };
         let start = match mode {
             WindowMode::Tiled => workspace.tiled[&window].geometry.origin,
-            WindowMode::Floating => workspace.floating[&window].rect.origin,
+            WindowMode::Floating => workspace.floating[&window].viewport.rect.origin,
             WindowMode::Fullscreen => unreachable!(),
         };
         self.drag = Some(DragState {
@@ -704,6 +704,7 @@ impl Astera {
             },
             WindowMode::Floating => {
                 let size = self.desktop.workspace(workspace).unwrap().floating[&drag.window]
+                    .viewport
                     .rect
                     .size;
                 WindowTransaction::MoveFloating {

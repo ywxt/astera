@@ -194,9 +194,11 @@ impl RadialSolver {
                     .floating
                     .get_mut(&id)
                     .ok_or(LayoutError::UnknownWindow(id))?;
-                let from = placement.rect.origin;
-                placement.rect = clamp_to_viewport(target, viewport_size);
-                let to = placement.rect.origin;
+                let from = placement.viewport.rect.origin;
+                placement.viewport.rect = clamp_to_viewport(target, viewport_size);
+                placement.viewport.normalized_center =
+                    crate::NormalizedPoint::from_rect(placement.viewport.rect, viewport_size);
+                let to = placement.viewport.rect.origin;
                 workspace.focus(id);
                 Ok((
                     None,
@@ -293,7 +295,7 @@ impl RadialSolver {
                     world_rect: workspace.tiled.remove(&id).unwrap().geometry,
                 },
                 WindowMode::Floating => RestorePlacement::Floating {
-                    viewport_rect: workspace.floating.remove(&id).unwrap().rect,
+                    viewport: workspace.floating.remove(&id).unwrap().viewport,
                 },
                 WindowMode::Fullscreen => unreachable!(),
             };
@@ -305,19 +307,20 @@ impl RadialSolver {
             return Ok((None, workspace.focus_direction, Vec::new()));
         }
 
-        let (rect, geometry_mode) = match current {
+        let (rect, geometry_mode, saved_viewport) = match current {
             WindowMode::Tiled => (
                 workspace.tiled.remove(&id).unwrap().geometry,
                 WindowMode::Tiled,
+                None,
             ),
-            WindowMode::Floating => (
-                workspace.floating.remove(&id).unwrap().rect,
-                WindowMode::Floating,
-            ),
+            WindowMode::Floating => {
+                let viewport = workspace.floating.remove(&id).unwrap().viewport;
+                (viewport.rect, WindowMode::Floating, Some(viewport))
+            }
             WindowMode::Fullscreen => match workspace.fullscreen.take().unwrap().restore {
-                RestorePlacement::Tiled { world_rect } => (world_rect, WindowMode::Tiled),
-                RestorePlacement::Floating { viewport_rect } => {
-                    (viewport_rect, WindowMode::Floating)
+                RestorePlacement::Tiled { world_rect } => (world_rect, WindowMode::Tiled, None),
+                RestorePlacement::Floating { viewport } => {
+                    (viewport.rect, WindowMode::Floating, Some(viewport))
                 }
             },
         };
@@ -348,7 +351,12 @@ impl RadialSolver {
                     id,
                     FloatingPlacement {
                         window: id,
-                        rect: clamp_to_viewport(viewport_rect, viewport_size),
+                        viewport: saved_viewport.unwrap_or_else(|| {
+                            crate::ViewportPlacement::new(
+                                clamp_to_viewport(viewport_rect, viewport_size),
+                                viewport_size,
+                            )
+                        }),
                     },
                 );
                 None
@@ -612,7 +620,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let floating_rect = workspace.floating[&WindowId(1)].rect;
+        let floating_rect = workspace.floating[&WindowId(1)].viewport.rect;
         solver
             .apply(
                 &mut workspace,
@@ -633,7 +641,10 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(workspace.floating[&WindowId(1)].rect, floating_rect);
+        assert_eq!(
+            workspace.floating[&WindowId(1)].viewport.rect,
+            floating_rect
+        );
     }
 
     #[test]

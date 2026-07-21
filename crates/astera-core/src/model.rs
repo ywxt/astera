@@ -49,15 +49,69 @@ pub struct TiledWindow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ViewportPlacement {
+    pub rect: Rect,
+    pub normalized_center: NormalizedPoint,
+    pub output_rects: BTreeMap<String, Rect>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NormalizedPoint {
+    pub x_millionths: u32,
+    pub y_millionths: u32,
+}
+
+impl ViewportPlacement {
+    pub fn new(rect: Rect, viewport: Size) -> Self {
+        Self {
+            rect,
+            normalized_center: NormalizedPoint::from_rect(rect, viewport),
+            output_rects: BTreeMap::new(),
+        }
+    }
+
+    pub fn store_for_output(&mut self, output: &str, viewport: Size) {
+        self.normalized_center = NormalizedPoint::from_rect(self.rect, viewport);
+        self.output_rects.insert(output.to_owned(), self.rect);
+    }
+}
+
+impl NormalizedPoint {
+    const DENOMINATOR: f64 = 1_000_000.0;
+
+    pub fn from_rect(rect: Rect, viewport: Size) -> Self {
+        let center = rect.center();
+        Self {
+            x_millionths: normalize_axis(center.x, viewport.width),
+            y_millionths: normalize_axis(center.y, viewport.height),
+        }
+    }
+
+    pub fn center_in(self, viewport: Size) -> Point {
+        Point::new(
+            (self.x_millionths as f64 / Self::DENOMINATOR * viewport.width as f64).round() as i64,
+            (self.y_millionths as f64 / Self::DENOMINATOR * viewport.height as f64).round() as i64,
+        )
+    }
+}
+
+fn normalize_axis(value: i64, extent: i64) -> u32 {
+    if extent <= 0 {
+        return 500_000;
+    }
+    ((value as f64 / extent as f64).clamp(0.0, 1.0) * NormalizedPoint::DENOMINATOR).round() as u32
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FloatingPlacement {
     pub window: WindowId,
-    pub rect: Rect,
+    pub viewport: ViewportPlacement,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RestorePlacement {
     Tiled { world_rect: Rect },
-    Floating { viewport_rect: Rect },
+    Floating { viewport: ViewportPlacement },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -68,9 +122,9 @@ pub struct FullscreenPlacement {
 
 impl FullscreenPlacement {
     pub fn size(&self) -> Size {
-        match self.restore {
+        match &self.restore {
             RestorePlacement::Tiled { world_rect } => world_rect.size,
-            RestorePlacement::Floating { viewport_rect } => viewport_rect.size,
+            RestorePlacement::Floating { viewport } => viewport.rect.size,
         }
     }
 }
@@ -134,7 +188,7 @@ impl Workspace {
     pub fn window_size(&self, id: WindowId) -> Option<Size> {
         match self.window_mode(id)? {
             WindowMode::Tiled => Some(self.tiled[&id].geometry.size),
-            WindowMode::Floating => Some(self.floating[&id].rect.size),
+            WindowMode::Floating => Some(self.floating[&id].viewport.rect.size),
             WindowMode::Fullscreen => self.fullscreen.as_ref().map(FullscreenPlacement::size),
         }
     }
