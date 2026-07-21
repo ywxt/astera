@@ -249,6 +249,22 @@ impl Astera {
                 entered_surfaces: Vec::new(),
             },
         );
+        if let Some(workspace) = self
+            .desktop
+            .workspaces
+            .values()
+            .find(|workspace| workspace.bound_output.is_none())
+            .map(|workspace| workspace.id)
+        {
+            self.desktop.apply(WorkspaceTransaction::Bind {
+                workspace,
+                output: output.id,
+            })?;
+        }
+        if self.desktop.outputs.len() == 1 {
+            self.active_output = output.id;
+        }
+        self.refresh_visible_scales();
         Ok(())
     }
 
