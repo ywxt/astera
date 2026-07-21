@@ -1135,6 +1135,15 @@ impl Astera {
                 self.active_output = output;
                 Ok(())
             }
+            Command::ConfigureOutput {
+                output,
+                physical_size,
+                logical_size,
+                native_scale,
+                transform,
+            } => self
+                .configure_output(output, physical_size, logical_size, native_scale, transform)
+                .map_err(map_desktop_error),
             Command::BindWorkspace { workspace, output }
             | Command::MoveWorkspaceToOutput { workspace, output } => self
                 .desktop

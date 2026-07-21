@@ -36,9 +36,11 @@ WAYLAND_DISPLAY=astera-1 weston-terminal
 
 The compositor also creates `<runtime-dir>/<wayland-display>.ipc`. It accepts one
 RON-encoded `astera_ipc::Request` per connection (the client must close its write
-half) and returns a RON-encoded `Response<DesktopSnapshot>`. Protocol v2 exposes
+half) and returns a RON-encoded `Response<DesktopSnapshot>`. Protocol v3 exposes
 output focus, workspace bind/swap, window transfer, mode changes and camera
-commands. `GetState` reports both visible and background workspaces.
+commands, plus per-output physical/logical size, scale and transform updates.
+`GetState` reports both visible and background workspaces and complete output
+configuration.
 
 Default nested-backend bindings use the logo/Super modifier:
 
