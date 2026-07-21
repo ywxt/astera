@@ -90,6 +90,7 @@ struct OutputRuntime {
     wayland: SmithayOutput,
     global: GlobalId,
     entered_surfaces: Vec<WlSurface>,
+    location: Point,
 }
 
 pub struct Astera {
@@ -193,6 +194,7 @@ impl Astera {
                     wayland: wayland_output,
                     global: output_global,
                     entered_surfaces: Vec::new(),
+                    location: Point::ORIGIN,
                 },
             )]),
             shm_state,
@@ -247,6 +249,7 @@ impl Astera {
                 wayland,
                 global,
                 entered_surfaces: Vec::new(),
+                location: Point::ORIGIN,
             },
         );
         if let Some(workspace) = self
@@ -264,6 +267,7 @@ impl Astera {
         if self.desktop.outputs.len() == 1 {
             self.active_output = output.id;
         }
+        self.reflow_outputs();
         self.refresh_visible_scales();
         Ok(())
     }
@@ -285,6 +289,7 @@ impl Astera {
                 self.active_output = next;
             }
         }
+        self.reflow_outputs();
         tracing::info!(?output, ?event, "output disconnected");
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
@@ -345,12 +350,8 @@ impl Astera {
                 }
             }
             InputEvent::PointerMotion { event } => {
-                let size = self.desktop.outputs[&self.active_output].logical_size;
                 let delta = event.delta_unaccel();
-                let location = SmithayPoint::from((
-                    (self.pointer_location.x + delta.x).clamp(0.0, size.width as f64 - 1.0),
-                    (self.pointer_location.y + delta.y).clamp(0.0, size.height as f64 - 1.0),
-                ));
+                let location = self.relative_pointer_location(delta.x, delta.y);
                 self.pointer_location = location;
                 if self.drag.is_some() {
                     self.update_drag(location);
@@ -384,6 +385,60 @@ impl Astera {
         let serial = self.serial;
         self.serial = self.serial.wrapping_add(1).max(1);
         serial.into()
+    }
+
+    fn relative_pointer_location(
+        &mut self,
+        dx: f64,
+        dy: f64,
+    ) -> SmithayPoint<f64, smithay::utils::Logical> {
+        let previous_output = self.active_output;
+        let mut x = self.pointer_location.x + dx;
+        let y = self.pointer_location.y + dy;
+        if self.drag.is_none() {
+            loop {
+                let width = self.desktop.outputs[&self.active_output].logical_size.width as f64;
+                if x >= width {
+                    let Some(next) = self.adjacent_output(self.active_output, true) else {
+                        x = width - 1.0;
+                        break;
+                    };
+                    x -= width;
+                    self.active_output = next;
+                } else if x < 0.0 {
+                    let Some(previous) = self.adjacent_output(self.active_output, false) else {
+                        x = 0.0;
+                        break;
+                    };
+                    self.active_output = previous;
+                    x += self.desktop.outputs[&previous].logical_size.width as f64;
+                } else {
+                    break;
+                }
+            }
+        }
+        let size = self.desktop.outputs[&self.active_output].logical_size;
+        let location = SmithayPoint::from((
+            x.clamp(0.0, size.width as f64 - 1.0),
+            y.clamp(0.0, size.height as f64 - 1.0),
+        ));
+        if self.active_output != previous_output {
+            self.sync_keyboard_focus();
+        }
+        location
+    }
+
+    fn adjacent_output(&self, output: OutputId, forward: bool) -> Option<OutputId> {
+        let outputs = self.desktop.outputs.keys().copied().collect::<Vec<_>>();
+        let index = outputs.iter().position(|candidate| *candidate == output)?;
+        if forward {
+            outputs.get(index + 1).copied()
+        } else {
+            index
+                .checked_sub(1)
+                .and_then(|index| outputs.get(index))
+                .copied()
+        }
     }
 
     fn surface_under(
@@ -920,10 +975,38 @@ impl Astera {
             None,
         );
         runtime.wayland.set_preferred(mode);
+        self.reflow_outputs();
         self.configure_fullscreen_windows();
         self.configure_layer_surfaces();
         self.refresh_visible_scales();
         Ok(())
+    }
+
+    fn reflow_outputs(&mut self) {
+        let mut x = 0_i64;
+        let placements = self
+            .desktop
+            .outputs
+            .iter()
+            .map(|(id, output)| {
+                let placement = (*id, Point::new(x, 0));
+                x = x.saturating_add(output.logical_size.width);
+                placement
+            })
+            .collect::<Vec<_>>();
+        for (output, location) in placements {
+            let runtime = self
+                .output_runtime
+                .get_mut(&output)
+                .expect("desktop output has a Wayland runtime");
+            runtime.location = location;
+            runtime.wayland.change_current_state(
+                None,
+                None,
+                None,
+                Some((saturating_i32(location.x), saturating_i32(location.y)).into()),
+            );
+        }
     }
 
     fn active_scale(&self) -> f64 {
@@ -1585,6 +1668,10 @@ mod tests {
         assert_eq!(runtime.current_mode().unwrap().size, (3840, 2160).into());
         assert_eq!(runtime.current_scale().fractional_scale(), 1.5);
         assert_eq!(runtime.current_transform(), smithay::utils::Transform::_90);
+        assert_eq!(
+            state.output_runtime[&OutputId(1)].location,
+            Point::new(1280, 0)
+        );
         state
             .desktop
             .apply(WorkspaceTransaction::Bind {
@@ -1636,5 +1723,36 @@ mod tests {
         assert_eq!(runtime.current_mode().unwrap().size, (3000, 2000).into());
         assert_eq!(runtime.current_scale().fractional_scale(), 1.5);
         assert_eq!(runtime.current_transform(), smithay::utils::Transform::_180);
+    }
+
+    #[test]
+    fn pointer_crosses_outputs_but_compositor_drag_stays_local() {
+        let display = Display::<Astera>::new().unwrap();
+        let mut state = Astera::new(&display.handle(), Config::default());
+        state
+            .connect_output(Output::new(
+                OutputId(1),
+                "test-output-2",
+                Size::new(1920, 1080),
+            ))
+            .unwrap();
+        state.pointer_location = (1270.0, 200.0).into();
+
+        let location = state.relative_pointer_location(20.0, 0.0);
+        assert_eq!(state.active_output, OutputId(1));
+        assert_eq!(location, (10.0, 200.0).into());
+
+        state.active_output = OutputId(0);
+        state.pointer_location = (1270.0, 200.0).into();
+        state.drag = Some(DragState {
+            window: WindowId(999),
+            mode: WindowMode::Floating,
+            grab_offset: (0.0, 0.0),
+            target: Point::ORIGIN,
+            start: Point::ORIGIN,
+        });
+        let location = state.relative_pointer_location(20.0, 0.0);
+        assert_eq!(state.active_output, OutputId(0));
+        assert_eq!(location, (1279.0, 200.0).into());
     }
 }
