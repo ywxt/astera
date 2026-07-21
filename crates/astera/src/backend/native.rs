@@ -37,7 +37,7 @@ use smithay::{
     desktop::PopupManager,
     reexports::{
         calloop::{EventLoop, LoopHandle, RegistrationToken},
-        drm::control::{ModeTypeFlags, connector, crtc},
+        drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc, property::Value},
         input::Libinput,
         rustix::fs::OFlags,
         wayland_server::{Display, ListeningSocket},
@@ -76,6 +76,36 @@ type NativeOutputManager = DrmOutputManager<
     (),
     DrmDeviceFd,
 >;
+
+fn edid_output_key(device: &impl ControlDevice, connector: connector::Handle) -> Option<String> {
+    let properties = device.get_properties(connector).ok()?;
+    for (handle, raw) in properties.iter() {
+        let info = device.get_property(*handle).ok()?;
+        if info.name().to_bytes() != b"EDID" {
+            continue;
+        }
+        let Value::Blob(blob) = info.value_type().convert_value(*raw) else {
+            continue;
+        };
+        if blob == 0 {
+            continue;
+        }
+        let edid = device.get_property_blob(blob).ok()?;
+        if edid.len() < 16 {
+            continue;
+        }
+        let manufacturer = u16::from_be_bytes([edid[8], edid[9]]);
+        let product = u16::from_le_bytes([edid[10], edid[11]]);
+        let serial = u32::from_le_bytes([edid[12], edid[13], edid[14], edid[15]]);
+        let fingerprint = edid.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+        return Some(format!(
+            "edid:{manufacturer:04x}:{product:04x}:{serial:08x}:{fingerprint:016x}"
+        ));
+    }
+    None
+}
 
 struct NativeDevice {
     output_manager: NativeOutputManager,
@@ -177,9 +207,16 @@ impl NativeLoop {
                     );
                     let id = OutputId(self.next_output_id);
                     self.next_output_id += 1;
+                    let stable_key = self
+                        .devices
+                        .get(&node)
+                        .and_then(|device| {
+                            edid_output_key(device.output_manager.device(), connector.handle())
+                        })
+                        .unwrap_or_else(|| format!("{node:?}:{name}"));
                     let output = Output::new(
                         id,
-                        format!("{node:?}:{name}"),
+                        stable_key,
                         Size::new(i64::from(width), i64::from(height)),
                     );
                     match self.state.connect_output(output) {
