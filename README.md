@@ -1,9 +1,9 @@
 # Astera
 
 Astera is an experimental infinite-canvas Wayland compositor written in Rust.
-Each workspace is an independent infinite world and can be bound to at most one
-output at a time. Opening or placing a tiled window pushes intersecting tiled
-windows outward until the layout is stable.
+Each output owns an independent ordered set of dynamic workspaces. Every
+workspace is an infinite world; opening or placing a tiled window pushes
+intersecting tiled windows outward until the layout is stable.
 
 Windows have three exclusive modes:
 
@@ -11,9 +11,15 @@ Windows have three exclusive modes:
 - floating windows use viewport-local coordinates and follow their workspace;
 - one fullscreen window may cover the output currently showing the workspace.
 
-Workspaces can move or swap between outputs. Disconnecting an output leaves its
-workspace intact in the background, including camera, focus, floating and
-fullscreen state.
+Every connected output always has one empty workspace at the end. Using or
+naming it creates the next placeholder. Empty, unnamed, inactive workspaces are
+removed automatically. Workspace IDs are globally stable for IPC, while numbers
+shown to users are one-based and local to each output.
+
+Workspaces can move between outputs. The first connected output is primary; when
+another output disconnects, its non-empty or named workspaces are appended to the
+primary output. They remember their original output and return when it
+reconnects. If every output disconnects, they remain detached until one returns.
 
 The repository contains the compositor-independent layout engine, configuration
 and IPC contracts, plus a first Smithay nested backend. Native Wayland clients
@@ -37,9 +43,9 @@ cargo run -p astera -- --backend=native
 The native backend requires an active seat (for example seatd or logind) and
 permission to open the DRM and input devices. It discovers GPUs and connectors
 through udev, assigns a CRTC and preferred mode to every usable connector, and
-renders each output with its own GBM/KMS swapchain. Connector removal unbinds
-the workspace without destroying it; reconnecting an output binds the first
-available background workspace.
+renders each output with its own GBM/KMS swapchain. Connector removal preserves
+workspace layout, focus and camera state. Reconnecting the same stable output
+restores its workspaces and last active workspace.
 
 Astera prints the socket name when it starts. Launch a client from another
 terminal with the printed value, for example:
@@ -50,11 +56,13 @@ WAYLAND_DISPLAY=astera-1 weston-terminal
 
 The compositor also creates `<runtime-dir>/<wayland-display>.ipc`. It accepts one
 RON-encoded `astera_ipc::Request` per connection (the client must close its write
-half) and returns a RON-encoded `Response<DesktopSnapshot>`. Protocol v3 exposes
-output focus, workspace bind/swap, window transfer, mode changes and camera
-commands, plus per-output physical/logical size, scale and transform updates.
-`GetState` reports both visible and background workspaces and complete output
-configuration.
+half) and returns a RON-encoded `Response<DesktopSnapshot>`. Protocol v4 exposes
+output focus, workspace focus/move/name operations, window transfer, mode and
+camera commands, plus per-output physical/logical size, scale and transform
+updates. Outputs can be selected by ID, stable key or active output. Workspaces
+can be selected by global ID, unique name, or output-local index. `GetState`
+reports each output's ordered workspace set, active workspace and detached
+workspaces.
 
 For a human-readable workspace overview and output status, run:
 
@@ -62,14 +70,14 @@ For a human-readable workspace overview and output status, run:
 WAYLAND_DISPLAY=astera-1 cargo run -p astera --bin astera-msg -- overview
 ```
 
-The active output is marked with `*`; unbound workspaces are explicitly shown as
+The active output is marked with `*`; detached workspaces are shown as
 `background`.
 
 Default nested-backend bindings use the logo/Super modifier:
 
-- `Super+1` through `Super+9`: show that workspace on the active output, swapping
-  with the workspace already there;
-- `Super+Shift+1` through `Super+Shift+9`: send the focused window;
+- `Super+1` through `Super+9`: focus that output-local workspace index;
+- `Super+Shift+1` through `Super+Shift+9`: send the focused window to that
+  output-local workspace;
 - `Super+Space`: toggle tiled/floating;
 - `Super+F`: enter fullscreen or restore the previous mode;
 - `Super+Arrow`: pan the current workspace camera by 160 logical units.
@@ -88,8 +96,8 @@ Camera policy is stored by the workspace and follows it between outputs.
 `Centered` places the focused tiled window at the viewport center;
 `KeepVisible` performs only the minimum pan required to keep the complete window
 inside the configured margin. Focusing floating or fullscreen content never moves
-the world camera. Workspace swaps restore focus and xdg activation on the output
-that receives the workspace.
+the world camera. Camera zoom is not persistent workspace state; a future
+overview may apply a temporary render-only scale.
 
 XDG popups are tracked as children of their parent, rendered and hit-tested with
 the parent transform, receive frame callbacks, and support nested keyboard and
@@ -106,9 +114,10 @@ one surface to satisfy two output scales simultaneously.
 
 Native outputs are arranged left-to-right for pointer traversal. Relative pointer
 motion crosses output boundaries and changes the active output; compositor window
-drags remain clamped to their source output. Per-output physical size, logical
-size, fractional scale and transform can be changed atomically with the protocol
-v3 `ConfigureOutput` IPC command.
+drags remain clamped to their source output. Floating windows keep an exact
+placement cache per stable output key and a normalized fallback anchor for a new
+output. Per-output physical size, logical size, fractional scale and transform
+can be changed atomically with the protocol v4 `ConfigureOutput` IPC command.
 
 Astera remains experimental. Configurable binding files and animated layout
 transitions are not implemented yet.

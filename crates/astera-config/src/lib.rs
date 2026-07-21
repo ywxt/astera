@@ -10,7 +10,6 @@ pub struct Config {
     pub gap: i64,
     pub animation_ms: u64,
     pub camera: CameraPolicy,
-    pub workspace_count: u32,
 }
 
 impl Default for Config {
@@ -19,7 +18,6 @@ impl Default for Config {
             gap: 8,
             animation_ms: 280,
             camera: CameraPolicy::KeepVisible { margin: 32 },
-            workspace_count: 9,
         }
     }
 }
@@ -39,9 +37,6 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.gap < 0 {
             return Err(ConfigError::Invalid("gap cannot be negative"));
-        }
-        if self.workspace_count == 0 {
-            return Err(ConfigError::Invalid("at least one workspace is required"));
         }
         Ok(())
     }

@@ -1032,4 +1032,71 @@ mod tests {
             Some("A")
         );
     }
+
+    #[test]
+    fn empty_ordinary_workspace_is_removed_after_focus_leaves() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        let first = desktop.active_workspace_id(OutputId(1)).unwrap();
+        let window = WindowId(30);
+        desktop
+            .apply_window(
+                first,
+                WindowTransaction::InsertTiled {
+                    id: window,
+                    size: Size::new(400, 300),
+                    anchor: Point::ORIGIN,
+                    seed_direction: crate::Direction::RIGHT,
+                },
+            )
+            .unwrap();
+        desktop
+            .apply_window(first, WindowTransaction::Remove { id: window })
+            .unwrap();
+        let placeholder = desktop.outputs[&OutputId(1)].workspaces.last().unwrap().id;
+        desktop
+            .apply(WorkspaceTransaction::Focus {
+                output: OutputId(1),
+                workspace: placeholder,
+            })
+            .unwrap();
+        assert!(desktop.workspace(first).is_err());
+        assert_eq!(desktop.outputs[&OutputId(1)].workspaces.len(), 1);
+    }
+
+    #[test]
+    fn last_output_detaches_and_reconnect_restores_active_workspace() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        let first = desktop.active_workspace_id(OutputId(1)).unwrap();
+        desktop
+            .apply(WorkspaceTransaction::SetName {
+                workspace: first,
+                name: Some("one".into()),
+            })
+            .unwrap();
+        let second = desktop.outputs[&OutputId(1)].workspaces.last().unwrap().id;
+        desktop
+            .apply(WorkspaceTransaction::SetName {
+                workspace: second,
+                name: Some("two".into()),
+            })
+            .unwrap();
+        desktop
+            .apply(WorkspaceTransaction::Focus {
+                output: OutputId(1),
+                workspace: second,
+            })
+            .unwrap();
+
+        desktop.disconnect_output(OutputId(1)).unwrap();
+        assert!(desktop.outputs.is_empty());
+        assert_eq!(desktop.detached.len(), 2);
+        desktop.connect_output(output(9, "A")).unwrap();
+        assert_eq!(desktop.active_workspace_id(OutputId(9)), Some(second));
+        assert_eq!(
+            desktop.workspace_location(first).unwrap().output,
+            Some(OutputId(9))
+        );
+    }
 }
