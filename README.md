@@ -56,6 +56,15 @@ commands, plus per-output physical/logical size, scale and transform updates.
 `GetState` reports both visible and background workspaces and complete output
 configuration.
 
+For a human-readable workspace overview and output status, run:
+
+```sh
+WAYLAND_DISPLAY=astera-1 cargo run -p astera --bin astera-msg -- overview
+```
+
+The active output is marked with `*`; unbound workspaces are explicitly shown as
+`background`.
+
 Default nested-backend bindings use the logo/Super modifier:
 
 - `Super+1` through `Super+9`: show that workspace on the active output, swapping
