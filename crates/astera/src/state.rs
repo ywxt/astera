@@ -801,6 +801,7 @@ impl Astera {
         &self,
         output: OutputId,
     ) -> impl Iterator<Item = (&ToplevelSurface, SmithayPoint<i32, Physical>, f64)> {
+        let output_scale = self.output_scale(output);
         let mut instances: Vec<_> = self
             .windows
             .iter()
@@ -812,13 +813,15 @@ impl Astera {
             })
             .collect();
         instances.sort_by_key(|(layer, _, _, _)| std::cmp::Reverse(*layer));
-        instances.into_iter().map(|(_, surface, origin, scale)| {
-            (
-                surface,
-                SmithayPoint::from((saturating_i32(origin.x), saturating_i32(origin.y))),
-                scale,
-            )
-        })
+        instances
+            .into_iter()
+            .map(move |(_, surface, origin, scale)| {
+                (
+                    surface,
+                    physical_point(origin, output_scale),
+                    scale * output_scale,
+                )
+            })
     }
 
     pub fn render_roots(&self) -> Vec<(WlSurface, SmithayPoint<i32, Physical>, f64)> {
@@ -875,15 +878,16 @@ impl Astera {
         output: OutputId,
         wanted: Layer,
     ) -> impl Iterator<Item = (WlSurface, SmithayPoint<i32, Physical>, f64)> + '_ {
+        let scale = self.output_scale(output);
         self.layers
             .iter()
             .filter(move |mapped| mapped.output == output && mapped.layer == wanted)
-            .filter_map(|mapped| {
+            .filter_map(move |mapped| {
                 let (origin, _) = self.layer_geometry(mapped)?;
                 Some((
                     mapped.surface.wl_surface().clone(),
-                    (saturating_i32(origin.x), saturating_i32(origin.y)).into(),
-                    1.0,
+                    physical_point(origin, scale),
+                    scale,
                 ))
             })
     }
@@ -1372,6 +1376,18 @@ fn saturating_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
+fn physical_point(origin: Point, scale: f64) -> SmithayPoint<i32, Physical> {
+    (
+        (origin.x as f64 * scale)
+            .round()
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32,
+        (origin.y as f64 * scale)
+            .round()
+            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32,
+    )
+        .into()
+}
+
 impl BufferHandler for Astera {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
 }
@@ -1754,5 +1770,11 @@ mod tests {
         let location = state.relative_pointer_location(20.0, 0.0);
         assert_eq!(state.active_output, OutputId(0));
         assert_eq!(location, (1279.0, 200.0).into());
+    }
+
+    #[test]
+    fn fractional_output_converts_logical_origins_to_physical_pixels() {
+        let physical = physical_point(Point::new(101, -25), 1.5);
+        assert_eq!(physical, (152, -38).into());
     }
 }
