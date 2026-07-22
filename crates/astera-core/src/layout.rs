@@ -87,15 +87,17 @@ impl RadialSolver {
     }
 
     pub fn reflow(&self, workspace: &mut Workspace) -> Result<(), LayoutError> {
-        let windows = workspace.tiled.keys().copied().collect::<Vec<_>>();
+        let mut working = workspace.clone();
+        let windows = working.tiled.keys().copied().collect::<Vec<_>>();
         for window in windows {
-            let direction = workspace.layout_direction_hint;
-            self.solve(workspace, window, direction)?;
+            let direction = working.layout_direction_hint;
+            self.solve(&mut working, window, direction)?;
         }
-        if !workspace.tiled_windows_are_stable(self.gap) {
+        if !working.tiled_windows_are_stable(self.gap) {
             return Err(LayoutError::UnstableResult);
         }
-        workspace.generation = workspace.generation.wrapping_add(1);
+        working.generation = workspace.generation.wrapping_add(1);
+        *workspace = working;
         Ok(())
     }
 
@@ -818,6 +820,28 @@ mod tests {
         solver.reflow(&mut workspace).unwrap();
         assert!(workspace.tiled_windows_are_stable(8));
         assert_eq!(workspace.generation, generation + 1);
+    }
+
+    #[test]
+    fn failed_reflow_is_atomic() {
+        let solver = RadialSolver::new(8).with_operation_limit(1);
+        let mut workspace = Workspace::new(WorkspaceId(1));
+        for id in 1..=4 {
+            workspace.tiled.insert(
+                WindowId(id),
+                TiledWindow {
+                    id: WindowId(id),
+                    geometry: Rect::new(0, 0, 100, 80),
+                },
+            );
+        }
+        let before = workspace.clone();
+        assert!(matches!(
+            solver.reflow(&mut workspace),
+            Err(LayoutError::DidNotConverge(_))
+        ));
+        assert_eq!(workspace.tiled, before.tiled);
+        assert_eq!(workspace.generation, before.generation);
     }
 
     fn apply_fixture(fixture: &[(i16, i16, u16, u16)]) -> Result<Workspace, LayoutError> {

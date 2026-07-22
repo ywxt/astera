@@ -46,8 +46,8 @@ impl Rect {
 
     pub fn centered_at(center: Point, size: Size) -> Self {
         Self::new(
-            center.x - size.width / 2,
-            center.y - size.height / 2,
+            center.x.saturating_sub(size.width / 2),
+            center.y.saturating_sub(size.height / 2),
             size.width,
             size.height,
         )
@@ -55,8 +55,8 @@ impl Rect {
 
     pub fn center(self) -> Point {
         Point::new(
-            self.origin.x + self.size.width / 2,
-            self.origin.y + self.size.height / 2,
+            self.origin.x.saturating_add(self.size.width / 2),
+            self.origin.y.saturating_add(self.size.height / 2),
         )
     }
 
@@ -65,10 +65,17 @@ impl Rect {
     }
 
     pub fn conflicts(self, other: Self, gap: i64) -> bool {
-        self.origin.x < other.origin.x + other.size.width + gap
-            && self.origin.x + self.size.width + gap > other.origin.x
-            && self.origin.y < other.origin.y + other.size.height + gap
-            && self.origin.y + self.size.height + gap > other.origin.y
+        let gap = i128::from(gap.max(0));
+        let (left, top) = (i128::from(self.origin.x), i128::from(self.origin.y));
+        let right = left + i128::from(self.size.width);
+        let bottom = top + i128::from(self.size.height);
+        let (other_left, other_top) = (i128::from(other.origin.x), i128::from(other.origin.y));
+        let other_right = other_left + i128::from(other.size.width);
+        let other_bottom = other_top + i128::from(other.size.height);
+        left < other_right + gap
+            && right + gap > other_left
+            && top < other_bottom + gap
+            && bottom + gap > other_top
     }
 }
 
@@ -97,7 +104,10 @@ impl Direction {
         if from == to {
             fallback.normalized()
         } else {
-            Self::new((to.x - from.x) as f64, (to.y - from.y) as f64)
+            Self::new(
+                (i128::from(to.x) - i128::from(from.x)) as f64,
+                (i128::from(to.y) - i128::from(from.y)) as f64,
+            )
         }
     }
 

@@ -75,6 +75,14 @@ pub enum DesktopError {
     UnknownWindow(WindowId),
     #[error("workspace name {0:?} is already in use")]
     DuplicateWorkspaceName(String),
+    #[error("output stable key {0:?} is already connected")]
+    DuplicateOutputStableKey(String),
+    #[error("output physical and logical sizes must be positive")]
+    InvalidOutputSize,
+    #[error("output scale must be greater than zero")]
+    InvalidOutputScale,
+    #[error("workspace {0:?} contains inconsistent window or focus state")]
+    InvalidWorkspaceState(WorkspaceId),
     #[error("window {window:?} exists in multiple workspaces {first:?} and {second:?}")]
     DuplicateWindow {
         window: WindowId,
@@ -112,6 +120,16 @@ impl Desktop {
         let output_id = output.id;
         if working.outputs.contains_key(&output.id) {
             return Err(DesktopError::UnknownOutput(output.id));
+        }
+        validate_output_geometry(&output)?;
+        if working
+            .outputs
+            .values()
+            .any(|set| set.output.stable_key == output.stable_key)
+        {
+            return Err(DesktopError::DuplicateOutputStableKey(
+                output.stable_key.clone(),
+            ));
         }
         let key = output.stable_key.clone();
         let target_size = output.logical_size;
@@ -348,6 +366,12 @@ impl Desktop {
         transform: OutputTransform,
     ) -> Result<(), DesktopError> {
         let mut working = self.clone();
+        if !physical_size.is_valid() || !logical_size.is_valid() {
+            return Err(DesktopError::InvalidOutputSize);
+        }
+        if native_scale.0 == 0 {
+            return Err(DesktopError::InvalidOutputScale);
+        }
         let set = working
             .outputs
             .get_mut(&output)
@@ -395,6 +419,7 @@ impl Desktop {
     pub fn find_window(&self, window: WindowId) -> Result<WorkspaceId, DesktopError> {
         let mut found = None;
         for workspace in self.workspaces() {
+            validate_workspace_state(workspace)?;
             if workspace.contains_window(window) {
                 if let Some(first) = found {
                     return Err(DesktopError::DuplicateWindow {
@@ -608,6 +633,10 @@ impl Desktop {
         let source = self.find_window(window)?;
         self.workspace(target)?;
         if source == target {
+            if activate && let Some(output) = self.workspace_location(target)?.output {
+                let index = self.workspace_location(target)?.index;
+                self.outputs.get_mut(&output).unwrap().active = index;
+            }
             return Ok(DesktopEvent::WindowSent {
                 window,
                 source,
@@ -805,9 +834,19 @@ impl Desktop {
             return Err(DesktopError::UnknownOutput(primary));
         }
         let mut ids = BTreeMap::new();
+        let mut output_keys = BTreeMap::new();
         let mut names = BTreeMap::new();
         let mut windows = BTreeMap::new();
         for (output, set) in &self.outputs {
+            validate_output_geometry(&set.output)?;
+            if output_keys
+                .insert(set.output.stable_key.as_str(), *output)
+                .is_some()
+            {
+                return Err(DesktopError::DuplicateOutputStableKey(
+                    set.output.stable_key.clone(),
+                ));
+            }
             if set.output.id != *output || set.active >= set.workspaces.len() {
                 return Err(DesktopError::UnknownOutput(*output));
             }
@@ -844,6 +883,40 @@ impl Desktop {
             }
         }
         Ok(())
+    }
+}
+
+fn validate_output_geometry(output: &Output) -> Result<(), DesktopError> {
+    if !output.physical_size.is_valid() || !output.logical_size.is_valid() {
+        return Err(DesktopError::InvalidOutputSize);
+    }
+    if output.native_scale.0 == 0 {
+        return Err(DesktopError::InvalidOutputScale);
+    }
+    Ok(())
+}
+
+fn validate_workspace_state(workspace: &Workspace) -> Result<(), DesktopError> {
+    let tiled_valid = workspace
+        .tiled
+        .iter()
+        .all(|(id, window)| *id == window.id && window.geometry.size.is_valid());
+    let floating_valid = workspace
+        .floating
+        .iter()
+        .all(|(id, placement)| *id == placement.window && placement.viewport.rect.size.is_valid());
+    let focus_valid = workspace
+        .focused_window
+        .is_none_or(|window| workspace.contains_window(window));
+    let mut history = BTreeMap::new();
+    let history_valid = workspace
+        .focus_history
+        .iter()
+        .all(|window| workspace.contains_window(*window) && history.insert(*window, ()).is_none());
+    if tiled_valid && floating_valid && focus_valid && history_valid {
+        Ok(())
+    } else {
+        Err(DesktopError::InvalidWorkspaceState(workspace.id))
     }
 }
 
@@ -1390,5 +1463,118 @@ mod tests {
             Some(window)
         );
         assert_eq!(desktop.active_workspace_id(OutputId(1)), Some(target));
+    }
+
+    #[test]
+    fn duplicate_output_identity_and_invalid_geometry_are_rejected() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "same")).unwrap();
+        assert_eq!(
+            desktop.connect_output(output(2, "same")),
+            Err(DesktopError::DuplicateOutputStableKey("same".into()))
+        );
+        let mut invalid = output(2, "B");
+        invalid.logical_size = Size::new(0, 1080);
+        assert_eq!(
+            desktop.connect_output(invalid),
+            Err(DesktopError::InvalidOutputSize)
+        );
+        assert_eq!(
+            desktop.configure_output(
+                OutputId(1),
+                Size::new(1920, 1080),
+                Size::new(1920, 1080),
+                Scale120(0),
+                OutputTransform::Normal,
+            ),
+            Err(DesktopError::InvalidOutputScale)
+        );
+        assert_eq!(desktop.outputs.len(), 1);
+    }
+
+    #[test]
+    fn same_workspace_send_still_honors_activate() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        let source = desktop.active_workspace_id(OutputId(1)).unwrap();
+        desktop
+            .apply(WorkspaceTransaction::SetName {
+                workspace: source,
+                name: Some("source".into()),
+            })
+            .unwrap();
+        let other = desktop.outputs[&OutputId(1)].workspaces.last().unwrap().id;
+        desktop
+            .apply(WorkspaceTransaction::SetName {
+                workspace: other,
+                name: Some("other".into()),
+            })
+            .unwrap();
+        desktop
+            .apply(WorkspaceTransaction::Focus {
+                output: OutputId(1),
+                workspace: other,
+            })
+            .unwrap();
+        let window = WindowId(90);
+        desktop
+            .apply_window(
+                source,
+                WindowTransaction::InsertTiled {
+                    id: window,
+                    size: Size::new(100, 100),
+                    anchor: Point::ORIGIN,
+                    seed_direction: crate::Direction::RIGHT,
+                },
+            )
+            .unwrap();
+        desktop
+            .apply(WorkspaceTransaction::SendWindow {
+                window,
+                target: source,
+                activate: true,
+            })
+            .unwrap();
+        assert_eq!(desktop.active_workspace_id(OutputId(1)), Some(source));
+    }
+
+    #[test]
+    fn output_reconfigure_and_layout_reflow_commit_atomically() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        let workspace = desktop.active_workspace_id(OutputId(1)).unwrap();
+        let window = WindowId(91);
+        desktop
+            .apply_window(
+                workspace,
+                WindowTransaction::InsertTiled {
+                    id: window,
+                    size: Size::new(200, 100),
+                    anchor: Point::new(2_000, 1_000),
+                    seed_direction: crate::Direction::RIGHT,
+                },
+            )
+            .unwrap();
+        assert!(desktop.output(OutputId(1)).is_some());
+        desktop.output_mut(OutputId(1)).unwrap().physical_size = Size::new(2560, 1440);
+        desktop
+            .configure_output(
+                OutputId(1),
+                Size::new(2560, 1440),
+                Size::new(1280, 720),
+                Scale120(240),
+                OutputTransform::Rotate90,
+            )
+            .unwrap();
+        assert_eq!(
+            desktop.output(OutputId(1)).unwrap().native_scale,
+            Scale120(240)
+        );
+        desktop
+            .reconfigure_layout(24, crate::CameraPolicy::Centered)
+            .unwrap();
+        let state = desktop.workspace(workspace).unwrap();
+        assert_eq!(state.camera.policy, crate::CameraPolicy::Centered);
+        assert_eq!(state.camera.center, state.tiled[&window].geometry.center());
     }
 }
