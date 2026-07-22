@@ -14,7 +14,7 @@ use astera_ipc::{
 fn main() -> Result<(), Box<dyn Error>> {
     let command = env::args().nth(1).unwrap_or_else(|| "overview".to_owned());
     if command != "overview" {
-        return Err(format!("unknown command {command:?}; usage: astera-msg [overview]").into());
+        return Err(format!("unknown command {command:?}; usage: astrology [overview]").into());
     }
     let display = env::var("WAYLAND_DISPLAY")?;
     let runtime = env::var_os("XDG_RUNTIME_DIR")

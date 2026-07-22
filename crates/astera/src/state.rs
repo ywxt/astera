@@ -256,6 +256,14 @@ impl Astera {
         }
         self.reflow_outputs();
         self.refresh_visible_scales();
+        let workspace = self.desktop.active_workspace_id(output.id);
+        tracing::info!(
+            output = ?output.id,
+            stable_key = %output.stable_key,
+            ?workspace,
+            outputs = self.desktop.outputs.len(),
+            "output connected"
+        );
         Ok(())
     }
 
@@ -426,6 +434,11 @@ impl Astera {
             y.clamp(0.0, size.height as f64 - 1.0),
         ));
         if self.active_output != previous_output {
+            tracing::debug!(
+                from = ?previous_output,
+                to = ?self.active_output,
+                "pointer crossed output boundary"
+            );
             self.sync_keyboard_focus();
         }
         location
@@ -651,6 +664,7 @@ impl Astera {
             target: start,
             start,
         });
+        tracing::debug!(?window, ?workspace_id, ?mode, "compositor drag started");
         let _ = self.desktop.focus_window(window);
         self.sync_keyboard_focus();
     }
@@ -734,6 +748,15 @@ impl Astera {
         };
         if let Err(error) = self.desktop.apply_window(workspace, transaction) {
             tracing::warn!(%error, window = ?drag.window, "drag transaction failed");
+        } else {
+            tracing::info!(
+                window = ?drag.window,
+                ?workspace,
+                mode = ?drag.mode,
+                from = ?drag.start,
+                to = ?drag.target,
+                "compositor drag committed"
+            );
         }
     }
 
@@ -1098,15 +1121,25 @@ impl Astera {
         self.windows.retain(|mapped| mapped.surface.alive());
         for id in dead {
             if let Ok(workspace) = self.desktop.find_window(id) {
-                let _ = self
+                match self
                     .desktop
-                    .apply_window(workspace, WindowTransaction::Remove { id });
+                    .apply_window(workspace, WindowTransaction::Remove { id })
+                {
+                    Ok(()) => tracing::info!(window = ?id, ?workspace, "window removed"),
+                    Err(error) => {
+                        tracing::warn!(window = ?id, ?workspace, %error, "window removal failed")
+                    }
+                }
             }
         }
         self.refresh_visible_scales();
     }
 
     pub fn execute_command(&mut self, command: Command) -> Response<DesktopSnapshot> {
+        match &command {
+            Command::GetState => tracing::debug!("IPC state snapshot requested"),
+            command => tracing::info!(?command, "command started"),
+        }
         let mode_change = match &command {
             Command::SetWindowMode { window, mode } => Some((*window, *mode)),
             _ => None,
@@ -1124,7 +1157,10 @@ impl Astera {
                         .with_active_output(Some(self.active_output)),
                 )
             }
-            Err((code, message)) => Response::Error { code, message },
+            Err((code, message)) => {
+                tracing::warn!(?code, %message, "command failed");
+                Response::Error { code, message }
+            }
         }
     }
 
@@ -1566,6 +1602,7 @@ impl WlrLayerShellHandler for Astera {
             layer,
             output,
         });
+        tracing::info!(?output, ?layer, "layer surface mapped");
         self.configure_layer_surface(&surface);
         self.refresh_visible_scales();
     }
@@ -1582,6 +1619,7 @@ impl WlrLayerShellHandler for Astera {
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
         self.layers.retain(|mapped| mapped.surface != surface);
+        tracing::debug!("layer surface destroyed");
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
     }
@@ -1632,6 +1670,12 @@ impl XdgShellHandler for Astera {
         });
         surface.send_configure();
         self.windows.push(MappedWindow { id, surface });
+        tracing::info!(
+            window = ?id,
+            workspace = ?workspace_id,
+            output = ?self.active_output,
+            "toplevel mapped"
+        );
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
     }

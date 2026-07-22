@@ -67,7 +67,7 @@ workspaces.
 For a human-readable workspace overview and output status, run:
 
 ```sh
-WAYLAND_DISPLAY=astera-1 cargo run -p astera --bin astera-msg -- overview
+WAYLAND_DISPLAY=astera-1 cargo run -p astera --bin astrology -- overview
 ```
 
 The active output is marked with `*`; detached workspaces are shown as
