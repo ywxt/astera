@@ -588,6 +588,9 @@ impl Desktop {
         target.workspaces.insert(index, value);
         if activate {
             target.active = index;
+        } else if index <= target.active {
+            // Preserve the same active workspace when insertion shifts its vector index.
+            target.active += 1;
         }
         Ok(DesktopEvent::WorkspaceMoved {
             workspace,
@@ -1267,5 +1270,125 @@ mod tests {
             desktop.workspace(workspace).unwrap().layout_direction_hint,
             old_hint
         );
+    }
+
+    #[test]
+    fn invalid_output_and_workspace_transactions_do_not_mutate_state() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        let workspace = desktop.active_workspace_id(OutputId(1)).unwrap();
+        let before_count = desktop.workspaces().count();
+
+        assert_eq!(
+            desktop.connect_output(output(1, "duplicate")),
+            Err(DesktopError::UnknownOutput(OutputId(1)))
+        );
+        assert_eq!(
+            desktop.disconnect_output(OutputId(99)),
+            Err(DesktopError::UnknownOutput(OutputId(99)))
+        );
+        assert_eq!(
+            desktop.apply(WorkspaceTransaction::Focus {
+                output: OutputId(99),
+                workspace,
+            }),
+            Err(DesktopError::UnknownWorkspace(workspace))
+        );
+        assert_eq!(
+            desktop.apply(WorkspaceTransaction::Move {
+                workspace,
+                target_output: OutputId(99),
+                target_index: None,
+                activate: false,
+            }),
+            Err(DesktopError::UnknownOutput(OutputId(99)))
+        );
+        assert_eq!(desktop.workspaces().count(), before_count);
+        assert_eq!(desktop.active_workspace_id(OutputId(1)), Some(workspace));
+    }
+
+    #[test]
+    fn moving_workspace_honors_index_and_activation() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        desktop.connect_output(output(2, "B")).unwrap();
+        let source = desktop.active_workspace_id(OutputId(1)).unwrap();
+        desktop
+            .apply(WorkspaceTransaction::SetName {
+                workspace: source,
+                name: Some("moved".into()),
+            })
+            .unwrap();
+        let old_active = desktop.active_workspace_id(OutputId(2)).unwrap();
+
+        let event = desktop
+            .apply(WorkspaceTransaction::Move {
+                workspace: source,
+                target_output: OutputId(2),
+                target_index: Some(0),
+                activate: false,
+            })
+            .unwrap();
+        assert_eq!(
+            event,
+            DesktopEvent::WorkspaceMoved {
+                workspace: source,
+                source: Some(OutputId(1)),
+                target: OutputId(2),
+            }
+        );
+        assert_eq!(desktop.workspace_local_index(source), Some(1));
+        assert_eq!(desktop.active_workspace_id(OutputId(2)), Some(old_active));
+
+        desktop
+            .apply(WorkspaceTransaction::Move {
+                workspace: source,
+                target_output: OutputId(2),
+                target_index: Some(usize::MAX),
+                activate: true,
+            })
+            .unwrap();
+        assert_eq!(desktop.active_workspace_id(OutputId(2)), Some(source));
+    }
+
+    #[test]
+    fn sending_tiled_window_moves_ownership_and_focus_atomically() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        let source = desktop.active_workspace_id(OutputId(1)).unwrap();
+        desktop
+            .apply(WorkspaceTransaction::SetName {
+                workspace: source,
+                name: Some("source".into()),
+            })
+            .unwrap();
+        let target = desktop.outputs[&OutputId(1)].workspaces.last().unwrap().id;
+        let window = WindowId(80);
+        desktop
+            .apply_window(
+                source,
+                WindowTransaction::InsertTiled {
+                    id: window,
+                    size: Size::new(300, 200),
+                    anchor: Point::new(100, 100),
+                    seed_direction: crate::Direction::RIGHT,
+                },
+            )
+            .unwrap();
+        desktop
+            .apply(WorkspaceTransaction::SendWindow {
+                window,
+                target,
+                activate: true,
+            })
+            .unwrap();
+
+        assert!(!desktop.workspace(source).unwrap().contains_window(window));
+        assert_eq!(desktop.find_window(window), Ok(target));
+        assert_eq!(
+            desktop.workspace(target).unwrap().focused_window,
+            Some(window)
+        );
+        assert_eq!(desktop.active_workspace_id(OutputId(1)), Some(target));
     }
 }

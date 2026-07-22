@@ -122,4 +122,56 @@ mod tests {
             Some(Action::Quit)
         );
     }
+
+    #[test]
+    fn newest_held_binding_repeats_then_release_resumes_previous() {
+        let start = Instant::now();
+        let modifiers = Modifiers::default();
+        let first = Action::PanCamera { x: 10, y: 0 };
+        let second = Action::PanCamera { x: 0, y: 20 };
+        let mut state = KeyRepeatState::default();
+        state.intercept(key(30));
+        state.register(key(30), modifiers, first.clone(), 100, start);
+        state.intercept(key(31));
+        state.register(key(31), modifiers, second.clone(), 100, start);
+
+        assert_eq!(
+            state.next_action(start + Duration::from_millis(100), modifiers, 10),
+            Some(second)
+        );
+        assert!(state.release(key(31), 10, start + Duration::from_millis(110)));
+        assert_eq!(
+            state.next_action(start + Duration::from_millis(209), modifiers, 10),
+            None
+        );
+        assert_eq!(
+            state.next_action(start + Duration::from_millis(210), modifiers, 10),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn modifier_change_and_cancellation_stop_repeat_but_keep_release_balanced() {
+        let start = Instant::now();
+        let expected = Modifiers::from_state(false, false, false, true);
+        let changed = Modifiers::default();
+        let mut state = KeyRepeatState::default();
+        state.intercept(key(40));
+        state.register(key(40), expected, Action::Quit, 1, start);
+        assert_eq!(
+            state.next_action(start + Duration::from_millis(1), changed, 25),
+            None
+        );
+        assert!(state.release(key(40), 25, start));
+        assert!(!state.release(key(40), 25, start));
+
+        state.intercept(key(41));
+        state.register(key(41), changed, Action::Quit, 1, start);
+        state.cancel_repeats();
+        assert_eq!(
+            state.next_action(start + Duration::from_secs(1), changed, 25),
+            None
+        );
+        assert!(state.release(key(41), 25, start));
+    }
 }

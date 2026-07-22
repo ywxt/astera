@@ -102,6 +102,104 @@ fn normalize_axis(value: i64, extent: i64) -> u32 {
     ((value as f64 / extent as f64).clamp(0.0, 1.0) * NormalizedPoint::DENOMINATOR).round() as u32
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiled(workspace: &mut Workspace, id: u64, rect: Rect) {
+        let id = WindowId(id);
+        workspace
+            .tiled
+            .insert(id, TiledWindow { id, geometry: rect });
+    }
+
+    #[test]
+    fn focus_history_rejects_unknown_and_restores_live_window() {
+        let mut workspace = Workspace::new(WorkspaceId(1));
+        tiled(&mut workspace, 1, Rect::new(0, 0, 100, 100));
+        tiled(&mut workspace, 2, Rect::new(200, 0, 100, 100));
+        assert!(!workspace.focus(WindowId(99)));
+        assert!(workspace.focus(WindowId(1)));
+        assert!(workspace.focus(WindowId(2)));
+        assert!(workspace.focus(WindowId(1)));
+        assert_eq!(workspace.focus_history, vec![WindowId(2), WindowId(1)]);
+        workspace.tiled.remove(&WindowId(1));
+        workspace.remove_focus(WindowId(1));
+        assert_eq!(workspace.focused_window, Some(WindowId(2)));
+    }
+
+    #[test]
+    fn centered_camera_only_follows_tiled_focus() {
+        let mut workspace = Workspace::new(WorkspaceId(1));
+        workspace.camera.policy = CameraPolicy::Centered;
+        tiled(&mut workspace, 1, Rect::new(700, -200, 200, 100));
+        workspace.focus(WindowId(1));
+        assert!(workspace.follow_focus(Size::new(800, 600)));
+        assert_eq!(workspace.camera.center, Point::new(800, -150));
+
+        let floating = WindowId(2);
+        workspace.floating.insert(
+            floating,
+            FloatingPlacement {
+                window: floating,
+                viewport: ViewportPlacement::new(Rect::new(20, 20, 100, 100), Size::new(800, 600)),
+            },
+        );
+        workspace.focus(floating);
+        assert!(!workspace.follow_focus(Size::new(800, 600)));
+        assert_eq!(workspace.camera.center, Point::new(800, -150));
+    }
+
+    #[test]
+    fn keep_visible_camera_pans_minimally_and_centers_oversized_windows() {
+        let mut workspace = Workspace::new(WorkspaceId(1));
+        workspace.camera.policy = CameraPolicy::KeepVisible { margin: 20 };
+        tiled(&mut workspace, 1, Rect::new(500, 400, 100, 100));
+        workspace.focus(WindowId(1));
+        assert!(workspace.follow_focus(Size::new(800, 600)));
+        assert_eq!(workspace.camera.center, Point::new(220, 220));
+
+        workspace.tiled.get_mut(&WindowId(1)).unwrap().geometry =
+            Rect::new(-1_000, -500, 1_200, 900);
+        assert!(workspace.follow_focus(Size::new(800, 600)));
+        assert_eq!(workspace.camera.center, Point::new(-400, -50));
+    }
+
+    #[test]
+    fn normalized_points_clamp_and_handle_invalid_viewports() {
+        let rect = Rect::new(-100, 900, 200, 100);
+        let normalized = NormalizedPoint::from_rect(rect, Size::new(1_000, 1_000));
+        assert_eq!(normalized.x_millionths, 0);
+        assert_eq!(normalized.y_millionths, 950_000);
+        assert_eq!(
+            normalized.center_in(Size::new(2_000, 500)),
+            Point::new(0, 475)
+        );
+
+        let invalid = NormalizedPoint::from_rect(rect, Size::new(0, -1));
+        assert_eq!(invalid.x_millionths, 500_000);
+        assert_eq!(invalid.y_millionths, 500_000);
+    }
+
+    #[test]
+    fn fullscreen_size_uses_saved_mode_geometry() {
+        let tiled = FullscreenPlacement {
+            window: WindowId(1),
+            restore: RestorePlacement::Tiled {
+                world_rect: Rect::new(0, 0, 640, 480),
+            },
+        };
+        let floating = FullscreenPlacement {
+            window: WindowId(2),
+            restore: RestorePlacement::Floating {
+                viewport: ViewportPlacement::new(Rect::new(0, 0, 320, 240), Size::new(800, 600)),
+            },
+        };
+        assert_eq!(tiled.size(), Size::new(640, 480));
+        assert_eq!(floating.size(), Size::new(320, 240));
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FloatingPlacement {
     pub window: WindowId,

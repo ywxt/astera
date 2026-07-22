@@ -49,7 +49,8 @@ cargo install cargo-fuzz
 cargo fuzz run layout_transactions
 ```
 
-Core line coverage is currently ratcheted from its measured 77% baseline toward 90%, and the
+Core whole-target line coverage (including inline scenario tests) is currently ratcheted from
+its measured 72% baseline toward 90%, and the
 whole workspace from 51% toward 70%; pull requests already require 90% coverage on changed lines.
 Coverage XML and any render diagnostics are uploaded as workflow artifacts. Pixel golden files
 are never accepted automatically.

@@ -105,3 +105,43 @@ impl Direction {
         Self::new(self.x, self.y)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conflict_respects_gap_and_touching_boundary() {
+        let left = Rect::new(0, 0, 100, 100);
+        assert!(!left.conflicts(Rect::new(100, 0, 50, 50), 0));
+        assert!(left.conflicts(Rect::new(100, 0, 50, 50), 1));
+        assert!(!left.conflicts(Rect::new(0, 101, 50, 50), 1));
+    }
+
+    #[test]
+    fn direction_normalizes_and_falls_back_for_invalid_vectors() {
+        let direction = Direction::new(3.0, 4.0);
+        assert!((direction.x - 0.6).abs() < f64::EPSILON);
+        assert!((direction.y - 0.8).abs() < f64::EPSILON);
+        assert_eq!(Direction::new(0.0, 0.0), Direction::RIGHT);
+        assert_eq!(Direction::new(f64::NAN, 1.0), Direction::RIGHT);
+        assert_eq!(
+            Direction::between(Point::ORIGIN, Point::ORIGIN, direction),
+            direction
+        );
+        assert_eq!(
+            Direction::between(Point::ORIGIN, Point::new(0, -5), Direction::RIGHT),
+            Direction::new(0.0, -1.0)
+        );
+    }
+
+    #[test]
+    fn centered_and_translated_rect_preserve_size() {
+        let rect = Rect::centered_at(Point::new(50, 40), Size::new(21, 11));
+        assert_eq!(rect, Rect::new(40, 35, 21, 11));
+        assert_eq!(rect.center(), Point::new(50, 40));
+        assert_eq!(rect.translated(-10, 12), Rect::new(-10, 12, 21, 11));
+        assert!(Size::new(1, 1).is_valid());
+        assert!(!Size::new(0, 1).is_valid());
+    }
+}
