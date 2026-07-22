@@ -8,7 +8,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use astera_ipc::{
-    Command as IpcCommand, DesktopSnapshot, PROTOCOL_VERSION, Request, Response, WorkspaceSnapshot,
+    BOOTSTRAP_VERSION, CURRENT_VERSION, Command as IpcCommand, DesktopSnapshot, MIN_VERSION,
+    Request, RequestKind, Response, Success, decode_frame, encode_frame, wire,
 };
 use clap::{Parser, Subcommand};
 
@@ -36,20 +37,44 @@ fn main() -> Result<()> {
     let runtime = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .context("XDG_RUNTIME_DIR is required")?;
-    let mut stream = UnixStream::connect(runtime.join(format!("{display}.ipc")))?;
-    let request = Request {
-        version: PROTOCOL_VERSION,
-        command: IpcCommand::GetState,
+    let socket = runtime.join(format!("{display}.ipc"));
+    let versions = exchange(
+        &socket,
+        &encode_frame(BOOTSTRAP_VERSION, &wire::v0::Request::Versions)?,
+    )?;
+    let wire::v0::Response::Versions { minimum, current } =
+        decode_frame::<wire::v0::Response>(&versions, BOOTSTRAP_VERSION)?
+    else {
+        bail!("server rejected version negotiation")
     };
-    stream.write_all(ron::to_string(&request)?.as_bytes())?;
+    let minimum_common = minimum.max(MIN_VERSION);
+    let maximum_common = current.min(CURRENT_VERSION);
+    if minimum_common > maximum_common {
+        bail!(
+            "no common IPC version (server {minimum}..={current}, client {MIN_VERSION}..={CURRENT_VERSION})"
+        );
+    }
+    let request = Request {
+        kind: RequestKind::Command(IpcCommand::GetState),
+    };
+    let payload = exchange(&socket, &encode_frame(maximum_common, &request)?)?;
+    match decode_frame::<Response>(&payload, maximum_common)? {
+        Response::Success(Success::State { snapshot, .. }) => {
+            print!("{}", format_overview(&snapshot))
+        }
+        Response::Success(_) => bail!("unexpected IPC success response"),
+        Response::Error(error) => bail!("{:?}: {}", error.code, error.message),
+    }
+    Ok(())
+}
+
+fn exchange(path: &std::path::Path, frame: &str) -> Result<String> {
+    let mut stream = UnixStream::connect(path)?;
+    stream.write_all(frame.as_bytes())?;
     stream.shutdown(Shutdown::Write)?;
     let mut payload = String::new();
     stream.read_to_string(&mut payload)?;
-    match ron::from_str::<Response<DesktopSnapshot>>(&payload)? {
-        Response::Ok(snapshot) => print!("{}", format_overview(&snapshot)),
-        Response::Error { code, message } => bail!("{code:?}: {message}"),
-    }
-    Ok(())
+    Ok(payload)
 }
 
 fn format_overview(snapshot: &DesktopSnapshot) -> String {
@@ -81,7 +106,7 @@ fn format_overview(snapshot: &DesktopSnapshot) -> String {
     text
 }
 
-fn format_workspace(workspace: &WorkspaceSnapshot) -> String {
+fn format_workspace(workspace: &wire::v1::WorkspaceSnapshot) -> String {
     let location = workspace
         .output
         .zip(workspace.local_index)
@@ -97,7 +122,7 @@ fn format_workspace(workspace: &WorkspaceSnapshot) -> String {
         workspace.id.0,
         label,
         location,
-        workspace.focused_window.map(|id| id.0),
+        workspace.active_window.map(|id| id.0),
         workspace.tiled_count,
         workspace.floating_count,
         workspace.fullscreen.map(|id| id.0),
@@ -106,8 +131,10 @@ fn format_workspace(workspace: &WorkspaceSnapshot) -> String {
 
 #[cfg(test)]
 mod tests {
-    use astera_core::{OutputId, OutputTransform, Scale120, Size, WindowId, WorkspaceId};
-    use astera_ipc::{DesktopSnapshot, OutputSnapshot, WorkspaceSnapshot};
+    use astera_ipc::wire::v1::{
+        OutputId, OutputTransform, Rect, Scale120, Size, WindowId, WorkspaceId,
+    };
+    use astera_ipc::{ConfigSnapshot, DesktopSnapshot, OutputSnapshot, WorkspaceSnapshot};
 
     use super::format_overview;
 
@@ -125,7 +152,10 @@ mod tests {
                 logical_size: Size::new(2560, 1440),
                 native_scale: Scale120(180),
                 transform: OutputTransform::Normal,
+                viewport: Rect::new(0, 0, 2560, 1440),
+                usable_area: Rect::new(0, 0, 2560, 1440),
             }],
+            layers: vec![],
             workspaces: vec![
                 WorkspaceSnapshot {
                     id: WorkspaceId(3),
@@ -133,7 +163,7 @@ mod tests {
                     original_output: Some("DP-1".into()),
                     output: Some(OutputId(2)),
                     local_index: Some(1),
-                    focused_window: Some(WindowId(9)),
+                    active_window: Some(WindowId(9)),
                     tiled_count: 2,
                     floating_count: 1,
                     fullscreen: None,
@@ -144,12 +174,15 @@ mod tests {
                     original_output: Some("DP-1".into()),
                     output: None,
                     local_index: None,
-                    focused_window: None,
+                    active_window: None,
                     tiled_count: 1,
                     floating_count: 0,
                     fullscreen: None,
                 },
             ],
+            cameras: vec![],
+            windows: vec![],
+            config: ConfigSnapshot::default(),
         };
 
         let overview = format_overview(&snapshot);

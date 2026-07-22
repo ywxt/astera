@@ -34,7 +34,7 @@ use astera_core::{
     WindowTransaction, WorkspaceId, WorkspaceTransaction,
 };
 use astera_ipc::{
-    Command, DesktopSnapshot, ErrorCode, OutputSelector, Response, WorkspaceSelector,
+    Command, DesktopSnapshot, ErrorCode, OutputSelector, Response, Success, WorkspaceSelector,
 };
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::{
@@ -770,14 +770,14 @@ impl Astera {
                 return process::spawn(vec!["/bin/sh".into(), "-c".into(), script]);
             }
             Action::FocusWorkspace { workspace } => Some(Command::FocusWorkspace {
-                workspace: self.resolve_binding_workspace(workspace),
+                workspace: self.resolve_binding_workspace(workspace)?,
             }),
             Action::MoveWindowToWorkspace {
                 workspace,
                 activate,
             } => Some(Command::MoveWindow {
-                window: focused.ok_or_else(|| anyhow!("no focused window"))?,
-                target: self.resolve_binding_workspace(workspace),
+                window: focused.ok_or_else(|| anyhow!("no focused window"))?.into(),
+                target: self.resolve_binding_workspace(workspace)?,
                 activate,
             }),
             Action::FocusOutput { output } => {
@@ -791,33 +791,35 @@ impl Astera {
                 workspace: self
                     .desktop
                     .active_workspace_id(self.active_output)
-                    .ok_or_else(|| anyhow!("active output has no workspace"))?,
+                    .ok_or_else(|| anyhow!("active output has no workspace"))?
+                    .into(),
                 target_output: OutputSelector::Key(output),
-                target_index: index.map(|index| index - 1),
+                target_index: index.map(|index| u32::try_from(index - 1)).transpose()?,
                 activate,
             }),
             Action::FocusDirection(direction) => {
-                Some(Command::FocusDirection(direction.as_direction()))
+                Some(Command::FocusDirection(direction.as_direction().into()))
             }
             Action::PanCamera { x, y } => Some(Command::PanCamera {
                 workspace: self
                     .desktop
                     .active_workspace_id(self.active_output)
-                    .ok_or_else(|| anyhow!("active output has no workspace"))?,
+                    .ok_or_else(|| anyhow!("active output has no workspace"))?
+                    .into(),
                 dx: x,
                 dy: y,
             }),
             Action::SetWindowMode(mode) => Some(Command::SetWindowMode {
-                window: focused.ok_or_else(|| anyhow!("no focused window"))?,
-                mode,
+                window: focused.ok_or_else(|| anyhow!("no focused window"))?.into(),
+                mode: mode.into(),
             }),
             Action::ToggleFloating => Some(Command::SetWindowMode {
-                window: focused.ok_or_else(|| anyhow!("no focused window"))?,
-                mode: self.toggle_floating_mode(focused.unwrap())?,
+                window: focused.ok_or_else(|| anyhow!("no focused window"))?.into(),
+                mode: self.toggle_floating_mode(focused.unwrap())?.into(),
             }),
             Action::ToggleFullscreen => Some(Command::SetWindowMode {
-                window: focused.ok_or_else(|| anyhow!("no focused window"))?,
-                mode: self.toggle_fullscreen_mode(focused.unwrap())?,
+                window: focused.ok_or_else(|| anyhow!("no focused window"))?.into(),
+                mode: self.toggle_fullscreen_mode(focused.unwrap())?.into(),
             }),
             Action::CloseWindow => {
                 let window = focused.ok_or_else(|| anyhow!("no focused window"))?;
@@ -838,24 +840,28 @@ impl Astera {
         if let Some(command) = command {
             // Reuse the command executor so bindings and IPC have identical transaction rules.
             match self.execute_command(command) {
-                Response::Ok(_) => Ok(()),
-                Response::Error { message, .. } => Err(anyhow!(message)),
+                Response::Success(_) => Ok(()),
+                Response::Error(error) => Err(anyhow!(error.message)),
             }
         } else {
             Ok(())
         }
     }
 
-    fn resolve_binding_workspace(&self, selector: BindingWorkspaceSelector) -> WorkspaceSelector {
-        match selector {
+    fn resolve_binding_workspace(
+        &self,
+        selector: BindingWorkspaceSelector,
+    ) -> AnyResult<WorkspaceSelector> {
+        Ok(match selector {
             BindingWorkspaceSelector::Index(index, output) => WorkspaceSelector::LocalIndex {
                 output: output
                     .map(OutputSelector::Key)
                     .unwrap_or(OutputSelector::Active),
-                index,
+                index: u32::try_from(index)
+                    .map_err(|_| anyhow!("binding workspace index exceeds protocol range"))?,
             },
             BindingWorkspaceSelector::Name(name) => WorkspaceSelector::Name(name),
-        }
+        })
     }
 
     fn toggle_floating_mode(&self, window: WindowId) -> AnyResult<WindowMode> {

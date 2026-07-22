@@ -117,9 +117,11 @@ terminal with the printed value, for example:
 WAYLAND_DISPLAY=astera-1 weston-terminal
 ```
 
-The compositor also creates `<runtime-dir>/<wayland-display>.ipc`. It accepts one
-RON-encoded `astera_ipc::Request` per connection (the client must close its write
-half) and returns a RON-encoded `Response<DesktopSnapshot>`. Protocol v4 exposes
+The compositor also creates `<runtime-dir>/<wayland-display>.ipc`. Every frame is
+one newline-terminated `<version> <RON>` record and every request uses a separate
+connection. Clients first send the frozen v0 `Versions` bootstrap request, choose
+an overlap with the returned bounds, then open a v1 command connection. The
+current and minimum command protocol versions are both 1. Protocol v1 exposes
 output focus, workspace focus/move/name operations, window transfer, mode and
 camera commands, plus per-output physical/logical size, scale and transform
 updates. Outputs can be selected by ID, stable key or active output. Workspaces
@@ -180,7 +182,7 @@ motion crosses output boundaries and changes the active output; compositor windo
 drags remain clamped to their source output. Floating windows keep an exact
 placement cache per stable output key and a normalized fallback anchor for a new
 output. The nested backend can change per-output physical size, logical size,
-fractional scale and transform atomically with protocol v4 `ConfigureOutput`.
+fractional scale and transform atomically with protocol v1 `ConfigureOutput`.
 The native backend currently rejects this command until KMS reconfiguration is
 implemented, instead of publishing metadata that disagrees with scanout.
 

@@ -181,6 +181,7 @@ dependencies = [
  "astera-core",
  "ron",
  "serde",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

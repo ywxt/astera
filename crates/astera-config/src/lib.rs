@@ -562,6 +562,13 @@ fn validate_action(action: &Action, source: &str) -> Result<(), ConfigError> {
             "binding {source:?} uses workspace index zero"
         )));
     }
+    if let Some(WorkspaceSelector::Index(index, _)) = workspace
+        && u32::try_from(*index).is_err()
+    {
+        return Err(ConfigError::Invalid(format!(
+            "binding {source:?} uses a workspace index larger than u32::MAX"
+        )));
+    }
     match action {
         Action::Spawn(argv) if argv.is_empty() || argv[0].is_empty() => Err(ConfigError::Invalid(
             format!("binding {source:?} has an empty Spawn argv"),
@@ -641,6 +648,12 @@ mod tests {
         assert!(
             Config::from_ron(
                 r#"(bindings: {"Super+Return": (action: Spawn(["foot"]), repeat: true)})"#
+            )
+            .is_err()
+        );
+        assert!(
+            Config::from_ron(
+                r#"(bindings: {"Super+1": FocusWorkspace(workspace: Index(4294967296))})"#
             )
             .is_err()
         );

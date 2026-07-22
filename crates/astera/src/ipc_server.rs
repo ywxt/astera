@@ -1,4 +1,5 @@
 use std::{
+    cell::Cell,
     fs,
     future::Future,
     io,
@@ -9,10 +10,14 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use astera_ipc::{DesktopSnapshot, ErrorCode, PROTOCOL_VERSION, Request, Response};
+use astera_ipc::{
+    BOOTSTRAP_VERSION, CURRENT_VERSION, Error, ErrorCode, MIN_VERSION, Request, RequestDecodeError,
+    RequestKind, Response, VersionedRequest, decode_payload, decode_request, encode_frame,
+    parse_frame, wire,
+};
 use smol::{
     Executor, Timer,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::unix::{UnixListener, UnixStream},
 };
 use thiserror::Error;
@@ -26,7 +31,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 struct PendingRequest {
     // The async socket task owns framing; the compositor thread alone executes this command.
     request: Request,
-    reply: smol::channel::Sender<Response<DesktopSnapshot>>,
+    reply: smol::channel::Sender<Response>,
 }
 
 #[derive(Debug, Error)]
@@ -52,6 +57,7 @@ pub struct IpcServer {
     executor: Arc<Executor<'static>>,
     requests: mpsc::Receiver<PendingRequest>,
     pub path: PathBuf,
+    sequence: Cell<u64>,
 }
 
 impl IpcServer {
@@ -113,6 +119,7 @@ impl IpcServer {
             executor,
             requests,
             path,
+            sequence: Cell::new(0),
         })
     }
 
@@ -121,16 +128,15 @@ impl IpcServer {
         // not wait for the next render iteration.
         self.drain_tasks();
         while let Ok(pending) = self.requests.try_recv() {
-            let response = if pending.request.version != PROTOCOL_VERSION {
-                Response::Error {
-                    code: ErrorCode::VersionMismatch,
-                    message: format!(
-                        "protocol version {} is unsupported; expected {PROTOCOL_VERSION}",
-                        pending.request.version
-                    ),
-                }
-            } else {
-                state.execute_command(pending.request.command)
+            let sequence = self.sequence.get().wrapping_add(1);
+            self.sequence.set(sequence);
+            let response = match pending.request.kind {
+                RequestKind::Command(command) => state.execute_command_at(command, sequence),
+                RequestKind::EventStream => Response::Error(Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "event streams are not implemented".into(),
+                    sequence,
+                }),
             };
             let _ = pending.reply.try_send(response);
         }
@@ -166,23 +172,48 @@ async fn handle_client(
     mut stream: UnixStream,
     sender: mpsc::SyncSender<PendingRequest>,
 ) -> Result<()> {
-    let mut payload = String::new();
-    with_timeout(
-        IO_TIMEOUT,
-        (&mut stream)
-            .take(MAX_REQUEST_BYTES)
-            .read_to_string(&mut payload),
-    )
-    .await
-    .context("timed out while reading IPC request")??;
-    let request = match ron::from_str::<Request>(&payload) {
-        Ok(request) => request,
+    let payload = {
+        let mut reader = BufReader::new(&mut stream);
+        with_timeout(IO_TIMEOUT, read_frame_line(&mut reader))
+            .await
+            .context("timed out while reading IPC request")??
+    };
+    let frame = parse_frame(&payload).context("invalid IPC frame")?;
+    if frame.version == BOOTSTRAP_VERSION {
+        let _: wire::v0::Request = decode_payload(frame).context("invalid bootstrap request")?;
+        return write_bootstrap_response(
+            &mut stream,
+            wire::v0::Response::Versions {
+                minimum: MIN_VERSION,
+                current: CURRENT_VERSION,
+            },
+        )
+        .await;
+    }
+    let request = match decode_request(&payload) {
+        Ok(VersionedRequest::V1(request)) => request,
+        Err(RequestDecodeError::UnsupportedVersion {
+            requested,
+            minimum,
+            current,
+        }) => {
+            return write_bootstrap_response(
+                &mut stream,
+                wire::v0::Response::UnsupportedVersion {
+                    requested,
+                    minimum,
+                    current,
+                },
+            )
+            .await;
+        }
         Err(error) => {
-            let response: Response<DesktopSnapshot> = Response::Error {
-                code: ErrorCode::InvalidCommand,
+            let response = Response::Error(Error {
+                code: ErrorCode::InvalidRequest,
                 message: error.to_string(),
-            };
-            return write_response(&mut stream, response).await;
+                sequence: 0,
+            });
+            return write_response(&mut stream, CURRENT_VERSION, response).await;
         }
     };
     let (reply, response) = smol::channel::bounded(1);
@@ -193,14 +224,48 @@ async fn handle_client(
         .await
         .context("timed out waiting for compositor response")?
         .context("compositor dropped IPC response")?;
-    write_response(&mut stream, response).await
+    write_response(&mut stream, CURRENT_VERSION, response).await
 }
 
-async fn write_response(
+async fn read_frame_line<R: smol::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+) -> Result<String> {
+    let mut bytes = Vec::with_capacity(1024);
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            anyhow::bail!("IPC client closed before a complete frame");
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |newline| newline + 1);
+        if bytes.len() + consumed > MAX_REQUEST_BYTES as usize {
+            anyhow::bail!("IPC request exceeds {MAX_REQUEST_BYTES} bytes");
+        }
+        let complete = available[consumed - 1] == b'\n';
+        bytes.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if complete {
+            return String::from_utf8(bytes).context("IPC request is not UTF-8");
+        }
+    }
+}
+
+async fn write_bootstrap_response(
     stream: &mut UnixStream,
-    response: Response<DesktopSnapshot>,
+    response: wire::v0::Response,
 ) -> Result<()> {
-    let payload = ron::to_string(&response).context("could not serialize IPC response")?;
+    let payload = encode_frame(BOOTSTRAP_VERSION, &response)
+        .context("could not serialize IPC bootstrap response")?;
+    with_timeout(IO_TIMEOUT, stream.write_all(payload.as_bytes()))
+        .await
+        .context("timed out while writing IPC bootstrap response")??;
+    Ok(())
+}
+
+async fn write_response(stream: &mut UnixStream, version: u16, response: Response) -> Result<()> {
+    let payload = encode_frame(version, &response).context("could not serialize IPC response")?;
     with_timeout(IO_TIMEOUT, stream.write_all(payload.as_bytes()))
         .await
         .context("timed out while writing IPC response")??;
@@ -213,4 +278,46 @@ async fn with_timeout<T>(duration: Duration, future: impl Future<Output = T>) ->
         Err(io::Error::new(io::ErrorKind::TimedOut, "IPC timed out"))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_reader_finishes_without_waiting_for_eof() {
+        smol::block_on(async {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            client
+                .write_all(b"1 (kind:EventStream)\n1 (kind:EventStream)\n")
+                .await
+                .unwrap();
+            // The client intentionally remains open: newline, rather than EOF, terminates a frame.
+            let mut reader = BufReader::new(&mut server);
+            assert_eq!(
+                read_frame_line(&mut reader).await.unwrap(),
+                "1 (kind:EventStream)\n"
+            );
+            assert_eq!(
+                read_frame_line(&mut reader).await.unwrap(),
+                "1 (kind:EventStream)\n"
+            );
+        });
+    }
+
+    #[test]
+    fn line_reader_enforces_the_exact_byte_limit() {
+        smol::block_on(async {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let mut oversized = vec![b'x'; MAX_REQUEST_BYTES as usize];
+            oversized.push(b'\n');
+            let write = async { client.write_all(&oversized).await.unwrap() };
+            let read = async {
+                let mut reader = BufReader::new(&mut server);
+                read_frame_line(&mut reader).await
+            };
+            let (_, result) = smol::future::zip(write, read).await;
+            assert!(result.unwrap_err().to_string().contains("exceeds"));
+        });
+    }
 }

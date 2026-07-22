@@ -19,7 +19,12 @@ impl CommandError {
 }
 
 impl Astera {
-    pub fn execute_command(&mut self, command: Command) -> Response<DesktopSnapshot> {
+    pub fn execute_command(&mut self, command: Command) -> Response {
+        self.execute_command_at(command, 0)
+    }
+
+    pub fn execute_command_at(&mut self, command: Command, sequence: u64) -> Response {
+        let returns_state = matches!(&command, Command::GetState);
         match &command {
             Command::GetState => tracing::debug!("IPC state snapshot requested"),
             command => tracing::info!(?command, "command started"),
@@ -32,26 +37,32 @@ impl Astera {
         match self.execute_command_inner(command) {
             Ok(()) => {
                 if let Some((window, mode)) = mode_change {
-                    self.configure_window_mode(window, mode);
+                    self.configure_window_mode(window.into(), mode.into());
                 }
                 self.configure_fullscreen_windows();
                 self.refresh_visible_scales();
                 self.sync_keyboard_focus();
-                Response::Ok(
-                    DesktopSnapshot::from(&self.desktop).with_active_output(
-                        self.desktop
-                            .outputs
-                            .contains_key(&self.active_output)
-                            .then_some(self.active_output),
-                    ),
-                )
+                if returns_state {
+                    Response::Success(Success::State {
+                        sequence,
+                        snapshot: DesktopSnapshot::from(&self.desktop).with_active_output(
+                            self.desktop
+                                .outputs
+                                .contains_key(&self.active_output)
+                                .then_some(self.active_output),
+                        ),
+                    })
+                } else {
+                    Response::Success(Success::Handled { sequence })
+                }
             }
             Err(error) => {
                 tracing::warn!(code = ?error.code, %error, "command failed");
-                Response::Error {
+                Response::Error(astera_ipc::Error {
                     code: error.code,
                     message: error.to_string(),
-                }
+                    sequence,
+                })
             }
         }
     }
@@ -180,7 +191,7 @@ impl Astera {
 
     fn resolve_output(&self, selector: OutputSelector) -> Result<OutputId, CommandError> {
         let output = match selector {
-            OutputSelector::Id(output) => Some(output),
+            OutputSelector::Id(output) => Some(output.into()),
             OutputSelector::Key(key) => self
                 .desktop
                 .outputs
@@ -197,7 +208,7 @@ impl Astera {
         let workspace = match selector {
             WorkspaceSelector::Id(workspace) => self
                 .desktop
-                .workspace(workspace)
+                .workspace(workspace.into())
                 .ok()
                 .map(|workspace| workspace.id),
             WorkspaceSelector::Name(name) => self
@@ -207,7 +218,7 @@ impl Astera {
             WorkspaceSelector::LocalIndex { output, index } => {
                 let output = self.resolve_output(output)?;
                 self.desktop
-                    .workspace_by_local_index(output, index)
+                    .workspace_by_local_index(output, index as usize)
                     .map(|workspace| workspace.id)
             }
         };
@@ -230,10 +241,10 @@ impl Astera {
                 transform,
             } => self.configure_output_command(
                 output,
-                physical_size,
-                logical_size,
-                native_scale,
-                transform,
+                physical_size.into(),
+                logical_size.into(),
+                native_scale.into(),
+                transform.into(),
             ),
             Command::FocusWorkspace { workspace } => self.focus_workspace_command(workspace),
             Command::MoveWorkspace {
@@ -245,9 +256,9 @@ impl Astera {
                 let target_output = self.resolve_output(target_output)?;
                 self.desktop
                     .apply(WorkspaceTransaction::Move {
-                        workspace,
+                        workspace: workspace.into(),
                         target_output,
-                        target_index,
+                        target_index: target_index.map(|index| index as usize),
                         activate,
                     })
                     .map(|_| ())
@@ -255,7 +266,10 @@ impl Astera {
             }
             Command::SetWorkspaceName { workspace, name } => self
                 .desktop
-                .apply(WorkspaceTransaction::SetName { workspace, name })
+                .apply(WorkspaceTransaction::SetName {
+                    workspace: workspace.into(),
+                    name,
+                })
                 .map(|_| ())
                 .map_err(map_desktop_error),
             Command::MoveWindow {
@@ -266,33 +280,35 @@ impl Astera {
                 let target = self.resolve_workspace(target)?;
                 self.desktop
                     .apply(WorkspaceTransaction::SendWindow {
-                        window,
+                        window: window.into(),
                         target,
                         activate,
                     })
                     .map(|_| ())
                     .map_err(map_desktop_error)
             }
-            Command::SetWindowMode { window, mode } => self.set_window_mode_command(window, mode),
+            Command::SetWindowMode { window, mode } => {
+                self.set_window_mode_command(window.into(), mode.into())
+            }
             Command::SetCameraPolicy { workspace, policy } => {
                 let state = self
                     .desktop
-                    .workspace_mut(workspace)
+                    .workspace_mut(workspace.into())
                     .map_err(map_desktop_error)?;
-                state.camera.policy = policy;
+                state.camera.policy = policy.into();
                 Ok(())
             }
             Command::PanCamera { workspace, dx, dy } => {
                 let state = self
                     .desktop
-                    .workspace_mut(workspace)
+                    .workspace_mut(workspace.into())
                     .map_err(map_desktop_error)?;
                 state.camera.center.x = state.camera.center.x.saturating_add(dx);
                 state.camera.center.y = state.camera.center.y.saturating_add(dy);
                 Ok(())
             }
-            Command::FocusWindow(window) => self.focus_window_command(window),
-            Command::FocusDirection(direction) => self.focus_direction_command(direction),
+            Command::FocusWindow(window) => self.focus_window_command(window.into()),
+            Command::FocusDirection(direction) => self.focus_direction_command(direction.into()),
         }
     }
 
@@ -403,7 +419,7 @@ fn map_desktop_error(error: astera_core::DesktopError) -> CommandError {
         | astera_core::DesktopError::InvalidWorkspaceState(_)
         | astera_core::DesktopError::Layout(_) => ErrorCode::Conflict,
         astera_core::DesktopError::InvalidOutputSize
-        | astera_core::DesktopError::InvalidOutputScale => ErrorCode::InvalidCommand,
+        | astera_core::DesktopError::InvalidOutputScale => ErrorCode::InvalidRequest,
     };
     CommandError::new(code, error.to_string())
 }

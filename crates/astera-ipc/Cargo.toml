@@ -8,9 +8,8 @@ rust-version.workspace = true
 [dependencies]
 astera-core.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
 ron.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
