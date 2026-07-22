@@ -7,19 +7,19 @@ use astera_ipc::Command;
 use smithay::{
     backend::{
         renderer::{
-            Color32F, Frame, Renderer,
+            Color32F,
+            damage::OutputDamageTracker,
             element::{
                 Kind,
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             },
             gles::GlesRenderer,
-            utils::draw_render_elements,
         },
         winit::{self, WinitEvent},
     },
     desktop::PopupManager,
     reexports::wayland_server::{Display, ListeningSocket},
-    utils::{Physical, Point, Rectangle, Transform},
+    utils::{Physical, Point, Transform},
 };
 
 use crate::{
@@ -42,6 +42,8 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         winit::init::<GlesRenderer>().map_err(|error| anyhow!(error.to_string()))?;
     let ipc = IpcServer::bind(&socket_name)?;
     let started = Instant::now();
+    let mut tracked_size = backend.window_size();
+    let mut damage_tracker = OutputDamageTracker::new(tracked_size, 1.0, Transform::Flipped180);
 
     tracing::info!(wayland_display = %socket_name, "nested compositor is ready");
     println!("WAYLAND_DISPLAY={socket_name}");
@@ -73,8 +75,12 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
 
         let size = backend.window_size();
         state.update_output_size(i64::from(size.w), i64::from(size.h));
-        let damage = Rectangle::from_size(size);
-        {
+        if size != tracked_size {
+            tracked_size = size;
+            damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Flipped180);
+        }
+        let buffer_age = backend.buffer_age().unwrap_or(0);
+        let submitted_damage = {
             let (renderer, mut framebuffer) = backend.bind()?;
             // Scene construction includes layout transforms, popup discovery and sorting; retain
             // it for frame callbacks instead of rebuilding the same scene twice per frame.
@@ -111,20 +117,29 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
                 })
                 .collect();
 
-            let mut frame = renderer.render(&mut framebuffer, size, Transform::Flipped180)?;
-            frame.clear(Color32F::new(0.025, 0.035, 0.06, 1.0), &[damage])?;
-            draw_render_elements(&mut frame, 1.0, &elements, &[damage])?;
-            let _sync = frame.finish()?;
+            let result = damage_tracker.render_output(
+                renderer,
+                &mut framebuffer,
+                buffer_age,
+                &elements,
+                Color32F::new(0.025, 0.035, 0.06, 1.0),
+            )?;
+            let submitted_damage = result.damage.cloned();
 
-            let frame_time = started.elapsed().as_millis() as u32;
-            for (surface, _, _) in roots {
-                send_frames_surface_tree(&surface, frame_time);
-                for (popup, _) in PopupManager::popups_for_surface(&surface) {
-                    send_frames_surface_tree(popup.wl_surface(), frame_time);
+            if submitted_damage.is_some() {
+                let frame_time = started.elapsed().as_millis() as u32;
+                for (surface, _, _) in roots {
+                    send_frames_surface_tree(&surface, frame_time);
+                    for (popup, _) in PopupManager::popups_for_surface(&surface) {
+                        send_frames_surface_tree(popup.wl_surface(), frame_time);
+                    }
                 }
+                display.flush_clients()?;
             }
-            display.flush_clients()?;
+            submitted_damage
+        };
+        if let Some(damage) = submitted_damage {
+            backend.submit(Some(&damage))?;
         }
-        backend.submit(Some(&[damage]))?;
     }
 }
