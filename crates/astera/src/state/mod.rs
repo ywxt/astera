@@ -1,9 +1,17 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    os::fd::OwnedFd,
-    path::PathBuf,
-    time::{Duration, Instant},
+use std::{collections::BTreeMap, os::fd::OwnedFd, time::Instant};
+
+mod config_watcher;
+mod geometry;
+mod key_repeat;
+mod model;
+mod process;
+
+use config_watcher::ConfigWatcher;
+use geometry::{
+    layer_rank, mode_layer, output_transform, physical_point, point_inside, saturating_i32,
 };
+use key_repeat::KeyRepeatState;
+use model::{DragState, MappedLayer, MappedWindow, OutputRuntime};
 
 use astera_config::{
     Action, BindingKey, Config, Modifiers as BindingModifiers,
@@ -39,7 +47,7 @@ use smithay::{
     output::{Mode, Output as SmithayOutput, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::{
         Client, DisplayHandle,
-        backend::{ClientData, ClientId, DisconnectReason, GlobalId},
+        backend::{ClientData, ClientId, DisconnectReason},
         protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
     },
     utils::{Physical, Point as SmithayPoint, Serial},
@@ -73,44 +81,6 @@ use smithay::{
 
 const DEFAULT_WINDOW_SIZE: Size = Size::new(800, 600);
 
-#[derive(Clone)]
-struct MappedWindow {
-    id: WindowId,
-    surface: ToplevelSurface,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct DragState {
-    window: WindowId,
-    mode: WindowMode,
-    grab_offset: (f64, f64),
-    target: Point,
-    start: Point,
-}
-
-#[derive(Clone)]
-struct HeldRepeat {
-    keycode: smithay::backend::input::Keycode,
-    modifiers: BindingModifiers,
-    action: Action,
-    next_at: Instant,
-}
-
-#[derive(Clone, Debug)]
-struct MappedLayer {
-    surface: LayerSurface,
-    layer: Layer,
-    output: OutputId,
-}
-
-#[derive(Debug)]
-struct OutputRuntime {
-    wayland: SmithayOutput,
-    global: GlobalId,
-    entered_surfaces: Vec<WlSurface>,
-    location: Point,
-}
-
 pub struct Astera {
     display: DisplayHandle,
     compositor_state: CompositorState,
@@ -134,13 +104,9 @@ pub struct Astera {
     next_window_id: u64,
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
     drag: Option<DragState>,
-    intercepted_keys: BTreeSet<smithay::backend::input::Keycode>,
-    held_repeats: Vec<HeldRepeat>,
+    key_repeat: KeyRepeatState,
     config: Config,
-    config_path: Option<PathBuf>,
-    config_stamp: Option<std::time::SystemTime>,
-    config_exists: bool,
-    config_reload_at: Option<Instant>,
+    config_watcher: Option<ConfigWatcher>,
     should_quit: bool,
     serial: u32,
 }
@@ -233,13 +199,9 @@ impl Astera {
             next_window_id: 1,
             pointer_location: (0.0, 0.0).into(),
             drag: None,
-            intercepted_keys: BTreeSet::new(),
-            held_repeats: Vec::new(),
+            key_repeat: KeyRepeatState::default(),
             config,
-            config_path: None,
-            config_stamp: None,
-            config_exists: false,
-            config_reload_at: None,
+            config_watcher: None,
             should_quit: false,
             serial: 1,
         }
@@ -340,8 +302,10 @@ impl Astera {
                     event.time_msec(),
                     move |state, modifiers, key| {
                         if !pressed {
-                            state.release_binding(key_code);
-                            return if state.intercepted_keys.remove(&key_code) {
+                            return if state
+                                .key_repeat
+                                .release(key_code, state.config.key_repeat.rate)
+                            {
                                 FilterResult::Intercept(())
                             } else {
                                 FilterResult::Forward
@@ -351,7 +315,7 @@ impl Astera {
                             .raw_latin_sym_or_raw_current_sym()
                             .map(|symbol| symbol.raw());
                         if state.handle_binding(modifiers, symbol, key_code) {
-                            state.intercepted_keys.insert(key_code);
+                            state.key_repeat.intercept(key_code);
                             FilterResult::Intercept(())
                         } else {
                             FilterResult::Forward
@@ -824,46 +788,25 @@ impl Astera {
             tracing::warn!(%message, "key binding action failed");
         }
         if binding.repeat {
-            self.held_repeats.retain(|held| held.keycode != keycode);
-            self.held_repeats.push(HeldRepeat {
+            self.key_repeat.register(
                 keycode,
                 modifiers,
-                action: binding.action,
-                next_at: Instant::now() + Duration::from_millis(self.config.key_repeat.delay_ms),
-            });
+                binding.action,
+                self.config.key_repeat.delay_ms,
+            );
         }
         true
-    }
-
-    fn release_binding(&mut self, keycode: smithay::backend::input::Keycode) {
-        let was_active = self
-            .held_repeats
-            .last()
-            .is_some_and(|held| held.keycode == keycode);
-        self.held_repeats.retain(|held| held.keycode != keycode);
-        if was_active {
-            if let Some(previous) = self.held_repeats.last_mut() {
-                previous.next_at = Instant::now()
-                    + Duration::from_secs_f64(1.0 / self.config.key_repeat.rate as f64);
-            }
-        }
     }
 
     pub fn process_key_repeats(&mut self) {
         let state = self.keyboard.modifier_state();
         let current = BindingModifiers::from_state(state.ctrl, state.alt, state.shift, state.logo);
-        self.held_repeats.retain(|held| {
-            held.modifiers == current && self.intercepted_keys.contains(&held.keycode)
-        });
-        let now = Instant::now();
-        let Some(held) = self.held_repeats.last_mut() else {
+        let Some(action) =
+            self.key_repeat
+                .next_action(Instant::now(), current, self.config.key_repeat.rate)
+        else {
             return;
         };
-        if now < held.next_at {
-            return;
-        }
-        let action = held.action.clone();
-        held.next_at = now + Duration::from_secs_f64(1.0 / self.config.key_repeat.rate as f64);
         if let Err(message) = self.execute_action(action) {
             tracing::warn!(%message, "repeated key binding action failed");
         }
@@ -875,9 +818,9 @@ impl Astera {
             .workspace_for_output(self.active_output)
             .and_then(|workspace| workspace.focused_window);
         let command = match action {
-            Action::Spawn(argv) => return spawn_program(argv),
+            Action::Spawn(argv) => return process::spawn(argv),
             Action::SpawnShell(script) => {
-                return spawn_program(vec!["/bin/sh".into(), "-c".into(), script]);
+                return process::spawn(vec!["/bin/sh".into(), "-c".into(), script]);
             }
             Action::FocusWorkspace { workspace } => Some(Command::FocusWorkspace {
                 workspace: self.resolve_binding_workspace(workspace)?,
@@ -1006,41 +949,18 @@ impl Astera {
         self.should_quit
     }
 
-    pub fn watch_config(&mut self, path: PathBuf) {
-        let metadata = std::fs::metadata(&path).ok();
-        self.config_stamp = metadata
-            .as_ref()
-            .and_then(|metadata| metadata.modified().ok());
-        self.config_exists = metadata.is_some();
-        self.config_path = Some(path.clone());
+    pub fn watch_config(&mut self, path: std::path::PathBuf) {
         tracing::info!(path = %path.display(), "configuration watcher enabled");
+        self.config_watcher = Some(ConfigWatcher::new(path));
     }
 
     pub fn poll_config(&mut self) {
-        let Some(path) = self.config_path.clone() else {
+        let Some(watcher) = self.config_watcher.as_mut() else {
             return;
         };
-        let metadata = std::fs::metadata(&path).ok();
-        let exists = metadata.is_some();
-        let stamp = metadata
-            .as_ref()
-            .and_then(|metadata| metadata.modified().ok());
-        if exists != self.config_exists || stamp != self.config_stamp {
-            self.config_exists = exists;
-            self.config_stamp = stamp;
-            self.config_reload_at = Some(Instant::now() + Duration::from_millis(200));
-        }
-        if !self
-            .config_reload_at
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        let path = watcher.path().to_owned();
+        let Some(result) = watcher.poll(Instant::now()) else {
             return;
-        }
-        self.config_reload_at = None;
-        let result = if exists {
-            Config::load(&path)
-        } else {
-            Ok(Config::default())
         };
         match result {
             Ok(config) => {
@@ -1063,7 +983,7 @@ impl Astera {
             config.key_repeat.rate as i32,
             config.key_repeat.delay_ms as i32,
         );
-        self.held_repeats.clear();
+        self.key_repeat.cancel_repeats();
         self.desktop = desktop;
         self.config = config;
         tracing::info!(
@@ -1708,77 +1628,6 @@ fn map_desktop_error(error: astera_core::DesktopError) -> (ErrorCode, String) {
         | astera_core::DesktopError::Layout(_) => ErrorCode::Conflict,
     };
     (code, error.to_string())
-}
-
-fn spawn_program(argv: Vec<String>) -> Result<(), String> {
-    let (program, arguments) = argv
-        .split_first()
-        .ok_or_else(|| "Spawn requires a non-empty argv".to_owned())?;
-    let mut child = std::process::Command::new(program)
-        .args(arguments)
-        .spawn()
-        .map_err(|error| format!("could not spawn {program:?}: {error}"))?;
-    let program = program.clone();
-    std::thread::spawn(move || match child.wait() {
-        Ok(status) => tracing::debug!(%program, ?status, "spawned process exited"),
-        Err(error) => tracing::warn!(%program, %error, "could not reap spawned process"),
-    });
-    Ok(())
-}
-
-fn mode_layer(mode: WindowMode) -> u8 {
-    match mode {
-        WindowMode::Tiled => 2,
-        WindowMode::Floating => 3,
-        WindowMode::Fullscreen => 5,
-    }
-}
-
-fn layer_rank(layer: Layer) -> u8 {
-    match layer {
-        Layer::Background => 0,
-        Layer::Bottom => 1,
-        Layer::Top => 4,
-        Layer::Overlay => 6,
-    }
-}
-
-fn output_transform(transform: OutputTransform) -> smithay::utils::Transform {
-    match transform {
-        OutputTransform::Normal => smithay::utils::Transform::Normal,
-        OutputTransform::Rotate90 => smithay::utils::Transform::_90,
-        OutputTransform::Rotate180 => smithay::utils::Transform::_180,
-        OutputTransform::Rotate270 => smithay::utils::Transform::_270,
-        OutputTransform::Flipped => smithay::utils::Transform::Flipped,
-    }
-}
-
-fn point_inside(
-    point: SmithayPoint<f64, smithay::utils::Logical>,
-    origin: Point,
-    size: Size,
-    scale: f64,
-) -> bool {
-    point.x >= origin.x as f64
-        && point.x < origin.x as f64 + size.width as f64 * scale
-        && point.y >= origin.y as f64
-        && point.y < origin.y as f64 + size.height as f64 * scale
-}
-
-fn saturating_i32(value: i64) -> i32 {
-    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
-}
-
-fn physical_point(origin: Point, scale: f64) -> SmithayPoint<i32, Physical> {
-    (
-        (origin.x as f64 * scale)
-            .round()
-            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32,
-        (origin.y as f64 * scale)
-            .round()
-            .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32,
-    )
-        .into()
 }
 
 impl BufferHandler for Astera {
