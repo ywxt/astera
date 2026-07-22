@@ -40,6 +40,8 @@ impl CompositorHandler for Astera {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
         self.popup_manager.commit(surface);
+        // Creating an xdg role is not mapping. The first non-null buffer maps the window and a
+        // null-buffer commit unmaps it while preserving the role for a later remap.
         if let Some(index) = self
             .windows
             .iter()
@@ -87,6 +89,8 @@ impl WlrLayerShellHandler for Astera {
         layer: Layer,
         _namespace: String,
     ) {
+        // A missing wl_output means the compositor-selected active output, as required by the
+        // layer-shell protocol; placement remains viewport-local to that output.
         let output = output
             .as_ref()
             .and_then(|requested| {

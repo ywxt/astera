@@ -47,6 +47,7 @@ impl Astera {
         // Compute window geometry once. Previously each frame rebuilt and sorted this list twice,
         // then performed another linear surface-to-window lookup for every item.
         let windows = self.mapped_windows_for_output(output).collect::<Vec<_>>();
+        // Ordering here is both render order and the contract mirrored by scene hit testing.
         let mut roots = Vec::new();
         roots.extend(self.layer_roots(output, Layer::Overlay));
         roots.extend(
@@ -230,6 +231,8 @@ impl Astera {
     }
 
     pub(super) fn refresh_visible_scales(&mut self) {
+        // A workspace is exclusive to one output, so each entered surface has one authoritative
+        // fractional scale. Subsurfaces and popups still need explicit enter/leave propagation.
         let scenes: BTreeMap<_, _> = self
             .output_runtime
             .keys()

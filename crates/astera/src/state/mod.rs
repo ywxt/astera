@@ -385,6 +385,8 @@ impl Astera {
         time: u32,
     ) {
         self.pointer_location = location;
+        // During compositor grabs, clients do not receive motion; the pending tiled placement is
+        // committed only on release so the radial solver does not run for every pointer sample.
         if self.drag.is_some() {
             self.update_drag(location);
             return;

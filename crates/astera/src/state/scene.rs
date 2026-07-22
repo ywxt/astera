@@ -9,6 +9,8 @@ impl Astera {
         SmithayPoint<f64, smithay::utils::Logical>,
         Option<WindowId>,
     )> {
+        // Hit testing mirrors render stacking. We retain every hit and choose the highest tuple so
+        // popups, floating/fullscreen windows and layer surfaces resolve deterministically.
         let mut candidates = Vec::new();
         for (index, mapped) in self.windows.iter().enumerate() {
             let Some((origin, size, scale, mode)) = self.visual_geometry(mapped.id) else {
@@ -19,6 +21,8 @@ impl Astera {
                     (location.x - origin.x as f64) / scale,
                     (location.y - origin.y as f64) / scale,
                 ));
+                // Smithay performs input-region and subsurface-aware testing in surface-local
+                // coordinates; the returned offset is transformed back to compositor space.
                 if let Some((surface, offset)) = under_from_surface_tree(
                     mapped.surface.wl_surface(),
                     local,

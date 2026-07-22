@@ -87,6 +87,7 @@ impl RadialSolver {
     }
 
     pub fn reflow(&self, workspace: &mut Workspace) -> Result<(), LayoutError> {
+        // Solver failure must never expose a half-reflowed world to rendering or input.
         let mut working = workspace.clone();
         let windows = working.tiled.keys().copied().collect::<Vec<_>>();
         for window in windows {
@@ -116,6 +117,7 @@ impl RadialSolver {
         workspace: &mut Workspace,
         transaction: WindowTransaction,
     ) -> Result<LayoutDelta, LayoutError> {
+        // Window mode changes and radial displacement form one atomic layout generation.
         let mut working = workspace.clone();
         let (source, seed, mut movements) = self.apply_to_working(&mut working, transaction)?;
         if let Some(source) = source {

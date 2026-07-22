@@ -95,7 +95,9 @@ pub enum DesktopError {
 
 #[derive(Clone, Debug)]
 pub struct Desktop {
+    /// Each output owns an independent ordered workspace set; a workspace never appears twice.
     pub outputs: BTreeMap<OutputId, OutputWorkspaceSet>,
+    /// Workspaces survive the removal of the last output here without becoming renderable.
     pub detached: Vec<Workspace>,
     pub primary_output: Option<OutputId>,
     pub last_active: BTreeMap<String, WorkspaceId>,
@@ -116,6 +118,8 @@ impl Desktop {
     }
 
     pub fn connect_output(&mut self, output: Output) -> Result<DesktopEvent, DesktopError> {
+        // Hotplug touches several workspace sets. Mutate a snapshot and publish it only after all
+        // dynamic-workspace and ownership invariants pass validation.
         let mut working = self.clone();
         let output_id = output.id;
         if working.outputs.contains_key(&output.id) {
@@ -139,6 +143,8 @@ impl Desktop {
                 .get(&primary)
                 .map(|set| (set.output.stable_key.clone(), set.output.logical_size))
         });
+        // Stable output identity, not the transient OutputId, decides which displaced workspaces
+        // return when a monitor reconnects.
         let mut workspaces = if working.outputs.is_empty() {
             std::mem::take(&mut working.detached)
         } else {
@@ -196,6 +202,8 @@ impl Desktop {
     }
 
     pub fn disconnect_output(&mut self, output: OutputId) -> Result<DesktopEvent, DesktopError> {
+        // Disconnect is transactional because migration can fail after the output was removed
+        // from the working map. `self` must remain untouched in that case.
         let mut working = self.clone();
         let mut removed = working
             .outputs
@@ -783,6 +791,7 @@ impl Desktop {
     }
 
     fn normalize_all(&mut self) {
+        // Normalization implements niri-style dynamic workspaces after every successful mutation.
         let outputs = self.outputs.keys().copied().collect::<Vec<_>>();
         for output in outputs {
             self.normalize_output(output);
@@ -805,6 +814,8 @@ impl Desktop {
                 index += 1;
             }
         }
+        // Exactly one empty trailing workspace is kept as the creation affordance. Other empty,
+        // inactive workspaces disappear once focus has left them.
         let needs_placeholder = set
             .workspaces
             .last()
@@ -822,6 +833,8 @@ impl Desktop {
     }
 
     fn validate(&self) -> Result<(), DesktopError> {
+        // This is the commit barrier for every multi-object transaction. Keep global uniqueness
+        // checks here rather than distributing partial checks across mutation paths.
         if self.outputs.is_empty() != self.primary_output.is_none() {
             return Err(DesktopError::UnknownOutput(
                 self.primary_output.unwrap_or(OutputId(u32::MAX)),

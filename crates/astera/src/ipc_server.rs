@@ -24,6 +24,7 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct PendingRequest {
+    // The async socket task owns framing; the compositor thread alone executes this command.
     request: Request,
     reply: smol::channel::Sender<Response<DesktopSnapshot>>,
 }
@@ -116,6 +117,8 @@ impl IpcServer {
     }
 
     pub fn dispatch(&self, state: &mut Astera) {
+        // Tick before draining to accept/read requests, and after replying so completed writes do
+        // not wait for the next render iteration.
         self.drain_tasks();
         while let Ok(pending) = self.requests.try_recv() {
             let response = if pending.request.version != PROTOCOL_VERSION {

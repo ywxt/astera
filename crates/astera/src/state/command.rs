@@ -4,6 +4,7 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[error("{message}")]
 struct CommandError {
+    // `code` is stable IPC behavior; `message` remains diagnostic and may evolve.
     code: ErrorCode,
     message: String,
 }
@@ -23,6 +24,7 @@ impl Astera {
             Command::GetState => tracing::debug!("IPC state snapshot requested"),
             command => tracing::info!(?command, "command started"),
         }
+        // Protocol configure is emitted only after the core transaction commits successfully.
         let mode_change = match &command {
             Command::SetWindowMode { window, mode } => Some((*window, *mode)),
             _ => None,

@@ -48,6 +48,7 @@ pub struct ProtocolState {
 pub(super) struct MappedWindow {
     pub(super) id: WindowId,
     pub(super) surface: ToplevelSurface,
+    /// Role existence and mapping are distinct: only a committed non-null buffer is mapped.
     pub(super) mapped: bool,
 }
 
@@ -73,6 +74,7 @@ pub(super) struct MappedLayer {
 
 #[derive(Debug)]
 pub(super) struct OutputRuntime {
+    /// Smithay protocol object corresponding to the core model's stable OutputId.
     pub(super) wayland: SmithayOutput,
     pub(super) global: GlobalId,
     /// Surfaces that received wl_surface.enter for this output during the last refresh.
