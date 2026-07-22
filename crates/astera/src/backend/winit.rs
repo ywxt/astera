@@ -74,12 +74,14 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dy
         let damage = Rectangle::from_size(size);
         {
             let (renderer, mut framebuffer) = backend.bind()?;
-            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = state
-                .render_roots()
-                .into_iter()
+            // Scene construction includes layout transforms, popup discovery and sorting; retain
+            // it for frame callbacks instead of rebuilding the same scene twice per frame.
+            let roots = state.render_roots();
+            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = roots
+                .iter()
                 .flat_map(|(surface, location, scale)| {
                     let mut elements = Vec::new();
-                    for (popup, popup_offset) in PopupManager::popups_for_surface(&surface) {
+                    for (popup, popup_offset) in PopupManager::popups_for_surface(surface) {
                         let geometry = popup.geometry();
                         let offset: Point<i32, Physical> = (
                             ((popup_offset.x - geometry.loc.x) as f64 * scale).round() as i32,
@@ -89,17 +91,17 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dy
                         elements.extend(render_elements_from_surface_tree(
                             renderer,
                             popup.wl_surface(),
-                            location + offset,
-                            scale,
+                            *location + offset,
+                            *scale,
                             1.0,
                             Kind::Unspecified,
                         ));
                     }
                     elements.extend(render_elements_from_surface_tree(
                         renderer,
-                        &surface,
-                        location,
-                        scale,
+                        surface,
+                        *location,
+                        *scale,
                         1.0,
                         Kind::Unspecified,
                     ));
@@ -113,7 +115,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dy
             let _sync = frame.finish()?;
 
             let frame_time = started.elapsed().as_millis() as u32;
-            for (surface, _, _) in state.render_roots() {
+            for (surface, _, _) in roots {
                 send_frames_surface_tree(&surface, frame_time);
                 for (popup, _) in PopupManager::popups_for_surface(&surface) {
                     send_frames_surface_tree(popup.wl_surface(), frame_time);
