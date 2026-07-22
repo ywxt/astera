@@ -178,6 +178,8 @@ impl DesktopSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use astera_core::{Output, Size, WorkspaceTransaction};
+
     use super::*;
 
     #[test]
@@ -203,5 +205,34 @@ mod tests {
                 index: 3,
             }
         );
+    }
+
+    #[test]
+    fn desktop_snapshot_preserves_output_and_workspace_identity() {
+        let mut desktop = Desktop::new(8);
+        desktop
+            .connect_output(Output::new(OutputId(7), "DP-1", Size::new(2560, 1440)))
+            .unwrap();
+        let workspace = desktop.active_workspace_id(OutputId(7)).unwrap();
+        desktop
+            .apply(WorkspaceTransaction::SetName {
+                workspace,
+                name: Some("code".into()),
+            })
+            .unwrap();
+
+        let snapshot = DesktopSnapshot::from(&desktop).with_active_output(Some(OutputId(7)));
+        assert_eq!(snapshot.active_output, Some(OutputId(7)));
+        assert_eq!(snapshot.primary_output, Some(OutputId(7)));
+        assert_eq!(snapshot.outputs[0].stable_key, "DP-1");
+        assert_eq!(snapshot.outputs[0].active_workspace, workspace);
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|candidate| candidate.id == workspace)
+            .unwrap();
+        assert_eq!(workspace.name.as_deref(), Some("code"));
+        assert_eq!(workspace.output, Some(OutputId(7)));
+        assert_eq!(workspace.local_index, Some(1));
     }
 }

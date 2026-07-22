@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, path::Path, time::Duration};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use astera_core::{CameraPolicy, Direction, WindowMode};
 use serde::{Deserialize, Deserializer};
@@ -8,7 +8,6 @@ use xkbcommon::xkb;
 #[derive(Clone, Debug)]
 pub struct Config {
     pub gap: i64,
-    pub animation_ms: u64,
     pub camera: CameraPolicy,
     pub key_repeat: KeyRepeatConfig,
     pub bindings: Bindings,
@@ -250,7 +249,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             gap: 8,
-            animation_ms: 280,
             camera: CameraPolicy::KeepVisible { margin: 32 },
             key_repeat: KeyRepeatConfig::default(),
             bindings: Bindings::built_in(),
@@ -262,7 +260,6 @@ impl Default for Config {
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
     gap: i64,
-    animation_ms: u64,
     camera: CameraPolicy,
     key_repeat: KeyRepeatConfig,
     bindings: BindingMap,
@@ -273,7 +270,6 @@ impl Default for FileConfig {
         let defaults = Config::default();
         Self {
             gap: defaults.gap,
-            animation_ms: defaults.animation_ms,
             camera: defaults.camera,
             key_repeat: defaults.key_repeat,
             bindings: BindingMap::default(),
@@ -298,10 +294,6 @@ impl<'de> Deserialize<'de> for BindingMap {
 }
 
 impl Config {
-    pub fn animation_duration(&self) -> Duration {
-        Duration::from_millis(self.animation_ms)
-    }
-
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let contents = fs::read_to_string(path)?;
         Self::from_ron(&contents)
@@ -336,7 +328,6 @@ impl Config {
         }
         let config = Self {
             gap: raw.gap,
-            animation_ms: raw.animation_ms,
             camera: raw.camera,
             key_repeat: raw.key_repeat,
             bindings: Bindings { entries },
@@ -378,7 +369,11 @@ fn normalize_workspace_selectors(source: &str) -> String {
         if let Some(comma) = find_unquoted_comma(arguments) {
             let index = arguments[..comma].trim();
             let key = arguments[comma + 1..].trim();
-            output.push_str(&format!("Index({index},Some({key}))"));
+            if key == "None" || key.starts_with("Some(") {
+                output.push_str(&format!("Index({index},{key})"));
+            } else {
+                output.push_str(&format!("Index({index},Some({key}))"));
+            }
         } else {
             output.push_str(&format!("Index({},None)", arguments.trim()));
         }
@@ -432,6 +427,7 @@ fn find_next_selector(source: &str, start: usize) -> Option<usize> {
 fn find_selector_end(source: &str, start: usize) -> Option<usize> {
     let mut quoted = false;
     let mut escaped = false;
+    let mut depth = 0_u32;
     for (offset, character) in source[start..].char_indices() {
         if quoted {
             if escaped {
@@ -443,8 +439,13 @@ fn find_selector_end(source: &str, start: usize) -> Option<usize> {
             }
         } else if character == '"' {
             quoted = true;
+        } else if character == '(' {
+            depth += 1;
         } else if character == ')' {
-            return Some(start + offset);
+            if depth == 0 {
+                return Some(start + offset);
+            }
+            depth -= 1;
         }
     }
     None
@@ -453,6 +454,7 @@ fn find_selector_end(source: &str, start: usize) -> Option<usize> {
 fn find_unquoted_comma(source: &str) -> Option<usize> {
     let mut quoted = false;
     let mut escaped = false;
+    let mut depth = 0_u32;
     for (offset, character) in source.char_indices() {
         if quoted {
             if escaped {
@@ -464,7 +466,11 @@ fn find_unquoted_comma(source: &str) -> Option<usize> {
             }
         } else if character == '"' {
             quoted = true;
-        } else if character == ',' {
+        } else if character == '(' {
+            depth += 1;
+        } else if character == ')' {
+            depth = depth.saturating_sub(1);
+        } else if character == ',' && depth == 0 {
             return Some(offset);
         }
     }
@@ -606,6 +612,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.bindings.len(), 6);
+    }
+
+    #[test]
+    fn selector_normalization_accepts_explicit_option_shape() {
+        let config = Config::from_ron(
+            r#"(bindings: {
+                "Super+1": FocusWorkspace(workspace: Index(2, Some("DP-1"))),
+                "Super+2": FocusWorkspace(workspace: Index(3, None)),
+            })"#,
+        )
+        .unwrap();
+        assert_eq!(config.bindings.len(), 2);
     }
 
     #[test]

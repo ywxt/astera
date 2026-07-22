@@ -49,9 +49,9 @@ cargo install cargo-fuzz
 cargo fuzz run layout_transactions
 ```
 
-Core whole-target line coverage (including inline scenario tests) is currently ratcheted from
-its measured 72% baseline toward 90%, and the
-whole workspace from 51% toward 70%; pull requests already require 90% coverage on changed lines.
+Core line coverage is enforced at 90%, portable support crates at 70%, and the
+whole workspace is ratcheted from its current systems-heavy baseline toward 70%; pull requests
+also require 90% coverage on changed lines.
 Coverage XML and any render diagnostics are uploaded as workflow artifacts. Pixel golden files
 are never accepted automatically.
 
@@ -72,13 +72,11 @@ restores them.
 
 The file is watched while Astera runs. Changes are applied after a short
 debounce; an invalid edit leaves the last valid configuration active. Gap,
-camera policy, animation duration, keyboard repeat settings and bindings reload
-as one transaction.
+camera policy, keyboard repeat settings and bindings reload as one transaction.
 
 ```ron
 (
     gap: 8,
-    animation_ms: 280,
     camera: KeepVisible(margin: 32),
     key_repeat: (delay_ms: 300, rate: 25),
     bindings: {
@@ -181,8 +179,9 @@ Native outputs are arranged left-to-right for pointer traversal. Relative pointe
 motion crosses output boundaries and changes the active output; compositor window
 drags remain clamped to their source output. Floating windows keep an exact
 placement cache per stable output key and a normalized fallback anchor for a new
-output. Per-output physical size, logical size, fractional scale and transform
-can be changed atomically with the protocol v4 `ConfigureOutput` IPC command.
+output. The nested backend can change per-output physical size, logical size,
+fractional scale and transform atomically with protocol v4 `ConfigureOutput`.
+The native backend currently rejects this command until KMS reconfiguration is
+implemented, instead of publishing metadata that disagrees with scanout.
 
-Astera remains experimental. Configurable binding files and animated layout
-transitions are not implemented yet.
+Astera remains experimental. Animated layout transitions are not implemented yet.

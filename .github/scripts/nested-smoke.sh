@@ -18,14 +18,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build -p astera --bin astera
+cargo build -p astera --bins
 XDG_RUNTIME_DIR="$runtime_dir" XDG_CONFIG_HOME="$config_dir" \
     xvfb-run -a target/debug/astera --backend winit >"$log_file" 2>&1 &
 compositor_pid=$!
 
 for _ in $(seq 1 100); do
     if grep -q '^WAYLAND_DISPLAY=astera-' "$log_file"; then
-        exit 0
+        display_name="$(sed -n 's/^WAYLAND_DISPLAY=//p' "$log_file" | tail -n 1)"
+        if [[ -S "$runtime_dir/$display_name" && -S "$runtime_dir/$display_name.ipc" ]]; then
+            overview="$(XDG_RUNTIME_DIR="$runtime_dir" WAYLAND_DISPLAY="$display_name" \
+                target/debug/astrology overview)"
+            grep -q '^Outputs$' <<<"$overview"
+            grep -q '^Workspaces$' <<<"$overview"
+            kill -0 "$compositor_pid"
+            exit 0
+        fi
     fi
     if ! kill -0 "$compositor_pid" 2>/dev/null; then
         cat "$log_file"

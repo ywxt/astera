@@ -24,7 +24,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libegl1-mesa-dev xvfb
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --all-targets
+      - name: Test workspace (rerun failures for diagnostics)
+        shell: bash
+        run: |
+          set +e
+          cargo test --workspace --all-targets
+          status=$?
+          if (( status != 0 )); then
+            cargo test --workspace --all-targets -- --nocapture || true
+          fi
+          exit "$status"
       - name: Nested compositor smoke test
         run: .github/scripts/nested-smoke.sh
 
@@ -56,10 +65,10 @@ jobs:
       - name: Install diff coverage reporter
         if: github.event_name == 'pull_request'
         run: pipx install diff-cover
-      - name: Core coverage baseline
-        # Inline scenario tests are instrumented too, so this is a whole-target baseline rather
-        # than production-only coverage. Diff coverage below remains the stricter new-work gate.
-        run: cargo llvm-cov -p astera-core --all-targets --fail-under-lines 72
+      - name: Core coverage (90%)
+        run: cargo llvm-cov -p astera-core --all-targets --fail-under-lines 90
+      - name: Portable support crates coverage (70%)
+        run: cargo llvm-cov -p astera-config -p astera-ipc --all-targets --fail-under-lines 70
       - name: Workspace coverage baseline
         # Native device and render-loop paths require the mock/harness work tracked by this
         # test architecture. Keep today's 51% whole-workspace baseline from regressing.

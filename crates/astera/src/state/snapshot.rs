@@ -73,6 +73,7 @@ fn assert_snapshot(name: &str, actual: &str) {
     fs::create_dir_all(&artifact).expect("render artifact directory must be writable");
     fs::write(artifact.join("expected.ppm"), &expected).unwrap();
     fs::write(artifact.join("actual.ppm"), actual).unwrap();
+    fs::write(artifact.join("diff.ppm"), diff_ppm(&expected, actual)).unwrap();
     fs::write(
         artifact.join("diff.txt"),
         first_difference(&expected, actual),
@@ -82,6 +83,31 @@ fn assert_snapshot(name: &str, actual: &str) {
         "render snapshot {name:?} changed; inspect {}",
         artifact.display()
     );
+}
+
+fn diff_ppm(expected: &str, actual: &str) -> String {
+    let expected = expected.split_whitespace().collect::<Vec<_>>();
+    let actual = actual.split_whitespace().collect::<Vec<_>>();
+    if expected.len() < 4 || actual.len() < 4 || expected[..4] != actual[..4] {
+        return "P3\n1 1\n255\n255 0 255\n".to_owned();
+    }
+    let mut diff = format!(
+        "{}\n{} {}\n{}\n",
+        expected[0], expected[1], expected[2], expected[3]
+    );
+    for (index, (expected, actual)) in expected[4..].iter().zip(&actual[4..]).enumerate() {
+        let channel = index % 3;
+        let value = if expected == actual {
+            "0"
+        } else if channel == 0 {
+            "255"
+        } else {
+            "0"
+        };
+        diff.push_str(value);
+        diff.push(if channel == 2 { '\n' } else { ' ' });
+    }
+    diff
 }
 
 fn first_difference(expected: &str, actual: &str) -> String {

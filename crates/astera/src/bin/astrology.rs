@@ -8,22 +8,38 @@ use std::{
 };
 
 use astera_ipc::{
-    Command, DesktopSnapshot, PROTOCOL_VERSION, Request, Response, WorkspaceSnapshot,
+    Command as IpcCommand, DesktopSnapshot, PROTOCOL_VERSION, Request, Response, WorkspaceSnapshot,
 };
+use clap::{Parser, Subcommand};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "astrology",
+    version,
+    about = "Inspect a running Astera compositor"
+)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<AstrologyCommand>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum AstrologyCommand {
+    /// Print outputs, workspaces, focus, and window counts.
+    Overview,
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let command = env::args().nth(1).unwrap_or_else(|| "overview".to_owned());
-    if command != "overview" {
-        return Err(format!("unknown command {command:?}; usage: astrology [overview]").into());
-    }
+    let args = Args::parse();
+    let _command = args.command.unwrap_or(AstrologyCommand::Overview);
     let display = env::var("WAYLAND_DISPLAY")?;
     let runtime = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
+        .ok_or("XDG_RUNTIME_DIR is required")?;
     let mut stream = UnixStream::connect(runtime.join(format!("{display}.ipc")))?;
     let request = Request {
         version: PROTOCOL_VERSION,
-        command: Command::GetState,
+        command: IpcCommand::GetState,
     };
     stream.write_all(ron::to_string(&request)?.as_bytes())?;
     stream.shutdown(Shutdown::Write)?;
