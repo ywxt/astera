@@ -366,6 +366,32 @@ impl Desktop {
         Ok(())
     }
 
+    pub fn reconfigure_layout(
+        &mut self,
+        gap: i64,
+        camera_policy: crate::CameraPolicy,
+    ) -> Result<(), DesktopError> {
+        let mut working = self.clone();
+        working.solver = RadialSolver::new(gap);
+        let ids = working
+            .workspaces()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>();
+        for id in ids {
+            let solver = working.solver.clone();
+            let viewport = working.workspace_viewport_size(id);
+            let workspace = working.workspace_mut(id)?;
+            workspace.camera.policy = camera_policy;
+            solver.reflow(workspace)?;
+            if let Some(viewport) = viewport {
+                workspace.follow_focus(viewport);
+            }
+        }
+        working.validate()?;
+        *self = working;
+        Ok(())
+    }
+
     pub fn find_window(&self, window: WindowId) -> Result<WorkspaceId, DesktopError> {
         let mut found = None;
         for workspace in self.workspaces() {
@@ -399,6 +425,79 @@ impl Desktop {
         working.validate()?;
         *self = working;
         Ok(workspace)
+    }
+
+    pub fn focus_direction(
+        &mut self,
+        workspace: WorkspaceId,
+        direction: crate::Direction,
+    ) -> Result<Option<WindowId>, DesktopError> {
+        let mut working = self.clone();
+        let state = working.workspace(workspace)?;
+        let Some(focused) = state.focused_window else {
+            return Ok(None);
+        };
+        let Some(mode) = state.window_mode(focused) else {
+            return Ok(None);
+        };
+        if mode == WindowMode::Fullscreen {
+            return Ok(None);
+        }
+        let origin = match mode {
+            WindowMode::Tiled => state.tiled[&focused].geometry.center(),
+            WindowMode::Floating => state.floating[&focused].viewport.rect.center(),
+            WindowMode::Fullscreen => unreachable!(),
+        };
+        let direction = direction.normalized();
+        let candidates: Box<dyn Iterator<Item = (WindowId, Point)> + '_> = match mode {
+            WindowMode::Tiled => Box::new(
+                state
+                    .tiled
+                    .iter()
+                    .map(|(id, window)| (*id, window.geometry.center())),
+            ),
+            WindowMode::Floating => Box::new(
+                state
+                    .floating
+                    .iter()
+                    .map(|(id, window)| (*id, window.viewport.rect.center())),
+            ),
+            WindowMode::Fullscreen => unreachable!(),
+        };
+        let target = candidates
+            .filter(|(id, _)| *id != focused)
+            .filter_map(|(id, center)| {
+                let dx = (center.x - origin.x) as f64;
+                let dy = (center.y - origin.y) as f64;
+                let forward = dx * direction.x + dy * direction.y;
+                (forward > f64::EPSILON).then(|| {
+                    let distance = dx.hypot(dy);
+                    let angle = (dx * direction.y - dy * direction.x).abs() / distance;
+                    (id, angle, distance)
+                })
+            })
+            .min_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| left.2.total_cmp(&right.2))
+                    .then_with(|| left.0.cmp(&right.0))
+            })
+            .map(|(id, _, _)| id);
+        let Some(target) = target else {
+            return Ok(None);
+        };
+        let viewport = working.workspace_viewport_size(workspace);
+        let state = working.workspace_mut(workspace)?;
+        state.focus(target);
+        if mode == WindowMode::Tiled {
+            state.layout_direction_hint = direction;
+        }
+        if let Some(viewport) = viewport {
+            state.follow_focus(viewport);
+        }
+        working.validate()?;
+        *self = working;
+        Ok(Some(target))
     }
 
     fn apply_working(
@@ -539,7 +638,7 @@ impl Desktop {
                     .and_then(|focused| target_workspace.tiled.get(&focused))
                     .map(|focused| focused.geometry.center())
                     .unwrap_or(Point::ORIGIN);
-                let direction = target_workspace.focus_direction;
+                let direction = target_workspace.layout_direction_hint;
                 solver.apply(
                     target_workspace,
                     WindowTransaction::InsertTiled {
@@ -1097,6 +1196,77 @@ mod tests {
         assert_eq!(
             desktop.workspace_location(first).unwrap().output,
             Some(OutputId(9))
+        );
+    }
+
+    #[test]
+    fn directional_focus_is_mode_local_and_only_tiled_updates_hint() {
+        let mut desktop = Desktop::new(8);
+        desktop.connect_output(output(1, "A")).unwrap();
+        let workspace = desktop.active_workspace_id(OutputId(1)).unwrap();
+        let left = WindowId(40);
+        let right = WindowId(41);
+        let float_left = WindowId(42);
+        let float_right = WindowId(43);
+        let state = desktop.workspace_mut(workspace).unwrap();
+        state.tiled.insert(
+            left,
+            crate::TiledWindow {
+                id: left,
+                geometry: crate::Rect::new(0, 0, 100, 100),
+            },
+        );
+        state.tiled.insert(
+            right,
+            crate::TiledWindow {
+                id: right,
+                geometry: crate::Rect::new(500, 0, 100, 100),
+            },
+        );
+        state.floating.insert(
+            float_left,
+            crate::FloatingPlacement {
+                window: float_left,
+                viewport: crate::ViewportPlacement::new(
+                    crate::Rect::new(0, 300, 100, 100),
+                    Size::new(1920, 1080),
+                ),
+            },
+        );
+        state.floating.insert(
+            float_right,
+            crate::FloatingPlacement {
+                window: float_right,
+                viewport: crate::ViewportPlacement::new(
+                    crate::Rect::new(500, 300, 100, 100),
+                    Size::new(1920, 1080),
+                ),
+            },
+        );
+        state.focus(left);
+        desktop.normalize_all();
+
+        assert_eq!(
+            desktop
+                .focus_direction(workspace, crate::Direction::RIGHT)
+                .unwrap(),
+            Some(right)
+        );
+        assert_eq!(
+            desktop.workspace(workspace).unwrap().layout_direction_hint,
+            crate::Direction::RIGHT
+        );
+        desktop.workspace_mut(workspace).unwrap().focus(float_left);
+        let old_hint = desktop.workspace(workspace).unwrap().layout_direction_hint;
+        assert_eq!(
+            desktop
+                .focus_direction(workspace, crate::Direction::RIGHT)
+                .unwrap(),
+            Some(float_right)
+        );
+        assert_eq!(
+            desktop.workspace(workspace).unwrap().layout_direction_hint,
+            old_hint
         );
     }
 }

@@ -86,6 +86,19 @@ impl RadialSolver {
         self
     }
 
+    pub fn reflow(&self, workspace: &mut Workspace) -> Result<(), LayoutError> {
+        let windows = workspace.tiled.keys().copied().collect::<Vec<_>>();
+        for window in windows {
+            let direction = workspace.layout_direction_hint;
+            self.solve(workspace, window, direction)?;
+        }
+        if !workspace.tiled_windows_are_stable(self.gap) {
+            return Err(LayoutError::UnstableResult);
+        }
+        workspace.generation = workspace.generation.wrapping_add(1);
+        Ok(())
+    }
+
     pub fn with_snap_distance(mut self, distance: i64) -> Self {
         self.snap_distance = distance.max(0);
         self
@@ -147,7 +160,7 @@ impl RadialSolver {
                         geometry: Rect::centered_at(anchor, size),
                     },
                 );
-                workspace.focus_direction = seed_direction.normalized();
+                workspace.layout_direction_hint = seed_direction.normalized();
                 workspace.focus(id);
                 Ok((Some(id), seed_direction, Vec::new()))
             }
@@ -173,7 +186,7 @@ impl RadialSolver {
                 let window = workspace.tiled.get_mut(&id).unwrap();
                 let from = window.geometry.origin;
                 window.geometry = target;
-                workspace.focus_direction = seed_direction.normalized();
+                workspace.layout_direction_hint = seed_direction.normalized();
                 workspace.focus(id);
                 Ok((
                     Some(id),
@@ -202,7 +215,7 @@ impl RadialSolver {
                 workspace.focus(id);
                 Ok((
                     None,
-                    workspace.focus_direction,
+                    workspace.layout_direction_hint,
                     vec![Movement {
                         window: id,
                         from,
@@ -227,7 +240,7 @@ impl RadialSolver {
                     return Err(LayoutError::UnknownWindow(id));
                 }
                 workspace.remove_focus(id);
-                Ok((None, workspace.focus_direction, Vec::new()))
+                Ok((None, workspace.layout_direction_hint, Vec::new()))
             }
         }
     }
@@ -284,7 +297,7 @@ impl RadialSolver {
             .window_mode(id)
             .ok_or(LayoutError::UnknownWindow(id))?;
         if current == target {
-            return Ok((None, workspace.focus_direction, Vec::new()));
+            return Ok((None, workspace.layout_direction_hint, Vec::new()));
         }
         if target == WindowMode::Fullscreen {
             if let Some(fullscreen) = &workspace.fullscreen {
@@ -304,7 +317,7 @@ impl RadialSolver {
                 restore,
             });
             workspace.focus(id);
-            return Ok((None, workspace.focus_direction, Vec::new()));
+            return Ok((None, workspace.layout_direction_hint, Vec::new()));
         }
 
         let (rect, geometry_mode, saved_viewport) = match current {
@@ -364,7 +377,7 @@ impl RadialSolver {
             WindowMode::Fullscreen => unreachable!(),
         };
         workspace.focus(id);
-        Ok((source, workspace.focus_direction, Vec::new()))
+        Ok((source, workspace.layout_direction_hint, Vec::new()))
     }
 
     fn solve(

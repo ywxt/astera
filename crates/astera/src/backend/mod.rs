@@ -7,22 +7,38 @@ pub enum BackendKind {
     Native,
 }
 
-impl BackendKind {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchOptions {
+    pub backend: BackendKind,
+    pub config_path: Option<std::path::PathBuf>,
+}
+
+impl LaunchOptions {
     pub fn from_args() -> Result<Self, String> {
         let mut args = std::env::args().skip(1);
-        let Some(argument) = args.next() else {
-            return Ok(Self::Winit);
+        let mut options = Self {
+            backend: BackendKind::Winit,
+            config_path: None,
         };
-        if args.next().is_some() {
-            return Err("usage: astera [--backend=winit|native]".to_owned());
+        while let Some(argument) = args.next() {
+            match argument.as_str() {
+                "--backend=winit" | "--nested" => options.backend = BackendKind::Winit,
+                "--backend=native" => options.backend = BackendKind::Native,
+                "--config" => {
+                    options.config_path =
+                        Some(args.next().ok_or("--config requires a path")?.into());
+                }
+                _ if argument.starts_with("--config=") => {
+                    options.config_path = Some(argument["--config=".len()..].into());
+                }
+                _ => {
+                    return Err(format!(
+                        "unknown argument {argument:?}; usage: astera [--backend=winit|native] [--config PATH]"
+                    ));
+                }
+            }
         }
-        match argument.as_str() {
-            "--backend=winit" | "--nested" => Ok(Self::Winit),
-            "--backend=native" => Ok(Self::Native),
-            _ => Err(format!(
-                "unknown argument {argument:?}; usage: astera [--backend=winit|native]"
-            )),
-        }
+        Ok(options)
     }
 }
 

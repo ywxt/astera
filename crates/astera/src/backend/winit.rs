@@ -26,9 +26,10 @@ use crate::{
     state::{Astera, ClientState, send_frames_surface_tree},
 };
 
-pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
+pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dyn Error>> {
     let mut display: Display<Astera> = Display::new()?;
     let mut state = Astera::new(&display.handle(), config);
+    state.watch_config(config_path);
     tracing::debug!(state = ?state.execute_command(Command::GetState), "initial desktop state");
     let listener = ListeningSocket::bind_auto("astera", 1..32)?;
     let socket_name = listener
@@ -60,6 +61,12 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         }
         display.dispatch_clients(&mut state)?;
         ipc.dispatch(&mut state);
+        state.poll_config();
+        if state.should_quit() {
+            tracing::info!("quit action requested");
+            return Ok(());
+        }
+        state.process_key_repeats();
         state.remove_dead_windows();
 
         let size = backend.window_size();

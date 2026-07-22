@@ -62,12 +62,36 @@ impl Modifiers {
     pub fn super_key(self) -> bool {
         self.0 & Self::SUPER != 0
     }
+
+    pub fn from_state(ctrl: bool, alt: bool, shift: bool, super_key: bool) -> Self {
+        Self(
+            (u8::from(ctrl) * Self::CTRL)
+                | (u8::from(alt) * Self::ALT)
+                | (u8::from(shift) * Self::SHIFT)
+                | (u8::from(super_key) * Self::SUPER),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum KeyTrigger {
     Keysym(u32),
     Code(u32),
+}
+
+impl BindingKey {
+    pub fn keysym(modifiers: Modifiers, keysym: u32) -> Self {
+        Self {
+            modifiers,
+            trigger: KeyTrigger::Keysym(keysym),
+        }
+    }
+    pub fn code(modifiers: Modifiers, code: u32) -> Self {
+        Self {
+            modifiers,
+            trigger: KeyTrigger::Code(code),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -278,6 +302,7 @@ impl Config {
                     "binding {source:?} enables repeat for a non-repeatable action"
                 )));
             }
+            validate_action(&binding.action, &source)?;
             if entries.insert(key, binding).is_some() {
                 return Err(ConfigError::Invalid(format!(
                     "binding {source:?} duplicates another normalized binding"
@@ -437,6 +462,32 @@ fn parse_binding_key(source: &str) -> Result<BindingKey, ConfigError> {
 
 fn default_true() -> bool {
     true
+}
+
+fn validate_action(action: &Action, source: &str) -> Result<(), ConfigError> {
+    let workspace = match action {
+        Action::FocusWorkspace { workspace } | Action::MoveWindowToWorkspace { workspace, .. } => {
+            Some(workspace)
+        }
+        _ => None,
+    };
+    if matches!(workspace, Some(WorkspaceSelector::Index(0, _))) {
+        return Err(ConfigError::Invalid(format!(
+            "binding {source:?} uses workspace index zero"
+        )));
+    }
+    match action {
+        Action::Spawn(argv) if argv.is_empty() || argv[0].is_empty() => Err(ConfigError::Invalid(
+            format!("binding {source:?} has an empty Spawn argv"),
+        )),
+        Action::SpawnShell(script) if script.trim().is_empty() => Err(ConfigError::Invalid(
+            format!("binding {source:?} has an empty SpawnShell script"),
+        )),
+        Action::MoveWorkspaceToOutput { index: Some(0), .. } => Err(ConfigError::Invalid(format!(
+            "binding {source:?} uses target index zero"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Error)]

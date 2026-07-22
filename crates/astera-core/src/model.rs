@@ -140,7 +140,7 @@ pub struct Workspace {
     pub camera: CameraState,
     pub focused_window: Option<WindowId>,
     pub focus_history: Vec<WindowId>,
-    pub focus_direction: Direction,
+    pub layout_direction_hint: Direction,
     pub generation: u64,
 }
 
@@ -156,7 +156,7 @@ impl Workspace {
             camera: CameraState::default(),
             focused_window: None,
             focus_history: Vec::new(),
-            focus_direction: Direction::RIGHT,
+            layout_direction_hint: Direction::RIGHT,
             generation: 0,
         }
     }

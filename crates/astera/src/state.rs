@@ -1,9 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     os::fd::OwnedFd,
+    path::PathBuf,
+    time::{Duration, Instant},
 };
 
-use astera_config::Config;
+use astera_config::{
+    Action, BindingKey, Config, Modifiers as BindingModifiers,
+    WorkspaceSelector as BindingWorkspaceSelector,
+};
 use astera_core::{
     Desktop, Output, OutputId, OutputTransform, Point, Size, WindowId, WindowMode,
     WindowTransaction, WorkspaceId, WorkspaceTransaction,
@@ -28,7 +33,7 @@ use smithay::{
     },
     input::{
         Seat, SeatHandler, SeatState,
-        keyboard::{FilterResult, ModifiersState, keysyms},
+        keyboard::{FilterResult, ModifiersState},
         pointer::{ButtonEvent, Focus as PointerFocusMode, MotionEvent, PointerHandle},
     },
     output::{Mode, Output as SmithayOutput, PhysicalProperties, Scale, Subpixel},
@@ -83,6 +88,14 @@ struct DragState {
     start: Point,
 }
 
+#[derive(Clone)]
+struct HeldRepeat {
+    keycode: smithay::backend::input::Keycode,
+    modifiers: BindingModifiers,
+    action: Action,
+    next_at: Instant,
+}
+
 #[derive(Clone, Debug)]
 struct MappedLayer {
     surface: LayerSurface,
@@ -122,6 +135,13 @@ pub struct Astera {
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
     drag: Option<DragState>,
     intercepted_keys: BTreeSet<smithay::backend::input::Keycode>,
+    held_repeats: Vec<HeldRepeat>,
+    config: Config,
+    config_path: Option<PathBuf>,
+    config_stamp: Option<std::time::SystemTime>,
+    config_exists: bool,
+    config_reload_at: Option<Instant>,
+    should_quit: bool,
     serial: u32,
 }
 
@@ -158,7 +178,11 @@ impl Astera {
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(display, "astera-seat");
         let keyboard = seat
-            .add_keyboard(Default::default(), 200, 25)
+            .add_keyboard(
+                Default::default(),
+                config.key_repeat.delay_ms as i32,
+                config.key_repeat.rate as i32,
+            )
             .expect("default keyboard map must compile");
         let pointer = seat.add_pointer();
         let data_device_state = DataDeviceState::new::<Self>(display);
@@ -210,6 +234,13 @@ impl Astera {
             pointer_location: (0.0, 0.0).into(),
             drag: None,
             intercepted_keys: BTreeSet::new(),
+            held_repeats: Vec::new(),
+            config,
+            config_path: None,
+            config_stamp: None,
+            config_exists: false,
+            config_reload_at: None,
+            should_quit: false,
             serial: 1,
         }
     }
@@ -309,6 +340,7 @@ impl Astera {
                     event.time_msec(),
                     move |state, modifiers, key| {
                         if !pressed {
+                            state.release_binding(key_code);
                             return if state.intercepted_keys.remove(&key_code) {
                                 FilterResult::Intercept(())
                             } else {
@@ -319,7 +351,7 @@ impl Astera {
                             .raw_latin_sym_or_raw_current_sym()
                             .map(|symbol| symbol.raw());
                         if symbol
-                            .is_some_and(|symbol| state.handle_shortcut(modifiers, symbol, pressed))
+                            .is_some_and(|symbol| state.handle_binding(modifiers, symbol, key_code))
                         {
                             state.intercepted_keys.insert(key_code);
                             FilterResult::Intercept(())
@@ -727,7 +759,10 @@ impl Astera {
                 seed_direction: astera_core::Direction::between(
                     drag.start,
                     drag.target,
-                    self.desktop.workspace(workspace).unwrap().focus_direction,
+                    self.desktop
+                        .workspace(workspace)
+                        .unwrap()
+                        .layout_direction_hint,
                 ),
             },
             WindowMode::Floating => {
@@ -760,84 +795,280 @@ impl Astera {
         }
     }
 
-    fn handle_shortcut(&mut self, modifiers: &ModifiersState, symbol: u32, pressed: bool) -> bool {
-        if !pressed || !modifiers.logo {
+    fn handle_binding(
+        &mut self,
+        modifiers: &ModifiersState,
+        symbol: u32,
+        keycode: smithay::backend::input::Keycode,
+    ) -> bool {
+        let modifiers = BindingModifiers::from_state(
+            modifiers.ctrl,
+            modifiers.alt,
+            modifiers.shift,
+            modifiers.logo,
+        );
+        let binding = keycode
+            .raw()
+            .checked_sub(8)
+            .and_then(|code| self.config.bindings.get(&BindingKey::code(modifiers, code)))
+            .or_else(|| {
+                self.config
+                    .bindings
+                    .get(&BindingKey::keysym(modifiers, symbol))
+            })
+            .cloned();
+        let Some(binding) = binding else {
             return false;
+        };
+        if let Err(message) = self.execute_action(binding.action.clone()) {
+            tracing::warn!(%message, "key binding action failed");
         }
-        let workspace_id = self.desktop.active_workspace_id(self.active_output);
-        let focused_window = workspace_id
-            .and_then(|workspace| self.desktop.workspace(workspace).ok()?.focused_window);
-        let command = if (keysyms::KEY_1..=keysyms::KEY_9).contains(&symbol) {
-            let index = (symbol - keysyms::KEY_1 + 1) as usize;
-            let target = self
-                .desktop
-                .workspace_by_local_index(self.active_output, index)
-                .map(|workspace| workspace.id);
-            if modifiers.shift {
-                focused_window
-                    .zip(target)
-                    .map(|(window, target)| Command::MoveWindow {
-                        window,
-                        target: WorkspaceSelector::Id(target),
-                        activate: false,
-                    })
-            } else {
-                target.map(|workspace| Command::FocusWorkspace {
-                    workspace: WorkspaceSelector::Id(workspace),
-                })
-            }
-        } else {
-            match symbol {
-                keysyms::KEY_space => focused_window.and_then(|window| {
-                    let workspace = self.desktop.find_window(window).ok()?;
-                    let mode = match self
-                        .desktop
-                        .workspace(workspace)
-                        .ok()?
-                        .window_mode(window)?
-                    {
-                        WindowMode::Tiled | WindowMode::Fullscreen => WindowMode::Floating,
-                        WindowMode::Floating => WindowMode::Tiled,
-                    };
-                    Some(Command::SetWindowMode { window, mode })
-                }),
-                keysyms::KEY_f => focused_window.and_then(|window| {
-                    let workspace = self.desktop.find_window(window).ok()?;
-                    let state = self.desktop.workspace(workspace).ok()?;
-                    let mode = match state.window_mode(window)? {
-                        WindowMode::Fullscreen => match &state.fullscreen.as_ref()?.restore {
-                            astera_core::RestorePlacement::Tiled { .. } => WindowMode::Tiled,
-                            astera_core::RestorePlacement::Floating { .. } => WindowMode::Floating,
-                        },
-                        WindowMode::Tiled | WindowMode::Floating => WindowMode::Fullscreen,
-                    };
-                    Some(Command::SetWindowMode { window, mode })
-                }),
-                keysyms::KEY_Left | keysyms::KEY_Right | keysyms::KEY_Up | keysyms::KEY_Down => {
-                    workspace_id.map(|workspace| {
-                        let step = 160;
-                        let (dx, dy) = match symbol {
-                            keysyms::KEY_Left => (-step, 0),
-                            keysyms::KEY_Right => (step, 0),
-                            keysyms::KEY_Up => (0, -step),
-                            keysyms::KEY_Down => (0, step),
-                            _ => unreachable!(),
-                        };
-                        Command::PanCamera { workspace, dx, dy }
-                    })
-                }
-                _ => None,
-            }
-        };
-        let Some(command) = command else {
-            return false;
-        };
-        if pressed {
-            if let Response::Error { code, message } = self.execute_command(command) {
-                tracing::warn!(?code, %message, "shortcut command failed");
-            }
+        if binding.repeat {
+            self.held_repeats.retain(|held| held.keycode != keycode);
+            self.held_repeats.push(HeldRepeat {
+                keycode,
+                modifiers,
+                action: binding.action,
+                next_at: Instant::now() + Duration::from_millis(self.config.key_repeat.delay_ms),
+            });
         }
         true
+    }
+
+    fn release_binding(&mut self, keycode: smithay::backend::input::Keycode) {
+        let was_active = self
+            .held_repeats
+            .last()
+            .is_some_and(|held| held.keycode == keycode);
+        self.held_repeats.retain(|held| held.keycode != keycode);
+        if was_active {
+            if let Some(previous) = self.held_repeats.last_mut() {
+                previous.next_at = Instant::now()
+                    + Duration::from_secs_f64(1.0 / self.config.key_repeat.rate as f64);
+            }
+        }
+    }
+
+    pub fn process_key_repeats(&mut self) {
+        let state = self.keyboard.modifier_state();
+        let current = BindingModifiers::from_state(state.ctrl, state.alt, state.shift, state.logo);
+        self.held_repeats.retain(|held| {
+            held.modifiers == current && self.intercepted_keys.contains(&held.keycode)
+        });
+        let now = Instant::now();
+        let Some(held) = self.held_repeats.last_mut() else {
+            return;
+        };
+        if now < held.next_at {
+            return;
+        }
+        let action = held.action.clone();
+        held.next_at = now + Duration::from_secs_f64(1.0 / self.config.key_repeat.rate as f64);
+        if let Err(message) = self.execute_action(action) {
+            tracing::warn!(%message, "repeated key binding action failed");
+        }
+    }
+
+    fn execute_action(&mut self, action: Action) -> Result<(), String> {
+        let focused = self
+            .desktop
+            .workspace_for_output(self.active_output)
+            .and_then(|workspace| workspace.focused_window);
+        let command = match action {
+            Action::Spawn(argv) => return spawn_program(argv),
+            Action::SpawnShell(script) => {
+                return spawn_program(vec!["/bin/sh".into(), "-c".into(), script]);
+            }
+            Action::FocusWorkspace { workspace } => Some(Command::FocusWorkspace {
+                workspace: self.resolve_binding_workspace(workspace)?,
+            }),
+            Action::MoveWindowToWorkspace {
+                workspace,
+                activate,
+            } => Some(Command::MoveWindow {
+                window: focused.ok_or_else(|| "no focused window".to_owned())?,
+                target: self.resolve_binding_workspace(workspace)?,
+                activate,
+            }),
+            Action::FocusOutput { output } => {
+                Some(Command::FocusOutput(OutputSelector::Key(output)))
+            }
+            Action::MoveWorkspaceToOutput {
+                output,
+                index,
+                activate,
+            } => Some(Command::MoveWorkspace {
+                workspace: self
+                    .desktop
+                    .active_workspace_id(self.active_output)
+                    .ok_or_else(|| "active output has no workspace".to_owned())?,
+                target_output: OutputSelector::Key(output),
+                target_index: index.map(|index| index - 1),
+                activate,
+            }),
+            Action::FocusDirection(direction) => Some(Command::FocusDirection(direction)),
+            Action::PanCamera { x, y } => Some(Command::PanCamera {
+                workspace: self
+                    .desktop
+                    .active_workspace_id(self.active_output)
+                    .ok_or_else(|| "active output has no workspace".to_owned())?,
+                dx: x,
+                dy: y,
+            }),
+            Action::SetWindowMode(mode) => Some(Command::SetWindowMode {
+                window: focused.ok_or_else(|| "no focused window".to_owned())?,
+                mode,
+            }),
+            Action::ToggleFloating => Some(Command::SetWindowMode {
+                window: focused.ok_or_else(|| "no focused window".to_owned())?,
+                mode: self.toggle_floating_mode(focused.unwrap())?,
+            }),
+            Action::ToggleFullscreen => Some(Command::SetWindowMode {
+                window: focused.ok_or_else(|| "no focused window".to_owned())?,
+                mode: self.toggle_fullscreen_mode(focused.unwrap())?,
+            }),
+            Action::CloseWindow => {
+                let window = focused.ok_or_else(|| "no focused window".to_owned())?;
+                let mapped = self
+                    .windows
+                    .iter()
+                    .find(|mapped| mapped.id == window)
+                    .ok_or_else(|| "focused window is not mapped".to_owned())?;
+                mapped.surface.send_close();
+                None
+            }
+            Action::Quit => {
+                self.should_quit = true;
+                None
+            }
+        };
+        if let Some(command) = command {
+            match self.execute_command(command) {
+                Response::Ok(_) => Ok(()),
+                Response::Error { message, .. } => Err(message),
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    fn resolve_binding_workspace(
+        &self,
+        selector: BindingWorkspaceSelector,
+    ) -> Result<WorkspaceSelector, String> {
+        Ok(match selector {
+            BindingWorkspaceSelector::Index(index, output) => WorkspaceSelector::LocalIndex {
+                output: output
+                    .map(OutputSelector::Key)
+                    .unwrap_or(OutputSelector::Active),
+                index,
+            },
+            BindingWorkspaceSelector::Name(name) => WorkspaceSelector::Name(name),
+        })
+    }
+
+    fn toggle_floating_mode(&self, window: WindowId) -> Result<WindowMode, String> {
+        let workspace = self
+            .desktop
+            .find_window(window)
+            .map_err(|error| error.to_string())?;
+        match self
+            .desktop
+            .workspace(workspace)
+            .unwrap()
+            .window_mode(window)
+        {
+            Some(WindowMode::Floating) => Ok(WindowMode::Tiled),
+            Some(WindowMode::Tiled | WindowMode::Fullscreen) => Ok(WindowMode::Floating),
+            None => Err("focused window has no mode".into()),
+        }
+    }
+
+    fn toggle_fullscreen_mode(&self, window: WindowId) -> Result<WindowMode, String> {
+        let workspace = self
+            .desktop
+            .find_window(window)
+            .map_err(|error| error.to_string())?;
+        let state = self.desktop.workspace(workspace).unwrap();
+        match state.window_mode(window) {
+            Some(WindowMode::Fullscreen) => match &state.fullscreen.as_ref().unwrap().restore {
+                astera_core::RestorePlacement::Tiled { .. } => Ok(WindowMode::Tiled),
+                astera_core::RestorePlacement::Floating { .. } => Ok(WindowMode::Floating),
+            },
+            Some(WindowMode::Tiled | WindowMode::Floating) => Ok(WindowMode::Fullscreen),
+            None => Err("focused window has no mode".into()),
+        }
+    }
+
+    pub fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
+    pub fn watch_config(&mut self, path: PathBuf) {
+        let metadata = std::fs::metadata(&path).ok();
+        self.config_stamp = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok());
+        self.config_exists = metadata.is_some();
+        self.config_path = Some(path.clone());
+        tracing::info!(path = %path.display(), "configuration watcher enabled");
+    }
+
+    pub fn poll_config(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        let metadata = std::fs::metadata(&path).ok();
+        let exists = metadata.is_some();
+        let stamp = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok());
+        if exists != self.config_exists || stamp != self.config_stamp {
+            self.config_exists = exists;
+            self.config_stamp = stamp;
+            self.config_reload_at = Some(Instant::now() + Duration::from_millis(200));
+        }
+        if !self
+            .config_reload_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return;
+        }
+        self.config_reload_at = None;
+        let result = if exists {
+            Config::load(&path)
+        } else {
+            Ok(Config::default())
+        };
+        match result {
+            Ok(config) => {
+                if let Err(error) = self.apply_config(config) {
+                    tracing::error!(path = %path.display(), %error, "configuration reload rejected");
+                }
+            }
+            Err(error) => {
+                tracing::error!(path = %path.display(), %error, "configuration reload failed")
+            }
+        }
+    }
+
+    fn apply_config(&mut self, config: Config) -> Result<(), String> {
+        let mut desktop = self.desktop.clone();
+        desktop
+            .reconfigure_layout(config.gap, config.camera)
+            .map_err(|error| error.to_string())?;
+        self.keyboard.change_repeat_info(
+            config.key_repeat.rate as i32,
+            config.key_repeat.delay_ms as i32,
+        );
+        self.held_repeats.clear();
+        self.desktop = desktop;
+        self.config = config;
+        tracing::info!(
+            bindings = self.config.bindings.len(),
+            "configuration reloaded"
+        );
+        Ok(())
     }
 
     fn mapped_windows_for_output(
@@ -1457,9 +1688,8 @@ impl Astera {
                         )
                     })?;
                 self.desktop
-                    .workspace_mut(workspace_id)
-                    .map_err(map_desktop_error)?
-                    .focus_direction = direction;
+                    .focus_direction(workspace_id, direction)
+                    .map_err(map_desktop_error)?;
                 Ok(())
             }
         }
@@ -1476,6 +1706,22 @@ fn map_desktop_error(error: astera_core::DesktopError) -> (ErrorCode, String) {
         | astera_core::DesktopError::Layout(_) => ErrorCode::Conflict,
     };
     (code, error.to_string())
+}
+
+fn spawn_program(argv: Vec<String>) -> Result<(), String> {
+    let (program, arguments) = argv
+        .split_first()
+        .ok_or_else(|| "Spawn requires a non-empty argv".to_owned())?;
+    let mut child = std::process::Command::new(program)
+        .args(arguments)
+        .spawn()
+        .map_err(|error| format!("could not spawn {program:?}: {error}"))?;
+    let program = program.clone();
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) => tracing::debug!(%program, ?status, "spawned process exited"),
+        Err(error) => tracing::warn!(%program, %error, "could not reap spawned process"),
+    });
+    Ok(())
 }
 
 fn mode_layer(mode: WindowMode) -> u8 {
@@ -1643,7 +1889,7 @@ impl XdgShellHandler for Astera {
             .and_then(|focused| workspace.tiled.get(&focused))
             .map(|window| window.geometry.center())
             .unwrap_or(Point::ORIGIN);
-        let seed_direction = workspace.focus_direction;
+        let seed_direction = workspace.layout_direction_hint;
         let result = self.desktop.apply_window(
             workspace_id,
             WindowTransaction::InsertTiled {

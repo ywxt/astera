@@ -418,11 +418,12 @@ impl NativeLoop {
     }
 }
 
-pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
+pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dyn Error>> {
     let mut event_loop: EventLoop<NativeLoop> = EventLoop::try_new()?;
     let handle = event_loop.handle();
     let display = Display::<Astera>::new()?;
     let mut state = Astera::new(&display.handle(), config);
+    state.watch_config(config_path);
     state.disconnect_output(astera_core::OutputId(0))?;
     let listener = ListeningSocket::bind_auto("astera", 1..32)?;
     let socket_name = listener
@@ -536,6 +537,12 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         }
         runtime.display.dispatch_clients(&mut runtime.state)?;
         runtime.ipc.dispatch(&mut runtime.state);
+        runtime.state.poll_config();
+        if runtime.state.should_quit() {
+            tracing::info!("quit action requested");
+            return Ok(());
+        }
+        runtime.state.process_key_repeats();
         runtime.state.remove_dead_windows();
         runtime.render_all();
         runtime.display.flush_clients()?;
