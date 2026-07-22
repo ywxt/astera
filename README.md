@@ -40,6 +40,49 @@ libseat, use:
 cargo run -p astera -- --backend=native
 ```
 
+## Configuration
+
+Astera loads `$XDG_CONFIG_HOME/astera/config.ron`, falling back to
+`$HOME/.config/astera/config.ron`. Pass `--config PATH` to require a specific
+file. Without a file, Astera uses its built-in bindings; once a valid file
+exists, its `bindings` map completely replaces the built-ins. Deleting the file
+restores them.
+
+The file is watched while Astera runs. Changes are applied after a short
+debounce; an invalid edit leaves the last valid configuration active. Gap,
+camera policy, animation duration, keyboard repeat settings and bindings reload
+as one transaction.
+
+```ron
+(
+    gap: 8,
+    animation_ms: 280,
+    camera: KeepVisible(margin: 32),
+    key_repeat: (delay_ms: 300, rate: 25),
+    bindings: {
+        "Super+Return": Spawn(["foot"]),
+        "Super+P": SpawnShell("grim -g \"$(slurp)\" | wl-copy"),
+        "Super+1": FocusWorkspace(workspace: Index(1)),
+        "Super+2": FocusWorkspace(workspace: Index(2, "DP-1")),
+        "Super+Shift+2": MoveWindowToWorkspace(workspace: Index(2)),
+        "Super+H": FocusDirection(Left),
+        "Super+F": ToggleFullscreen,
+        "Super+Ctrl+F": SetWindowMode(Fullscreen),
+        "Super+Right": (
+            action: PanCamera(x: 160, y: 0),
+            repeat: true,
+        ),
+        "Super+code:0x7b": CloseWindow,
+    },
+)
+```
+
+Bindings use case-insensitive XKB keysyms or Linux evdev codes written as
+`code:123`/`code:0x7b`. Modifiers are exactly `Ctrl`, `Alt`, `Shift` and `Super`;
+matching is exact and ignores lock modifiers. A physical-code binding takes
+priority over a keysym binding. Normalized duplicates and repeat on unsafe
+actions are configuration errors.
+
 The native backend requires an active seat (for example seatd or logind) and
 permission to open the DRM and input devices. It discovers GPUs and connectors
 through udev, assigns a CRTC and preferred mode to every usable connector, and
@@ -73,7 +116,7 @@ WAYLAND_DISPLAY=astera-1 cargo run -p astera --bin astrology -- overview
 The active output is marked with `*`; detached workspaces are shown as
 `background`.
 
-Default nested-backend bindings use the logo/Super modifier:
+When no configuration file exists, built-in bindings use the Super modifier:
 
 - `Super+1` through `Super+9`: focus that output-local workspace index;
 - `Super+Shift+1` through `Super+Shift+9`: send the focused window to that

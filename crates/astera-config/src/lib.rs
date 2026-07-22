@@ -124,7 +124,7 @@ pub enum Action {
         #[serde(default = "default_true")]
         activate: bool,
     },
-    FocusDirection(Direction),
+    FocusDirection(CardinalDirection),
     PanCamera {
         x: i64,
         y: i64,
@@ -134,6 +134,25 @@ pub enum Action {
     ToggleFullscreen,
     CloseWindow,
     Quit,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub enum CardinalDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl CardinalDirection {
+    pub fn as_direction(self) -> Direction {
+        match self {
+            Self::Left => Direction::new(-1.0, 0.0),
+            Self::Right => Direction::new(1.0, 0.0),
+            Self::Up => Direction::new(0.0, -1.0),
+            Self::Down => Direction::new(0.0, 1.0),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -341,8 +360,7 @@ impl Config {
 fn normalize_workspace_selectors(source: &str) -> String {
     let mut output = String::with_capacity(source.len());
     let mut cursor = 0;
-    while let Some(relative) = source[cursor..].find("Index(") {
-        let start = cursor + relative;
+    while let Some(start) = find_next_selector(source, cursor) {
         output.push_str(&source[cursor..start]);
         let arguments_start = start + "Index(".len();
         let Some(end) = find_selector_end(source, arguments_start) else {
@@ -361,6 +379,45 @@ fn normalize_workspace_selectors(source: &str) -> String {
     }
     output.push_str(&source[cursor..]);
     output
+}
+
+fn find_next_selector(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => index = (index + 2).min(bytes.len()),
+                        b'"' => {
+                            index += 1;
+                            break;
+                        }
+                        _ => index += 1,
+                    }
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            b'I' if source[index..].starts_with("Index(") => return Some(index),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn find_selector_end(source: &str, start: usize) -> Option<usize> {
@@ -442,8 +499,20 @@ fn parse_binding_key(source: &str) -> Result<BindingKey, ConfigError> {
                 .map(|hex| u32::from_str_radix(hex, 16))
                 .unwrap_or_else(|| code.parse())
                 .map_err(|_| ConfigError::Invalid(format!("invalid keycode in {source:?}")))?;
+            if code > 0x2ff {
+                return Err(ConfigError::Invalid(format!(
+                    "keycode is outside the Linux evdev range in {source:?}"
+                )));
+            }
             KeyTrigger::Code(code)
         } else {
+            let normalized;
+            let component = if component.len() == 1 && component.is_ascii() {
+                normalized = component.to_ascii_lowercase();
+                &normalized
+            } else {
+                component
+            };
             let keysym = xkb::keysym_from_name(component, xkb::KEYSYM_CASE_INSENSITIVE);
             if keysym == xkb::Keysym::NoSymbol {
                 return Err(ConfigError::Invalid(format!(
@@ -520,11 +589,12 @@ mod tests {
                     "Super+code:0x7b": CloseWindow,
                     "Super+1": FocusWorkspace(workspace: Index(1)),
                     "Super+2": FocusWorkspace(workspace: Index(2, "DP-1")),
+                    "Super+3": SpawnShell("echo Index(3)"),
                 },
             )"#,
         )
         .unwrap();
-        assert_eq!(config.bindings.len(), 5);
+        assert_eq!(config.bindings.len(), 6);
     }
 
     #[test]
@@ -534,6 +604,10 @@ mod tests {
                 r#"(bindings: {"Super+Return": CloseWindow, "super+return": CloseWindow})"#
             )
             .is_err()
+        );
+        assert!(
+            Config::from_ron(r#"(bindings: {"Super+Q": CloseWindow, "super+q": CloseWindow})"#)
+                .is_err()
         );
         assert!(
             Config::from_ron(

@@ -350,9 +350,7 @@ impl Astera {
                         let symbol = key
                             .raw_latin_sym_or_raw_current_sym()
                             .map(|symbol| symbol.raw());
-                        if symbol
-                            .is_some_and(|symbol| state.handle_binding(modifiers, symbol, key_code))
-                        {
+                        if state.handle_binding(modifiers, symbol, key_code) {
                             state.intercepted_keys.insert(key_code);
                             FilterResult::Intercept(())
                         } else {
@@ -798,7 +796,7 @@ impl Astera {
     fn handle_binding(
         &mut self,
         modifiers: &ModifiersState,
-        symbol: u32,
+        symbol: Option<u32>,
         keycode: smithay::backend::input::Keycode,
     ) -> bool {
         let modifiers = BindingModifiers::from_state(
@@ -812,9 +810,11 @@ impl Astera {
             .checked_sub(8)
             .and_then(|code| self.config.bindings.get(&BindingKey::code(modifiers, code)))
             .or_else(|| {
-                self.config
-                    .bindings
-                    .get(&BindingKey::keysym(modifiers, symbol))
+                symbol.and_then(|symbol| {
+                    self.config
+                        .bindings
+                        .get(&BindingKey::keysym(modifiers, symbol))
+                })
             })
             .cloned();
         let Some(binding) = binding else {
@@ -906,7 +906,9 @@ impl Astera {
                 target_index: index.map(|index| index - 1),
                 activate,
             }),
-            Action::FocusDirection(direction) => Some(Command::FocusDirection(direction)),
+            Action::FocusDirection(direction) => {
+                Some(Command::FocusDirection(direction.as_direction()))
+            }
             Action::PanCamera { x, y } => Some(Command::PanCamera {
                 workspace: self
                     .desktop
