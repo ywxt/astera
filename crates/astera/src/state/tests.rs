@@ -13,16 +13,16 @@ use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_compositor::WlCompositor, wl_registry::WlRegistry, wl_surface::WlSurface},
 };
-use wayland_protocols::xdg::shell::client::{
-    xdg_popup::XdgPopup, xdg_positioner::XdgPositioner, xdg_surface::XdgSurface,
-    xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
-};
 use wayland_protocols::wp::{
     fractional_scale::v1::client::{
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
         wp_fractional_scale_v1::WpFractionalScaleV1,
     },
     viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
+};
+use wayland_protocols::xdg::shell::client::{
+    xdg_popup::XdgPopup, xdg_positioner::XdgPositioner, xdg_surface::XdgSurface,
+    xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::ZwlrLayerShellV1, zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
@@ -158,7 +158,9 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
             .bind::<ZwlrLayerShellV1, _, _>(&queue, 1..=4, ())
             .unwrap();
         let xdg = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
-        let viewporter = globals.bind::<WpViewporter, _, _>(&queue, 1..=1, ()).unwrap();
+        let viewporter = globals
+            .bind::<WpViewporter, _, _>(&queue, 1..=1, ())
+            .unwrap();
         let fractional = globals
             .bind::<WpFractionalScaleManagerV1, _, _>(&queue, 1..=1, ())
             .unwrap();
