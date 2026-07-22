@@ -1,6 +1,27 @@
 use super::*;
 
 impl Astera {
+    pub(crate) fn desktop_output(&self, output: OutputId) -> Option<&astera_core::Output> {
+        self.desktop.output(output)
+    }
+
+    pub(crate) fn rollback_output_physical_size(&mut self, output: OutputId, size: Size) {
+        if let Some(model) = self.desktop.output_mut(output) {
+            model.physical_size = size;
+        }
+        if let Some(runtime) = self.output_runtime.get(&output) {
+            runtime.wayland.change_current_state(
+                Some(Mode {
+                    size: (saturating_i32(size.width), saturating_i32(size.height)).into(),
+                    refresh: 60_000,
+                }),
+                None,
+                None,
+                None,
+            );
+        }
+    }
+
     pub fn enable_dmabuf(&mut self, formats: impl IntoIterator<Item = Format>) {
         if self.dmabuf_enabled {
             return;

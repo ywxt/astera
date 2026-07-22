@@ -111,6 +111,8 @@ struct NativeSurface {
     output: OutputId,
     drm: NativeOutput,
     pending: bool,
+    applied_size: Size,
+    modes: Vec<smithay::reexports::drm::control::Mode>,
 }
 
 impl NativeLoop {
@@ -269,6 +271,11 @@ impl NativeLoop {
                                             output: id,
                                             drm: drm_output,
                                             pending: false,
+                                            applied_size: Size::new(
+                                                i64::from(width),
+                                                i64::from(height),
+                                            ),
+                                            modes: connector.modes().to_vec(),
                                         },
                                     );
                                     self.connectors.insert((node, connector.handle()), id);
@@ -348,6 +355,66 @@ impl NativeLoop {
             .collect::<Vec<_>>();
         for (node, crtc, output) in outputs {
             self.render_output(node, crtc, output);
+        }
+    }
+
+    fn apply_output_configurations(&mut self) {
+        let changes = self
+            .devices
+            .iter()
+            .flat_map(|(node, device)| {
+                device.outputs.iter().filter_map(|(crtc, surface)| {
+                    let requested = self.state.desktop_output(surface.output)?.physical_size;
+                    (requested != surface.applied_size).then_some((
+                        *node,
+                        *crtc,
+                        surface.output,
+                        surface.applied_size,
+                        requested,
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        for (node, crtc, output, previous, requested) in changes {
+            let Some(mode) = self.devices[&node].outputs[&crtc]
+                .modes
+                .iter()
+                .copied()
+                .find(|mode| {
+                    let (width, height) = mode.size();
+                    i64::from(width) == requested.width && i64::from(height) == requested.height
+                })
+            else {
+                tracing::warn!(?output, ?requested, "requested KMS mode is not advertised");
+                self.state.rollback_output_physical_size(output, previous);
+                continue;
+            };
+            let mut renderer = match self.gpus.single_renderer(&node) {
+                Ok(renderer) => renderer,
+                Err(error) => {
+                    tracing::warn!(?output, %error, "could not acquire renderer for mode switch");
+                    self.state.rollback_output_physical_size(output, previous);
+                    continue;
+                }
+            };
+            let empty = DrmOutputRenderElements::<
+                NativeRenderer<'_>,
+                WaylandSurfaceRenderElement<NativeRenderer<'_>>,
+            >::default();
+            let surface = self
+                .devices
+                .get_mut(&node)
+                .unwrap()
+                .outputs
+                .get_mut(&crtc)
+                .unwrap();
+            match surface.drm.use_mode(mode, &mut renderer, &empty) {
+                Ok(()) => surface.applied_size = requested,
+                Err(error) => {
+                    tracing::warn!(?output, ?error, "KMS mode switch failed; rolling back");
+                    self.state.rollback_output_physical_size(output, previous);
+                }
+            }
         }
     }
 
@@ -442,7 +509,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     let handle = event_loop.handle();
     let display = Display::<Astera>::new()?;
     let mut state = Astera::new(&display.handle(), config);
-    state.set_output_configuration_supported(false);
+    state.set_output_configuration_supported(true);
     state.watch_config(config_path);
     state.disconnect_output(astera_core::OutputId(0))?;
     let listener = ListeningSocket::bind_auto("astera", 1..32)?;
@@ -560,6 +627,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         }
         runtime.display.dispatch_clients(&mut runtime.state)?;
         runtime.ipc.dispatch(&mut runtime.state);
+        runtime.apply_output_configurations();
         runtime.state.poll_config();
         if runtime.state.should_quit() {
             tracing::info!("quit action requested");
