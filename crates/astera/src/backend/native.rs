@@ -47,7 +47,7 @@ use smithay::{
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::{
-    backend::native_policy::{ModeCandidate, select_mode, stable_output_key},
+    backend::native_policy::{ConnectorSnapshot, ModeCandidate, SnapshotSource, scan_outputs},
     ipc_server::IpcServer,
     state::{Astera, ClientState, send_frames_surface_tree},
 };
@@ -78,7 +78,7 @@ type NativeOutputManager = DrmOutputManager<
     DrmDeviceFd,
 >;
 
-fn edid_output_key(device: &impl ControlDevice, connector: connector::Handle) -> Option<String> {
+fn edid_blob(device: &impl ControlDevice, connector: connector::Handle) -> Option<Vec<u8>> {
     let properties = device.get_properties(connector).ok()?;
     for (handle, raw) in properties.iter() {
         let info = device.get_property(*handle).ok()?;
@@ -95,7 +95,7 @@ fn edid_output_key(device: &impl ControlDevice, connector: connector::Handle) ->
         if edid.len() < 16 {
             continue;
         }
-        return Some(stable_output_key(Some(&edid), "invalid-edid"));
+        return Some(edid);
     }
     None
 }
@@ -199,26 +199,34 @@ impl NativeLoop {
                             }
                         })
                         .collect::<Vec<_>>();
-                    let mode = connector.modes()
-                        [select_mode(&candidates).expect("non-empty connector mode list")];
-                    let (width, height) = mode.size();
                     let name = format!(
                         "{}-{}",
                         connector.interface().as_str(),
                         connector.interface_id()
                     );
+                    let fallback_key = format!("{node:?}:{name}");
+                    let edid = self.devices.get(&node).and_then(|device| {
+                        edid_blob(device.output_manager.device(), connector.handle())
+                    });
+                    let plan = scan_outputs(&SnapshotSource(vec![ConnectorSnapshot {
+                        connector: fallback_key,
+                        edid,
+                        modes: candidates.clone(),
+                    }]))
+                    .expect("snapshot source cannot fail")
+                    .pop()
+                    .expect("connected connector has at least one mode");
+                    let mode_index = candidates
+                        .iter()
+                        .position(|candidate| *candidate == plan.mode)
+                        .expect("planned mode came from connector snapshot");
+                    let mode = connector.modes()[mode_index];
+                    let (width, height) = mode.size();
                     let id = OutputId(self.next_output_id);
                     self.next_output_id += 1;
-                    let stable_key = self
-                        .devices
-                        .get(&node)
-                        .and_then(|device| {
-                            edid_output_key(device.output_manager.device(), connector.handle())
-                        })
-                        .unwrap_or_else(|| format!("{node:?}:{name}"));
                     let output = Output::new(
                         id,
-                        stable_key,
+                        plan.stable_key,
                         Size::new(i64::from(width), i64::from(height)),
                     );
                     match self.state.connect_output(output) {
