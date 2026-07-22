@@ -100,42 +100,23 @@ impl Astera {
     }
 
     pub(super) fn layer_geometry(&self, mapped: &MappedLayer) -> Option<(Point, Size)> {
-        let output = self.desktop.outputs.get(&mapped.output)?;
-        let requested = with_states(mapped.surface.wl_surface(), |states| {
-            *states
-                .cached_state
-                .get::<LayerSurfaceCachedState>()
-                .current()
-        });
-        let width = if requested.size.w == 0 {
-            (output.output.logical_size.width
-                - i64::from(requested.margin.left + requested.margin.right))
-            .max(1)
-        } else {
-            i64::from(requested.size.w)
-        };
-        let height = if requested.size.h == 0 {
-            (output.output.logical_size.height
-                - i64::from(requested.margin.top + requested.margin.bottom))
-            .max(1)
-        } else {
-            i64::from(requested.size.h)
-        };
-        let x = if requested.anchor.contains(Anchor::LEFT) {
-            i64::from(requested.margin.left)
-        } else if requested.anchor.contains(Anchor::RIGHT) {
-            output.output.logical_size.width - width - i64::from(requested.margin.right)
-        } else {
-            (output.output.logical_size.width - width) / 2
-        };
-        let y = if requested.anchor.contains(Anchor::TOP) {
-            i64::from(requested.margin.top)
-        } else if requested.anchor.contains(Anchor::BOTTOM) {
-            output.output.logical_size.height - height - i64::from(requested.margin.bottom)
-        } else {
-            (output.output.logical_size.height - height) / 2
-        };
-        Some((Point::new(x, y), Size::new(width, height)))
+        let runtime = self.output_runtime.get(&mapped.output)?;
+        let geometry = layer_map_for_output(&runtime.wayland).layer_geometry(&mapped.surface)?;
+        Some((
+            Point::new(i64::from(geometry.loc.x), i64::from(geometry.loc.y)),
+            Size::new(i64::from(geometry.size.w), i64::from(geometry.size.h)),
+        ))
+    }
+
+    pub(super) fn usable_rect(&self, output: OutputId) -> Option<astera_core::Rect> {
+        let runtime = self.output_runtime.get(&output)?;
+        let zone = layer_map_for_output(&runtime.wayland).non_exclusive_zone();
+        Some(astera_core::Rect::new(
+            i64::from(zone.loc.x),
+            i64::from(zone.loc.y),
+            i64::from(zone.size.w),
+            i64::from(zone.size.h),
+        ))
     }
 
     pub fn update_output_size(&mut self, width: i64, height: i64) {
@@ -192,6 +173,7 @@ impl Astera {
             None,
         );
         runtime.wayland.set_preferred(mode);
+        layer_map_for_output(&runtime.wayland).arrange();
         self.reflow_outputs();
         self.configure_fullscreen_windows();
         self.configure_layer_surfaces();

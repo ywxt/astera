@@ -50,7 +50,7 @@ use smithay::{
     delegate_output, delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
-        find_popup_root_surface, utils::under_from_surface_tree,
+        find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
     },
     input::{
         Seat, SeatHandler, SeatState,
@@ -63,7 +63,7 @@ use smithay::{
         backend::{ClientData, ClientId, DisconnectReason},
         protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
     },
-    utils::{Physical, Point as SmithayPoint, Serial},
+    utils::{IsAlive, Physical, Point as SmithayPoint, Serial},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -81,7 +81,7 @@ use smithay::{
             },
         },
         shell::wlr_layer::{
-            Anchor, KeyboardInteractivity, Layer, LayerSurface, LayerSurfaceCachedState,
+            KeyboardInteractivity, Layer, LayerSurface, LayerSurfaceCachedState,
             WlrLayerShellHandler, WlrLayerShellState,
         },
         shell::xdg::{

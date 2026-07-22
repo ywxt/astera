@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use astera_core::{OutputId, Point, WindowId, WindowMode};
 use smithay::{
-    desktop::PopupManager,
+    desktop::{LayerSurface, PopupManager},
     input::{Seat, SeatState, keyboard::KeyboardHandle, pointer::PointerHandle},
     output::Output as SmithayOutput,
     reexports::wayland_server::{
@@ -14,7 +14,7 @@ use smithay::{
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::{
-            wlr_layer::{Layer, LayerSurface, WlrLayerShellState},
+            wlr_layer::{Layer, WlrLayerShellState},
             xdg::{ToplevelSurface, XdgShellState},
         },
         shm::ShmState,

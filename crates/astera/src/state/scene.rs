@@ -155,7 +155,8 @@ impl Astera {
         output_id: OutputId,
         id: WindowId,
     ) -> Option<(Point, Size, f64, WindowMode)> {
-        let output = self.desktop.outputs.get(&output_id)?;
+        let _output = self.desktop.outputs.get(&output_id)?;
+        let usable = self.usable_rect(output_id)?;
         let workspace = self.desktop.workspace_for_output(output_id)?;
         let mode = workspace.window_mode(id)?;
         match mode {
@@ -167,14 +168,12 @@ impl Astera {
                 {
                     rect.origin = drag.target;
                 }
-                let left = workspace.camera.center.x as f64
-                    - output.output.logical_size.width as f64 / 2.0;
-                let top = workspace.camera.center.y as f64
-                    - output.output.logical_size.height as f64 / 2.0;
+                let left = workspace.camera.center.x as f64 - usable.size.width as f64 / 2.0;
+                let top = workspace.camera.center.y as f64 - usable.size.height as f64 / 2.0;
                 Some((
                     Point::new(
-                        (rect.origin.x as f64 - left).round() as i64,
-                        (rect.origin.y as f64 - top).round() as i64,
+                        usable.origin.x + (rect.origin.x as f64 - left).round() as i64,
+                        usable.origin.y + (rect.origin.y as f64 - top).round() as i64,
                     ),
                     rect.size,
                     1.0,
@@ -191,7 +190,7 @@ impl Astera {
                 }
                 Some((rect.origin, rect.size, 1.0, mode))
             }
-            WindowMode::Fullscreen => Some((Point::ORIGIN, output.output.logical_size, 1.0, mode)),
+            WindowMode::Fullscreen => Some((usable.origin, usable.size, 1.0, mode)),
         }
     }
 }

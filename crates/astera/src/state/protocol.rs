@@ -61,6 +61,11 @@ impl CompositorHandler for Astera {
             .find(|mapped| mapped.surface.wl_surface() == surface)
             .map(|mapped| mapped.surface.clone())
         {
+            if let Some(mapped) = self.layers.iter().find(|mapped| mapped.surface == layer)
+                && let Some(runtime) = self.output_runtime.get(&mapped.output)
+            {
+                layer_map_for_output(&runtime.wayland).arrange();
+            }
             let has_buffer = with_renderer_surface_state(surface, |state| state.buffer().is_some())
                 .unwrap_or(false);
             if let Some(mapped) = self
@@ -87,7 +92,7 @@ impl WlrLayerShellHandler for Astera {
         surface: LayerSurface,
         output: Option<WlOutput>,
         layer: Layer,
-        _namespace: String,
+        namespace: String,
     ) {
         // A missing wl_output means the compositor-selected active output, as required by the
         // layer-shell protocol; placement remains viewport-local to that output.
@@ -99,14 +104,20 @@ impl WlrLayerShellHandler for Astera {
                     .find_map(|(id, runtime)| runtime.wayland.owns(requested).then_some(*id))
             })
             .unwrap_or(self.active_output);
+        let mapped_surface = smithay::desktop::LayerSurface::new(surface.clone(), namespace);
         self.layers.push(MappedLayer {
-            surface: surface.clone(),
+            surface: mapped_surface.clone(),
             layer,
             output,
             mapped: false,
         });
+        if let Some(runtime) = self.output_runtime.get(&output)
+            && let Err(error) = layer_map_for_output(&runtime.wayland).map_layer(&mapped_surface)
+        {
+            tracing::warn!(%error, ?output, "could not map layer surface");
+        }
         tracing::debug!(?output, ?layer, "layer surface role created");
-        self.configure_layer_surface(&surface);
+        self.configure_layer_surface(&mapped_surface);
     }
 
     fn new_popup(&mut self, _parent: LayerSurface, popup: PopupSurface) {
@@ -120,7 +131,16 @@ impl WlrLayerShellHandler for Astera {
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
-        self.layers.retain(|mapped| mapped.surface != surface);
+        if let Some(mapped) = self
+            .layers
+            .iter()
+            .find(|mapped| mapped.surface.layer_surface() == &surface)
+            && let Some(runtime) = self.output_runtime.get(&mapped.output)
+        {
+            layer_map_for_output(&runtime.wayland).unmap_layer(&mapped.surface);
+        }
+        self.layers
+            .retain(|mapped| mapped.surface.layer_surface() != &surface);
         tracing::debug!("layer surface destroyed");
         self.refresh_visible_scales();
         self.sync_keyboard_focus();

@@ -69,8 +69,8 @@ impl Astera {
                 .workspace_location(workspace_id)
                 .ok()
                 .and_then(|location| location.output)
-                .and_then(|output| self.desktop.outputs.get(&output))
-                .map(|output| output.output.logical_size)
+                .and_then(|output| self.usable_rect(output))
+                .map(|rect| rect.size)
         } else {
             workspace.window_size(window)
         };
@@ -104,7 +104,7 @@ impl Astera {
             else {
                 continue;
             };
-            let size = self.desktop.outputs[&output_id].output.logical_size;
+            let size = self.usable_rect(output_id).unwrap().size;
             mapped.surface.with_pending_state(|state| {
                 state.size = Some((saturating_i32(size.width), saturating_i32(size.height)).into());
                 state.states.set(xdg_toplevel::State::Fullscreen);
@@ -113,17 +113,17 @@ impl Astera {
         }
     }
 
-    pub(super) fn configure_layer_surface(&self, surface: &LayerSurface) {
+    pub(super) fn configure_layer_surface(&self, surface: &smithay::desktop::LayerSurface) {
         let Some(mapped) = self.layers.iter().find(|mapped| mapped.surface == *surface) else {
             return;
         };
         let Some((_, size)) = self.layer_geometry(mapped) else {
             return;
         };
-        surface.with_pending_state(|state| {
+        surface.layer_surface().with_pending_state(|state| {
             state.size = Some((saturating_i32(size.width), saturating_i32(size.height)).into());
         });
-        surface.send_pending_configure();
+        surface.layer_surface().send_pending_configure();
     }
 
     pub(super) fn configure_layer_surfaces(&self) {
