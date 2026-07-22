@@ -712,8 +712,21 @@ impl Astera {
                 keyboard.set_focus(self, Some(surface), serial);
             }
         }
+        // Scene-changing IPC/workspace actions may have changed the surface below a stationary
+        // pointer. Refresh pointer focus before delivering the button to avoid targeting the
+        // surface that occupied this coordinate before the transition.
+        let focus = self.surface_under(self.pointer_location);
         let pointer = self.pointer.clone();
         let serial = self.next_serial();
+        pointer.motion(
+            self,
+            focus.map(|(surface, origin, _)| (surface, origin)),
+            &MotionEvent {
+                location: self.pointer_location,
+                serial,
+                time,
+            },
+        );
         pointer.button(
             self,
             &ButtonEvent {
