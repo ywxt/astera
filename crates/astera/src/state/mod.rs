@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, os::fd::OwnedFd, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    ops::{Deref, DerefMut},
+    os::fd::OwnedFd,
+    sync::Arc,
+};
 
 mod clock;
 mod config_watcher;
@@ -15,7 +20,7 @@ use geometry::{
     layer_rank, mode_layer, output_transform, physical_point, point_inside, saturating_i32,
 };
 use key_repeat::KeyRepeatState;
-use model::{DragState, MappedLayer, MappedWindow, OutputRuntime};
+use model::{DragState, MappedLayer, MappedWindow, OutputRuntime, ProtocolState};
 
 use astera_config::{
     Action, BindingKey, Config, Modifiers as BindingModifiers,
@@ -47,7 +52,7 @@ use smithay::{
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::{FilterResult, ModifiersState},
-        pointer::{AxisFrame, ButtonEvent, Focus as PointerFocusMode, MotionEvent, PointerHandle},
+        pointer::{AxisFrame, ButtonEvent, Focus as PointerFocusMode, MotionEvent},
     },
     output::{Mode, Output as SmithayOutput, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::{
@@ -87,21 +92,8 @@ use smithay::{
 const DEFAULT_WINDOW_SIZE: Size = Size::new(800, 600);
 
 pub struct Astera {
-    display: DisplayHandle,
-    compositor_state: CompositorState,
-    xdg_shell_state: XdgShellState,
-    layer_shell_state: WlrLayerShellState,
-    _fractional_scale_state: FractionalScaleManagerState,
-    _viewporter_state: ViewporterState,
-    _output_manager_state: OutputManagerState,
+    protocol: ProtocolState,
     output_runtime: BTreeMap<OutputId, OutputRuntime>,
-    shm_state: ShmState,
-    seat_state: SeatState<Self>,
-    data_device_state: DataDeviceState,
-    popup_manager: PopupManager,
-    seat: Seat<Self>,
-    keyboard: smithay::input::keyboard::KeyboardHandle<Self>,
-    pointer: PointerHandle<Self>,
     desktop: Desktop,
     active_output: OutputId,
     windows: Vec<MappedWindow>,
@@ -116,6 +108,20 @@ pub struct Astera {
     should_quit: bool,
     output_configuration_supported: bool,
     serial: u32,
+}
+
+impl Deref for Astera {
+    type Target = ProtocolState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.protocol
+    }
+}
+
+impl DerefMut for Astera {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.protocol
+    }
 }
 
 impl Astera {
@@ -180,29 +186,31 @@ impl Astera {
             .policy = config.camera;
 
         Self {
-            display: display.clone(),
-            compositor_state,
-            xdg_shell_state,
-            layer_shell_state,
-            _fractional_scale_state: fractional_scale_state,
-            _viewporter_state: viewporter_state,
-            _output_manager_state: output_manager_state,
+            protocol: ProtocolState {
+                display: display.clone(),
+                compositor_state,
+                xdg_shell_state,
+                layer_shell_state,
+                _fractional_scale_state: fractional_scale_state,
+                _viewporter_state: viewporter_state,
+                _output_manager_state: output_manager_state,
+                shm_state,
+                seat_state,
+                data_device_state,
+                popup_manager: PopupManager::default(),
+                seat,
+                keyboard,
+                pointer,
+            },
             output_runtime: BTreeMap::from([(
                 active_output,
                 OutputRuntime {
                     wayland: wayland_output,
                     global: output_global,
-                    entered_surfaces: Vec::new(),
+                    entered_surfaces: HashSet::new(),
                     location: Point::ORIGIN,
                 },
             )]),
-            shm_state,
-            seat_state,
-            data_device_state,
-            popup_manager: PopupManager::default(),
-            seat,
-            keyboard,
-            pointer,
             desktop,
             active_output,
             windows: Vec::new(),
@@ -253,7 +261,7 @@ impl Astera {
             OutputRuntime {
                 wayland,
                 global,
-                entered_surfaces: Vec::new(),
+                entered_surfaces: HashSet::new(),
                 location: Point::ORIGIN,
             },
         );
@@ -350,46 +358,12 @@ impl Astera {
                 let location = event.position_transformed(
                     (saturating_i32(size.width), saturating_i32(size.height)).into(),
                 );
-                self.pointer_location = location;
-                if self.drag.is_some() {
-                    self.update_drag(location);
-                } else {
-                    let focus = self.surface_under(location);
-                    let pointer = self.pointer.clone();
-                    let serial = self.next_serial();
-                    pointer.motion(
-                        self,
-                        focus.map(|(surface, origin, _)| (surface, origin)),
-                        &MotionEvent {
-                            location,
-                            serial,
-                            time: event.time_msec(),
-                        },
-                    );
-                    pointer.frame(self);
-                }
+                self.handle_pointer_motion(location, event.time_msec());
             }
             InputEvent::PointerMotion { event } => {
                 let delta = event.delta_unaccel();
                 let location = self.relative_pointer_location(delta.x, delta.y);
-                self.pointer_location = location;
-                if self.drag.is_some() {
-                    self.update_drag(location);
-                } else {
-                    let focus = self.surface_under(location);
-                    let pointer = self.pointer.clone();
-                    let serial = self.next_serial();
-                    pointer.motion(
-                        self,
-                        focus.map(|(surface, origin, _)| (surface, origin)),
-                        &MotionEvent {
-                            location,
-                            serial,
-                            time: event.time_msec(),
-                        },
-                    );
-                    pointer.frame(self);
-                }
+                self.handle_pointer_motion(location, event.time_msec());
             }
             InputEvent::PointerButton { event } => self.handle_pointer_button(
                 event.button(),
@@ -397,28 +371,55 @@ impl Astera {
                 event.state(),
                 event.time_msec(),
             ),
-            InputEvent::PointerAxis { event } => {
-                let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
-                for axis in [Axis::Horizontal, Axis::Vertical] {
-                    frame = frame.relative_direction(axis, event.relative_direction(axis));
-                    if let Some(value) = event.amount(axis) {
-                        frame = frame.value(axis, value);
-                        if value == 0.0 {
-                            frame = frame.stop(axis);
-                        }
-                    }
-                    if let Some(v120) = event.amount_v120(axis) {
-                        frame = frame
-                            .v120(axis, v120.round() as i32)
-                            .value(axis, v120 / 120.0 * 15.0);
-                    }
-                }
-                let pointer = self.pointer.clone();
-                pointer.axis(self, frame);
-                pointer.frame(self);
-            }
+            InputEvent::PointerAxis { event } => self.handle_pointer_axis(event),
             _ => {}
         }
+    }
+
+    fn handle_pointer_motion(
+        &mut self,
+        location: SmithayPoint<f64, smithay::utils::Logical>,
+        time: u32,
+    ) {
+        self.pointer_location = location;
+        if self.drag.is_some() {
+            self.update_drag(location);
+            return;
+        }
+        let focus = self.surface_under(location);
+        let pointer = self.pointer.clone();
+        let serial = self.next_serial();
+        pointer.motion(
+            self,
+            focus.map(|(surface, origin, _)| (surface, origin)),
+            &MotionEvent {
+                location,
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn handle_pointer_axis<B: InputBackend, E: PointerAxisEvent<B>>(&mut self, event: E) {
+        let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
+        for axis in [Axis::Horizontal, Axis::Vertical] {
+            frame = frame.relative_direction(axis, event.relative_direction(axis));
+            if let Some(value) = event.amount(axis) {
+                frame = frame.value(axis, value);
+                if value == 0.0 {
+                    frame = frame.stop(axis);
+                }
+            }
+            if let Some(v120) = event.amount_v120(axis) {
+                frame = frame
+                    .v120(axis, v120.round() as i32)
+                    .value(axis, v120 / 120.0 * 15.0);
+            }
+        }
+        let pointer = self.pointer.clone();
+        pointer.axis(self, frame);
+        pointer.frame(self);
     }
 
     fn next_serial(&mut self) -> Serial {
@@ -1125,7 +1126,14 @@ impl Astera {
     fn mapped_windows_for_output(
         &self,
         output: OutputId,
-    ) -> impl Iterator<Item = (&ToplevelSurface, SmithayPoint<i32, Physical>, f64)> {
+    ) -> impl Iterator<
+        Item = (
+            &ToplevelSurface,
+            SmithayPoint<i32, Physical>,
+            f64,
+            WindowMode,
+        ),
+    > {
         let output_scale = self.output_scale(output);
         let mut instances: Vec<_> = self
             .windows
@@ -1134,17 +1142,18 @@ impl Astera {
                 let (origin, _, scale, mode) =
                     self.visual_geometry_for_output(output, mapped.id)?;
                 let layer = mode_layer(mode);
-                Some((layer, &mapped.surface, origin, scale))
+                Some((layer, &mapped.surface, origin, scale, mode))
             })
             .collect();
-        instances.sort_by_key(|(layer, _, _, _)| std::cmp::Reverse(*layer));
+        instances.sort_by_key(|(layer, _, _, _, _)| std::cmp::Reverse(*layer));
         instances
             .into_iter()
-            .map(move |(_, surface, origin, scale)| {
+            .map(move |(_, surface, origin, scale, mode)| {
                 (
                     surface,
                     physical_point(origin, output_scale),
                     scale * output_scale,
+                    mode,
                 )
             })
     }
@@ -1157,26 +1166,27 @@ impl Astera {
         &self,
         output: OutputId,
     ) -> Vec<(WlSurface, SmithayPoint<i32, Physical>, f64)> {
+        // Compute window geometry once. Previously each frame rebuilt and sorted this list twice,
+        // then performed another linear surface-to-window lookup for every item.
+        let windows = self.mapped_windows_for_output(output).collect::<Vec<_>>();
         let mut roots = Vec::new();
         roots.extend(self.layer_roots(output, Layer::Overlay));
         roots.extend(
-            self.mapped_windows_for_output(output)
-                .filter(|(surface, _, _)| {
-                    self.window_mode_for_surface(output, surface.wl_surface())
-                        == Some(WindowMode::Fullscreen)
-                })
-                .map(|(surface, location, scale)| (surface.wl_surface().clone(), location, scale)),
+            windows
+                .iter()
+                .filter(|(_, _, _, mode)| *mode == WindowMode::Fullscreen)
+                .map(|(surface, location, scale, _)| {
+                    (surface.wl_surface().clone(), *location, *scale)
+                }),
         );
         roots.extend(self.layer_roots(output, Layer::Top));
         roots.extend(
-            self.mapped_windows_for_output(output)
-                .filter(|(surface, _, _)| {
-                    matches!(
-                        self.window_mode_for_surface(output, surface.wl_surface()),
-                        Some(WindowMode::Floating | WindowMode::Tiled)
-                    )
-                })
-                .map(|(surface, location, scale)| (surface.wl_surface().clone(), location, scale)),
+            windows
+                .iter()
+                .filter(|(_, _, _, mode)| matches!(mode, WindowMode::Floating | WindowMode::Tiled))
+                .map(|(surface, location, scale, _)| {
+                    (surface.wl_surface().clone(), *location, *scale)
+                }),
         );
         roots.extend(self.layer_roots(output, Layer::Bottom));
         roots.extend(self.layer_roots(output, Layer::Background));
@@ -1187,15 +1197,6 @@ impl Astera {
         self.output_runtime
             .get(&output)
             .map(|runtime| runtime.wayland.clone())
-    }
-
-    fn window_mode_for_surface(&self, output: OutputId, surface: &WlSurface) -> Option<WindowMode> {
-        let id = self
-            .windows
-            .iter()
-            .find(|mapped| mapped.surface.wl_surface() == surface)?
-            .id;
-        self.desktop.workspace_for_output(output)?.window_mode(id)
     }
 
     fn layer_roots(
@@ -1362,7 +1363,7 @@ impl Astera {
                     .into_iter()
                     .map(|(surface, _, _)| surface)
                     .collect::<Vec<_>>();
-                let mut visible = Vec::new();
+                let mut visible = HashSet::new();
                 for root in roots {
                     for (popup, _) in PopupManager::popups_for_surface(&root) {
                         extend_surface_tree(&mut visible, popup.wl_surface());
@@ -1490,729 +1491,11 @@ impl Astera {
         }
         self.refresh_visible_scales();
     }
-
-    pub fn execute_command(&mut self, command: Command) -> Response<DesktopSnapshot> {
-        match &command {
-            Command::GetState => tracing::debug!("IPC state snapshot requested"),
-            command => tracing::info!(?command, "command started"),
-        }
-        let mode_change = match &command {
-            Command::SetWindowMode { window, mode } => Some((*window, *mode)),
-            _ => None,
-        };
-        match self.execute_command_inner(command) {
-            Ok(()) => {
-                if let Some((window, mode)) = mode_change {
-                    self.configure_window_mode(window, mode);
-                }
-                self.configure_fullscreen_windows();
-                self.refresh_visible_scales();
-                self.sync_keyboard_focus();
-                Response::Ok(
-                    DesktopSnapshot::from(&self.desktop).with_active_output(
-                        self.desktop
-                            .outputs
-                            .contains_key(&self.active_output)
-                            .then_some(self.active_output),
-                    ),
-                )
-            }
-            Err((code, message)) => {
-                tracing::warn!(?code, %message, "command failed");
-                Response::Error { code, message }
-            }
-        }
-    }
-
-    fn configure_window_mode(&self, window: WindowId, mode: WindowMode) {
-        let Ok(workspace_id) = self.desktop.find_window(window) else {
-            return;
-        };
-        let workspace = self.desktop.workspace(workspace_id).unwrap();
-        let Some(mapped) = self.windows.iter().find(|mapped| mapped.id == window) else {
-            return;
-        };
-        let size = if mode == WindowMode::Fullscreen {
-            self.desktop
-                .workspace_location(workspace_id)
-                .ok()
-                .and_then(|location| location.output)
-                .and_then(|output| self.desktop.outputs.get(&output))
-                .map(|output| output.output.logical_size)
-        } else {
-            workspace.window_size(window)
-        };
-        mapped.surface.with_pending_state(|state| {
-            state.size =
-                size.map(|size| (saturating_i32(size.width), saturating_i32(size.height)).into());
-            if mode == WindowMode::Fullscreen {
-                state.states.set(xdg_toplevel::State::Fullscreen);
-            } else {
-                state.states.unset(xdg_toplevel::State::Fullscreen);
-            }
-        });
-        mapped.surface.send_pending_configure();
-    }
-
-    fn configure_fullscreen_windows(&self) {
-        for workspace in self.desktop.workspaces() {
-            let output = self
-                .desktop
-                .workspace_location(workspace.id)
-                .ok()
-                .and_then(|location| location.output);
-            let (Some(fullscreen), Some(output_id)) = (workspace.fullscreen.as_ref(), output)
-            else {
-                continue;
-            };
-            let Some(mapped) = self
-                .windows
-                .iter()
-                .find(|mapped| mapped.id == fullscreen.window)
-            else {
-                continue;
-            };
-            let size = self.desktop.outputs[&output_id].output.logical_size;
-            mapped.surface.with_pending_state(|state| {
-                state.size = Some((saturating_i32(size.width), saturating_i32(size.height)).into());
-                state.states.set(xdg_toplevel::State::Fullscreen);
-            });
-            mapped.surface.send_pending_configure();
-        }
-    }
-
-    fn configure_layer_surface(&self, surface: &LayerSurface) {
-        let Some(mapped) = self.layers.iter().find(|mapped| mapped.surface == *surface) else {
-            return;
-        };
-        let Some((_, size)) = self.layer_geometry(mapped) else {
-            return;
-        };
-        surface.with_pending_state(|state| {
-            state.size = Some((saturating_i32(size.width), saturating_i32(size.height)).into());
-        });
-        surface.send_pending_configure();
-    }
-
-    fn configure_layer_surfaces(&self) {
-        for mapped in &self.layers {
-            self.configure_layer_surface(&mapped.surface);
-        }
-    }
-
-    fn sync_keyboard_focus(&mut self) {
-        let layer_target = self
-            .layers
-            .iter()
-            .enumerate()
-            .filter(|(_, mapped)| {
-                let state = with_states(mapped.surface.wl_surface(), |states| {
-                    *states
-                        .cached_state
-                        .get::<LayerSurfaceCachedState>()
-                        .current()
-                });
-                mapped.mapped
-                    && mapped.output == self.active_output
-                    && mapped.surface.alive()
-                    && state.keyboard_interactivity == KeyboardInteractivity::Exclusive
-            })
-            .max_by_key(|(index, mapped)| (layer_rank(mapped.layer), *index))
-            .map(|(_, mapped)| mapped.surface.wl_surface().clone());
-        let focused = self
-            .desktop
-            .workspace_for_output(self.active_output)
-            .and_then(|workspace| workspace.focused_window);
-        let window_target = focused.and_then(|id| {
-            self.windows
-                .iter()
-                .find(|mapped| mapped.id == id)
-                .map(|mapped| mapped.surface.wl_surface().clone())
-        });
-        let target = layer_target.or(window_target);
-        for mapped in &self.windows {
-            let activated = Some(mapped.surface.wl_surface()) == target.as_ref();
-            mapped.surface.with_pending_state(|state| {
-                if activated {
-                    state.states.set(xdg_toplevel::State::Activated);
-                } else {
-                    state.states.unset(xdg_toplevel::State::Activated);
-                }
-            });
-            mapped.surface.send_pending_configure();
-        }
-        let keyboard = self.keyboard.clone();
-        let serial = self.next_serial();
-        keyboard.set_focus(self, target, serial);
-    }
-
-    fn resolve_output(&self, selector: OutputSelector) -> Result<OutputId, (ErrorCode, String)> {
-        let output = match selector {
-            OutputSelector::Id(output) => Some(output),
-            OutputSelector::Key(key) => self
-                .desktop
-                .outputs
-                .iter()
-                .find_map(|(id, set)| (set.output.stable_key == key).then_some(*id)),
-            OutputSelector::Active => Some(self.active_output),
-        };
-        output
-            .filter(|output| self.desktop.outputs.contains_key(output))
-            .ok_or_else(|| (ErrorCode::NotFound, "unknown output".to_owned()))
-    }
-
-    fn resolve_workspace(
-        &self,
-        selector: WorkspaceSelector,
-    ) -> Result<WorkspaceId, (ErrorCode, String)> {
-        let workspace = match selector {
-            WorkspaceSelector::Id(workspace) => self
-                .desktop
-                .workspace(workspace)
-                .ok()
-                .map(|workspace| workspace.id),
-            WorkspaceSelector::Name(name) => self
-                .desktop
-                .workspace_by_name(&name)
-                .map(|workspace| workspace.id),
-            WorkspaceSelector::LocalIndex { output, index } => {
-                let output = self.resolve_output(output)?;
-                self.desktop
-                    .workspace_by_local_index(output, index)
-                    .map(|workspace| workspace.id)
-            }
-        };
-        workspace.ok_or_else(|| (ErrorCode::NotFound, "unknown workspace".to_owned()))
-    }
-
-    fn execute_command_inner(&mut self, command: Command) -> Result<(), (ErrorCode, String)> {
-        match command {
-            Command::GetState => Ok(()),
-            Command::FocusOutput(output) => {
-                let output = self.resolve_output(output)?;
-                self.active_output = output;
-                Ok(())
-            }
-            Command::ConfigureOutput {
-                output,
-                physical_size,
-                logical_size,
-                native_scale,
-                transform,
-            } => {
-                if !self.output_configuration_supported {
-                    return Err((
-                        ErrorCode::Conflict,
-                        "the native backend does not support live KMS output reconfiguration"
-                            .to_owned(),
-                    ));
-                }
-                let output = self.resolve_output(output)?;
-                self.configure_output(output, physical_size, logical_size, native_scale, transform)
-                    .map_err(map_desktop_error)
-            }
-            Command::FocusWorkspace { workspace } => {
-                let workspace = self.resolve_workspace(workspace)?;
-                let location = self
-                    .desktop
-                    .workspace_location(workspace)
-                    .map_err(map_desktop_error)?;
-                let output = location
-                    .output
-                    .ok_or_else(|| (ErrorCode::Conflict, "workspace is detached".to_owned()))?;
-                self.desktop
-                    .apply(WorkspaceTransaction::Focus { output, workspace })
-                    .map_err(map_desktop_error)?;
-                self.active_output = output;
-                Ok(())
-            }
-            Command::MoveWorkspace {
-                workspace,
-                target_output,
-                target_index,
-                activate,
-            } => {
-                let target_output = self.resolve_output(target_output)?;
-                self.desktop
-                    .apply(WorkspaceTransaction::Move {
-                        workspace,
-                        target_output,
-                        target_index,
-                        activate,
-                    })
-                    .map(|_| ())
-                    .map_err(map_desktop_error)
-            }
-            Command::SetWorkspaceName { workspace, name } => self
-                .desktop
-                .apply(WorkspaceTransaction::SetName { workspace, name })
-                .map(|_| ())
-                .map_err(map_desktop_error),
-            Command::MoveWindow {
-                window,
-                target,
-                activate,
-            } => {
-                let target = self.resolve_workspace(target)?;
-                self.desktop
-                    .apply(WorkspaceTransaction::SendWindow {
-                        window,
-                        target,
-                        activate,
-                    })
-                    .map(|_| ())
-                    .map_err(map_desktop_error)
-            }
-            Command::SetWindowMode { window, mode } => {
-                let workspace = self
-                    .desktop
-                    .find_window(window)
-                    .map_err(map_desktop_error)?;
-                let viewport_size = self
-                    .desktop
-                    .workspace_location(workspace)
-                    .ok()
-                    .and_then(|location| location.output)
-                    .and_then(|output| self.desktop.output(output))
-                    .map(|output| output.logical_size)
-                    .unwrap_or(Size::new(1920, 1080));
-                self.desktop
-                    .apply_window(
-                        workspace,
-                        WindowTransaction::SetMode {
-                            id: window,
-                            mode,
-                            viewport_size,
-                        },
-                    )
-                    .map_err(map_desktop_error)
-            }
-            Command::SetCameraPolicy { workspace, policy } => {
-                let state = self
-                    .desktop
-                    .workspace_mut(workspace)
-                    .map_err(map_desktop_error)?;
-                state.camera.policy = policy;
-                Ok(())
-            }
-            Command::PanCamera { workspace, dx, dy } => {
-                let state = self
-                    .desktop
-                    .workspace_mut(workspace)
-                    .map_err(map_desktop_error)?;
-                state.camera.center.x = state.camera.center.x.saturating_add(dx);
-                state.camera.center.y = state.camera.center.y.saturating_add(dy);
-                Ok(())
-            }
-            Command::FocusWindow(window) => {
-                let workspace_id = self
-                    .desktop
-                    .focus_window(window)
-                    .map_err(map_desktop_error)?;
-                if let Some(output) = self
-                    .desktop
-                    .workspace_location(workspace_id)
-                    .map_err(map_desktop_error)?
-                    .output
-                {
-                    self.active_output = output;
-                }
-                Ok(())
-            }
-            Command::FocusDirection(direction) => {
-                let workspace_id = self
-                    .desktop
-                    .active_workspace_id(self.active_output)
-                    .ok_or_else(|| {
-                        (
-                            ErrorCode::Conflict,
-                            "active output has no workspace".to_owned(),
-                        )
-                    })?;
-                self.desktop
-                    .focus_direction(workspace_id, direction)
-                    .map_err(map_desktop_error)?;
-                Ok(())
-            }
-        }
-    }
 }
 
-fn map_desktop_error(error: astera_core::DesktopError) -> (ErrorCode, String) {
-    let code = match error {
-        astera_core::DesktopError::UnknownWorkspace(_)
-        | astera_core::DesktopError::UnknownOutput(_)
-        | astera_core::DesktopError::UnknownWindow(_) => ErrorCode::NotFound,
-        astera_core::DesktopError::DuplicateWindow { .. }
-        | astera_core::DesktopError::DuplicateWorkspaceName(_)
-        | astera_core::DesktopError::DuplicateOutputStableKey(_)
-        | astera_core::DesktopError::InvalidWorkspaceState(_)
-        | astera_core::DesktopError::Layout(_) => ErrorCode::Conflict,
-        astera_core::DesktopError::InvalidOutputSize
-        | astera_core::DesktopError::InvalidOutputScale => ErrorCode::InvalidCommand,
-    };
-    (code, error.to_string())
-}
+mod command;
 
-impl BufferHandler for Astera {
-    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
-}
-
-impl OutputHandler for Astera {}
-
-impl FractionalScaleHandler for Astera {
-    fn new_fractional_scale(&mut self, surface: WlSurface) {
-        let Some(scale) = self.output_runtime.iter().find_map(|(output, runtime)| {
-            runtime
-                .entered_surfaces
-                .contains(&surface)
-                .then(|| self.output_scale(*output))
-        }) else {
-            // Background and not-yet-mapped surfaces intentionally have no preferred output.
-            return;
-        };
-        with_states(&surface, |states| {
-            with_fractional_scale(states, |fractional| {
-                fractional.set_preferred_scale(scale);
-            });
-        });
-    }
-}
-
-impl CompositorHandler for Astera {
-    fn compositor_state(&mut self) -> &mut CompositorState {
-        &mut self.compositor_state
-    }
-
-    fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client
-            .get_data::<ClientState>()
-            .expect("all Astera clients have compositor state")
-            .compositor_state
-    }
-
-    fn commit(&mut self, surface: &WlSurface) {
-        on_commit_buffer_handler::<Self>(surface);
-        self.popup_manager.commit(surface);
-        if let Some(index) = self
-            .windows
-            .iter()
-            .position(|window| window.surface.wl_surface() == surface)
-        {
-            let has_buffer = with_renderer_surface_state(surface, |state| state.buffer().is_some())
-                .unwrap_or(false);
-            match (self.windows[index].mapped, has_buffer) {
-                (false, true) => self.map_toplevel(index),
-                (true, false) => self.unmap_toplevel(index),
-                _ => {}
-            }
-        }
-        if let Some(layer) = self
-            .layers
-            .iter()
-            .find(|mapped| mapped.surface.wl_surface() == surface)
-            .map(|mapped| mapped.surface.clone())
-        {
-            let has_buffer = with_renderer_surface_state(surface, |state| state.buffer().is_some())
-                .unwrap_or(false);
-            if let Some(mapped) = self
-                .layers
-                .iter_mut()
-                .find(|mapped| mapped.surface.wl_surface() == surface)
-            {
-                mapped.mapped = has_buffer;
-            }
-            self.configure_layer_surface(&layer);
-            self.refresh_visible_scales();
-            self.sync_keyboard_focus();
-        }
-    }
-}
-
-impl WlrLayerShellHandler for Astera {
-    fn shell_state(&mut self) -> &mut WlrLayerShellState {
-        &mut self.layer_shell_state
-    }
-
-    fn new_layer_surface(
-        &mut self,
-        surface: LayerSurface,
-        output: Option<WlOutput>,
-        layer: Layer,
-        _namespace: String,
-    ) {
-        let output = output
-            .as_ref()
-            .and_then(|requested| {
-                self.output_runtime
-                    .iter()
-                    .find_map(|(id, runtime)| runtime.wayland.owns(requested).then_some(*id))
-            })
-            .unwrap_or(self.active_output);
-        self.layers.push(MappedLayer {
-            surface: surface.clone(),
-            layer,
-            output,
-            mapped: false,
-        });
-        tracing::debug!(?output, ?layer, "layer surface role created");
-        self.configure_layer_surface(&surface);
-    }
-
-    fn new_popup(&mut self, _parent: LayerSurface, popup: PopupSurface) {
-        if let Err(error) = self.popup_manager.track_popup(popup.clone().into()) {
-            tracing::warn!(%error, "could not track layer popup");
-            return;
-        }
-        if let Err(error) = popup.send_configure() {
-            tracing::warn!(%error, "could not configure layer popup");
-        }
-    }
-
-    fn layer_destroyed(&mut self, surface: LayerSurface) {
-        self.layers.retain(|mapped| mapped.surface != surface);
-        tracing::debug!("layer surface destroyed");
-        self.refresh_visible_scales();
-        self.sync_keyboard_focus();
-    }
-}
-
-impl XdgShellHandler for Astera {
-    fn xdg_shell_state(&mut self) -> &mut XdgShellState {
-        &mut self.xdg_shell_state
-    }
-
-    fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        let id = WindowId(self.next_window_id);
-        self.next_window_id += 1;
-        surface.with_pending_state(|state| {
-            state.size = Some(
-                (
-                    DEFAULT_WINDOW_SIZE.width as i32,
-                    DEFAULT_WINDOW_SIZE.height as i32,
-                )
-                    .into(),
-            );
-        });
-        surface.send_configure();
-        self.windows.push(MappedWindow {
-            id,
-            surface,
-            mapped: false,
-        });
-        tracing::debug!(window = ?id, "toplevel role created");
-    }
-
-    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
-        surface.with_pending_state(|state| {
-            state.positioner = positioner;
-            state.geometry = positioner.get_geometry();
-        });
-        if let Err(error) = self.popup_manager.track_popup(surface.clone().into()) {
-            tracing::warn!(%error, "could not track xdg popup");
-            return;
-        }
-        if let Err(error) = surface.send_configure() {
-            tracing::warn!(%error, "could not configure xdg popup");
-        }
-    }
-
-    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
-        let Some(window) = self
-            .windows
-            .iter()
-            .find(|window| window.mapped && window.surface == surface)
-            .map(|window| window.id)
-        else {
-            return;
-        };
-        let Ok(workspace) = self.desktop.find_window(window) else {
-            return;
-        };
-        if let Some(requested) = output
-            && !self.output_runtime.iter().any(|(output, runtime)| {
-                runtime.wayland.owns(&requested)
-                    && self.desktop.active_workspace_id(*output) == Some(workspace)
-            })
-        {
-            tracing::warn!(
-                ?window,
-                "fullscreen request targeted another workspace output"
-            );
-            return;
-        }
-        let Some(viewport_size) = self
-            .desktop
-            .workspace_location(workspace)
-            .ok()
-            .and_then(|location| location.output)
-            .and_then(|output| self.desktop.output(output))
-            .map(|output| output.logical_size)
-        else {
-            return;
-        };
-        if self
-            .desktop
-            .apply_window(
-                workspace,
-                WindowTransaction::SetMode {
-                    id: window,
-                    mode: WindowMode::Fullscreen,
-                    viewport_size,
-                },
-            )
-            .is_ok()
-        {
-            self.configure_window_mode(window, WindowMode::Fullscreen);
-            self.refresh_visible_scales();
-            self.sync_keyboard_focus();
-        }
-    }
-
-    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        let Some(window) = self
-            .windows
-            .iter()
-            .find(|window| window.mapped && window.surface == surface)
-            .map(|window| window.id)
-        else {
-            return;
-        };
-        let Ok(mode) = self.toggle_fullscreen_mode(window) else {
-            return;
-        };
-        let Ok(workspace) = self.desktop.find_window(window) else {
-            return;
-        };
-        let Some(viewport_size) = self
-            .desktop
-            .workspace_location(workspace)
-            .ok()
-            .and_then(|location| location.output)
-            .and_then(|output| self.desktop.output(output))
-            .map(|output| output.logical_size)
-        else {
-            return;
-        };
-        if self
-            .desktop
-            .apply_window(
-                workspace,
-                WindowTransaction::SetMode {
-                    id: window,
-                    mode,
-                    viewport_size,
-                },
-            )
-            .is_ok()
-        {
-            self.configure_window_mode(window, mode);
-            self.refresh_visible_scales();
-            self.sync_keyboard_focus();
-        }
-    }
-
-    fn grab(&mut self, surface: PopupSurface, _seat: wl_seat::WlSeat, serial: Serial) {
-        let popup = PopupKind::from(surface);
-        let Ok(root) = find_popup_root_surface(&popup) else {
-            return;
-        };
-        let seat = self.seat.clone();
-        let Ok(grab) = self
-            .popup_manager
-            .grab_popup::<Self>(root, popup, &seat, serial)
-        else {
-            return;
-        };
-        let keyboard = self.keyboard.clone();
-        keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
-        let pointer = self.pointer.clone();
-        pointer.set_grab(
-            self,
-            PopupPointerGrab::new(&grab),
-            serial,
-            PointerFocusMode::Keep,
-        );
-    }
-
-    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let Some(index) = self
-            .windows
-            .iter()
-            .position(|window| window.surface == surface)
-        else {
-            return;
-        };
-        let window = self.windows.remove(index);
-        if window.mapped
-            && let Ok(workspace) = self.desktop.find_window(window.id)
-        {
-            let _ = self
-                .desktop
-                .apply_window(workspace, WindowTransaction::Remove { id: window.id });
-        }
-        if self.drag.is_some_and(|drag| drag.window == window.id) {
-            self.drag = None;
-        }
-        tracing::info!(window = ?window.id, "toplevel role destroyed");
-        self.refresh_visible_scales();
-        self.sync_keyboard_focus();
-    }
-
-    fn reposition_request(
-        &mut self,
-        surface: PopupSurface,
-        positioner: PositionerState,
-        token: u32,
-    ) {
-        surface.with_pending_state(|state| {
-            state.positioner = positioner;
-            state.geometry = positioner.get_geometry();
-        });
-        surface.send_repositioned(token);
-    }
-}
-
-impl ShmHandler for Astera {
-    fn shm_state(&self) -> &ShmState {
-        &self.shm_state
-    }
-}
-
-impl SeatHandler for Astera {
-    type KeyboardFocus = WlSurface;
-    type PointerFocus = WlSurface;
-    type TouchFocus = WlSurface;
-
-    fn seat_state(&mut self) -> &mut SeatState<Self> {
-        &mut self.seat_state
-    }
-
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
-
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
-    }
-}
-
-impl SelectionHandler for Astera {
-    type SelectionUserData = ();
-}
-
-impl DataDeviceHandler for Astera {
-    fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device_state
-    }
-}
-
-impl ClientDndGrabHandler for Astera {}
-
-impl ServerDndGrabHandler for Astera {
-    fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<Self>) {}
-}
+mod protocol;
 
 pub fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
     with_surface_tree_downward(
@@ -2234,15 +1517,13 @@ pub fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
     );
 }
 
-fn extend_surface_tree(surfaces: &mut Vec<WlSurface>, root: &WlSurface) {
+fn extend_surface_tree(surfaces: &mut HashSet<WlSurface>, root: &WlSurface) {
     with_surface_tree_downward(
         root,
         (),
         |_, _, &()| TraversalAction::DoChildren(()),
         |surface, _, &()| {
-            if !surfaces.contains(surface) {
-                surfaces.push(surface.clone());
-            }
+            surfaces.insert(surface.clone());
         },
         |_, _, &()| true,
     );
@@ -2274,315 +1555,4 @@ delegate_seat!(Astera);
 delegate_data_device!(Astera);
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        os::unix::net::UnixStream,
-        sync::Arc,
-        sync::mpsc,
-        thread,
-        time::{Duration, Instant},
-    };
-
-    use astera_core::{Scale120, WorkspaceTransaction};
-    use smithay::reexports::wayland_server::Display;
-    use wayland_client::{
-        Connection, Dispatch, QueueHandle, delegate_noop,
-        globals::registry_queue_init,
-        protocol::{wl_compositor::WlCompositor, wl_registry::WlRegistry, wl_surface::WlSurface},
-    };
-    use wayland_protocols::xdg::shell::client::{
-        xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
-    };
-
-    use super::clock::testing::ManualClock;
-    use super::*;
-
-    struct TestClient;
-
-    impl Dispatch<WlRegistry, wayland_client::globals::GlobalListContents> for TestClient {
-        fn event(
-            _state: &mut Self,
-            _proxy: &WlRegistry,
-            _event: wayland_client::protocol::wl_registry::Event,
-            _data: &wayland_client::globals::GlobalListContents,
-            _connection: &Connection,
-            _queue: &QueueHandle<Self>,
-        ) {
-        }
-    }
-
-    delegate_noop!(TestClient: ignore WlCompositor);
-    delegate_noop!(TestClient: ignore WlSurface);
-    delegate_noop!(TestClient: ignore XdgToplevel);
-
-    impl Dispatch<XdgWmBase, ()> for TestClient {
-        fn event(
-            _state: &mut Self,
-            proxy: &XdgWmBase,
-            event: wayland_protocols::xdg::shell::client::xdg_wm_base::Event,
-            _data: &(),
-            _connection: &Connection,
-            _queue: &QueueHandle<Self>,
-        ) {
-            if let wayland_protocols::xdg::shell::client::xdg_wm_base::Event::Ping { serial } =
-                event
-            {
-                proxy.pong(serial);
-            }
-        }
-    }
-
-    impl Dispatch<XdgSurface, ()> for TestClient {
-        fn event(
-            _state: &mut Self,
-            proxy: &XdgSurface,
-            event: wayland_protocols::xdg::shell::client::xdg_surface::Event,
-            _data: &(),
-            _connection: &Connection,
-            _queue: &QueueHandle<Self>,
-        ) {
-            if let wayland_protocols::xdg::shell::client::xdg_surface::Event::Configure { serial } =
-                event
-            {
-                proxy.ack_configure(serial);
-            }
-        }
-    }
-
-    fn dispatch_until(
-        display: &mut Display<Astera>,
-        state: &mut Astera,
-        mut condition: impl FnMut(&mut Astera) -> bool,
-    ) {
-        for _ in 0..10_000 {
-            display.dispatch_clients(state).unwrap();
-            display.flush_clients().unwrap();
-            if condition(state) {
-                return;
-            }
-            thread::yield_now();
-        }
-        panic!("Wayland harness condition did not become true");
-    }
-
-    #[test]
-    fn uncommitted_toplevel_does_not_map_and_role_destroy_cleans_up() {
-        let mut display = Display::<Astera>::new().unwrap();
-        let mut state = Astera::new(&display.handle(), Config::default());
-        let (server_socket, client_socket) = UnixStream::pair().unwrap();
-        display
-            .handle()
-            .insert_client(server_socket, Arc::new(ClientState::default()))
-            .unwrap();
-        let (mapped_tx, mapped_rx) = mpsc::sync_channel(0);
-        let (destroy_tx, destroy_rx) = mpsc::sync_channel(0);
-        let (role_destroyed_tx, role_destroyed_rx) = mpsc::sync_channel(0);
-        let (surface_destroy_tx, surface_destroy_rx) = mpsc::sync_channel(0);
-
-        let client = thread::spawn(move || {
-            let connection = Connection::from_socket(client_socket).unwrap();
-            let (globals, mut event_queue) =
-                registry_queue_init::<TestClient>(&connection).unwrap();
-            let queue = event_queue.handle();
-            let compositor = globals
-                .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
-                .unwrap();
-            let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
-            let surface = compositor.create_surface(&queue, ());
-            let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
-            let toplevel = xdg_surface.get_toplevel(&queue, ());
-            surface.commit();
-            connection.flush().unwrap();
-            mapped_tx.send(()).unwrap();
-            destroy_rx.recv().unwrap();
-            toplevel.destroy();
-            xdg_surface.destroy();
-            connection.flush().unwrap();
-            role_destroyed_tx.send(()).unwrap();
-            surface_destroy_rx.recv().unwrap();
-            surface.destroy();
-            connection.flush().unwrap();
-            // Consume any final configure/ping without waiting for another roundtrip.
-            event_queue.dispatch_pending(&mut TestClient).unwrap();
-        });
-
-        dispatch_until(&mut display, &mut state, |_| mapped_rx.try_recv().is_ok());
-        dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
-        let role_window = state.windows[0].id;
-        assert!(!state.windows[0].mapped);
-        assert_eq!(
-            state.desktop.find_window(role_window),
-            Err(astera_core::DesktopError::UnknownWindow(role_window))
-        );
-        destroy_tx.send(()).unwrap();
-        dispatch_until(&mut display, &mut state, |_| {
-            role_destroyed_rx.try_recv().is_ok()
-        });
-        dispatch_until(&mut display, &mut state, |state| state.windows.is_empty());
-        surface_destroy_tx.send(()).unwrap();
-        client.join().unwrap();
-    }
-
-    #[test]
-    fn disconnected_xdg_client_is_removed_without_explicit_destroy() {
-        let mut display = Display::<Astera>::new().unwrap();
-        let mut state = Astera::new(&display.handle(), Config::default());
-        let (server_socket, client_socket) = UnixStream::pair().unwrap();
-        display
-            .handle()
-            .insert_client(server_socket, Arc::new(ClientState::default()))
-            .unwrap();
-        let (created_tx, created_rx) = mpsc::sync_channel(0);
-        let (disconnect_tx, disconnect_rx) = mpsc::sync_channel(0);
-
-        let client = thread::spawn(move || {
-            let connection = Connection::from_socket(client_socket).unwrap();
-            let (globals, event_queue) = registry_queue_init::<TestClient>(&connection).unwrap();
-            let queue = event_queue.handle();
-            let compositor = globals
-                .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
-                .unwrap();
-            let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
-            let surface = compositor.create_surface(&queue, ());
-            let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
-            let _toplevel = xdg_surface.get_toplevel(&queue, ());
-            surface.commit();
-            connection.flush().unwrap();
-            created_tx.send(()).unwrap();
-            disconnect_rx.recv().unwrap();
-            // Dropping the connection simulates a crashed client.
-        });
-
-        dispatch_until(&mut display, &mut state, |_| created_rx.try_recv().is_ok());
-        dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
-        disconnect_tx.send(()).unwrap();
-        client.join().unwrap();
-        dispatch_until(&mut display, &mut state, |state| {
-            state.remove_dead_windows();
-            state.windows.is_empty()
-        });
-    }
-
-    #[test]
-    fn compositor_time_can_be_advanced_without_sleeping() {
-        let display = Display::<Astera>::new().unwrap();
-        let start = Instant::now();
-        let clock = Arc::new(ManualClock::new(start));
-        let state = Astera::new_with_clock(&display.handle(), Config::default(), clock.clone());
-        assert_eq!(state.clock.now(), start);
-        clock.advance(Duration::from_millis(300));
-        assert_eq!(state.clock.now(), start + Duration::from_millis(300));
-    }
-
-    #[test]
-    fn hotplug_moves_disconnected_workspaces_to_primary() {
-        let display = Display::<Astera>::new().unwrap();
-        let mut state = Astera::new(&display.handle(), Config::default());
-        let mut second = Output::new(OutputId(1), "test-output-2", Size::new(2560, 1440));
-        second.physical_size = Size::new(3840, 2160);
-        second.native_scale = Scale120(180);
-        second.transform = OutputTransform::Rotate90;
-
-        state.connect_output(second).unwrap();
-        let runtime = &state.output_runtime[&OutputId(1)].wayland;
-        assert_eq!(runtime.current_mode().unwrap().size, (3840, 2160).into());
-        assert_eq!(runtime.current_scale().fractional_scale(), 1.5);
-        assert_eq!(runtime.current_transform(), smithay::utils::Transform::_90);
-        assert_eq!(
-            state.output_runtime[&OutputId(1)].location,
-            Point::new(1280, 0)
-        );
-        let disconnected_workspace = state.desktop.active_workspace_id(OutputId(0)).unwrap();
-        state
-            .desktop
-            .apply(WorkspaceTransaction::SetName {
-                workspace: disconnected_workspace,
-                name: Some("main".into()),
-            })
-            .unwrap();
-        state.disconnect_output(OutputId(0)).unwrap();
-
-        assert_eq!(state.active_output, OutputId(1));
-        assert!(!state.output_runtime.contains_key(&OutputId(0)));
-        assert_eq!(
-            state
-                .desktop
-                .workspace_location(disconnected_workspace)
-                .unwrap()
-                .output,
-            Some(OutputId(1))
-        );
-    }
-
-    #[test]
-    fn output_reconfigure_preserves_camera_and_updates_protocol_state() {
-        let display = Display::<Astera>::new().unwrap();
-        let mut state = Astera::new(&display.handle(), Config::default());
-        let workspace = state.desktop.active_workspace_id(OutputId(0)).unwrap();
-        state
-            .desktop
-            .workspace_mut(workspace)
-            .unwrap()
-            .camera
-            .center = Point::new(740, -320);
-
-        state
-            .configure_output(
-                OutputId(0),
-                Size::new(3000, 2000),
-                Size::new(2000, 1333),
-                Scale120(180),
-                OutputTransform::Rotate180,
-            )
-            .unwrap();
-
-        let output = &state.desktop.outputs[&OutputId(0)];
-        assert_eq!(output.output.physical_size, Size::new(3000, 2000));
-        assert_eq!(output.output.logical_size, Size::new(2000, 1333));
-        assert_eq!(
-            state.desktop.workspace(workspace).unwrap().camera.center,
-            Point::new(740, -320)
-        );
-        let runtime = &state.output_runtime[&OutputId(0)].wayland;
-        assert_eq!(runtime.current_mode().unwrap().size, (3000, 2000).into());
-        assert_eq!(runtime.current_scale().fractional_scale(), 1.5);
-        assert_eq!(runtime.current_transform(), smithay::utils::Transform::_180);
-    }
-
-    #[test]
-    fn pointer_crosses_outputs_but_compositor_drag_stays_local() {
-        let display = Display::<Astera>::new().unwrap();
-        let mut state = Astera::new(&display.handle(), Config::default());
-        state
-            .connect_output(Output::new(
-                OutputId(1),
-                "test-output-2",
-                Size::new(1920, 1080),
-            ))
-            .unwrap();
-        state.pointer_location = (1270.0, 200.0).into();
-
-        let location = state.relative_pointer_location(20.0, 0.0);
-        assert_eq!(state.active_output, OutputId(1));
-        assert_eq!(location, (10.0, 200.0).into());
-
-        state.active_output = OutputId(0);
-        state.pointer_location = (1270.0, 200.0).into();
-        state.drag = Some(DragState {
-            window: WindowId(999),
-            mode: WindowMode::Floating,
-            grab_offset: (0.0, 0.0),
-            target: Point::ORIGIN,
-            start: Point::ORIGIN,
-        });
-        let location = state.relative_pointer_location(20.0, 0.0);
-        assert_eq!(state.active_output, OutputId(0));
-        assert_eq!(location, (1279.0, 200.0).into());
-    }
-
-    #[test]
-    fn fractional_output_converts_logical_origins_to_physical_pixels() {
-        let physical = physical_point(Point::new(101, -25), 1.5);
-        assert_eq!(physical, (152, -38).into());
-    }
-}
+mod tests;

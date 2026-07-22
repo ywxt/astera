@@ -1,12 +1,48 @@
+use std::collections::HashSet;
+
 use astera_core::{OutputId, Point, WindowId, WindowMode};
 use smithay::{
+    desktop::PopupManager,
+    input::{Seat, SeatState, keyboard::KeyboardHandle, pointer::PointerHandle},
     output::Output as SmithayOutput,
-    reexports::wayland_server::{backend::GlobalId, protocol::wl_surface::WlSurface},
-    wayland::shell::{
-        wlr_layer::{Layer, LayerSurface},
-        xdg::ToplevelSurface,
+    reexports::wayland_server::{
+        DisplayHandle, backend::GlobalId, protocol::wl_surface::WlSurface,
+    },
+    wayland::{
+        compositor::CompositorState,
+        fractional_scale::FractionalScaleManagerState,
+        output::OutputManagerState,
+        selection::data_device::DataDeviceState,
+        shell::{
+            wlr_layer::{Layer, LayerSurface, WlrLayerShellState},
+            xdg::{ToplevelSurface, XdgShellState},
+        },
+        shm::ShmState,
+        viewporter::ViewporterState,
     },
 };
+
+use super::Astera;
+
+/// Wayland protocol objects are grouped separately from desktop and interaction state. Keeping
+/// this ownership boundary explicit makes protocol delegate additions independent of `Astera`'s
+/// compositor policy fields.
+pub struct ProtocolState {
+    pub(super) display: DisplayHandle,
+    pub(super) compositor_state: CompositorState,
+    pub(super) xdg_shell_state: XdgShellState,
+    pub(super) layer_shell_state: WlrLayerShellState,
+    pub(super) _fractional_scale_state: FractionalScaleManagerState,
+    pub(super) _viewporter_state: ViewporterState,
+    pub(super) _output_manager_state: OutputManagerState,
+    pub(super) shm_state: ShmState,
+    pub(super) seat_state: SeatState<Astera>,
+    pub(super) data_device_state: DataDeviceState,
+    pub(super) popup_manager: PopupManager,
+    pub(super) seat: Seat<Astera>,
+    pub(super) keyboard: KeyboardHandle<Astera>,
+    pub(super) pointer: PointerHandle<Astera>,
+}
 
 #[derive(Clone)]
 pub(super) struct MappedWindow {
@@ -40,7 +76,7 @@ pub(super) struct OutputRuntime {
     pub(super) wayland: SmithayOutput,
     pub(super) global: GlobalId,
     /// Surfaces that received wl_surface.enter for this output during the last refresh.
-    pub(super) entered_surfaces: Vec<WlSurface>,
+    pub(super) entered_surfaces: HashSet<WlSurface>,
     /// Logical position in the compositor's output topology.
     pub(super) location: Point,
 }
