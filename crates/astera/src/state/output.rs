@@ -1,6 +1,25 @@
 use super::*;
 
 impl Astera {
+    pub fn enable_dmabuf(&mut self, formats: impl IntoIterator<Item = Format>) {
+        if self.dmabuf_enabled {
+            return;
+        }
+        let display = self.display.clone();
+        self.dmabuf_state.create_global::<Self>(&display, formats);
+        self.dmabuf_enabled = true;
+    }
+
+    pub fn validate_dmabuf_imports<R: ImportDma>(&mut self, renderer: &mut R) {
+        for (dmabuf, notifier) in self.pending_dmabufs.drain(..) {
+            if renderer.import_dmabuf(&dmabuf, None).is_ok() {
+                let _ = notifier.successful::<Self>();
+            } else {
+                notifier.failed();
+            }
+        }
+    }
+
     fn mapped_windows_for_output(
         &self,
         output: OutputId,

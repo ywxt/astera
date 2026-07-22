@@ -4,6 +4,22 @@ impl BufferHandler for Astera {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
 }
 
+impl DmabufHandler for Astera {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        // Renderer ownership lives in the backend, so validation is deferred until its next tick.
+        self.pending_dmabufs.push((dmabuf, notifier));
+    }
+}
+
 impl OutputHandler for Astera {}
 
 impl FractionalScaleHandler for Astera {
@@ -383,3 +399,5 @@ impl ClientDndGrabHandler for Astera {}
 impl ServerDndGrabHandler for Astera {
     fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<Self>) {}
 }
+
+delegate_dmabuf!(Astera);

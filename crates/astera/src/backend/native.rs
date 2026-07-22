@@ -132,6 +132,7 @@ impl NativeLoop {
         );
         let exporter = GbmFramebufferExporter::new(gbm.clone(), Some(node));
         let render_formats = self.gpus.single_renderer(&node)?.dmabuf_formats();
+        self.state.enable_dmabuf(render_formats.clone());
         let output_manager = DrmOutputManager::new(
             drm,
             allocator,
@@ -359,6 +360,7 @@ impl NativeLoop {
                 return;
             }
         };
+        self.state.validate_dmabuf_imports(&mut renderer);
         let elements: Vec<WaylandSurfaceRenderElement<NativeRenderer<'_>>> = roots
             .iter()
             .flat_map(|(surface, location, scale)| {

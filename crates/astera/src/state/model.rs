@@ -10,6 +10,7 @@ use smithay::{
     },
     wayland::{
         compositor::CompositorState,
+        dmabuf::DmabufState,
         fractional_scale::FractionalScaleManagerState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
@@ -38,6 +39,7 @@ pub struct ProtocolState {
     pub(super) shm_state: ShmState,
     pub(super) seat_state: SeatState<Astera>,
     pub(super) data_device_state: DataDeviceState,
+    pub(super) dmabuf_state: DmabufState,
     pub(super) popup_manager: PopupManager,
     pub(super) seat: Seat<Astera>,
     pub(super) keyboard: KeyboardHandle<Astera>,

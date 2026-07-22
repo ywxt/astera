@@ -7,7 +7,7 @@ use astera_ipc::Command;
 use smithay::{
     backend::{
         renderer::{
-            Color32F,
+            Color32F, ImportDma,
             damage::OutputDamageTracker,
             element::{
                 Kind,
@@ -40,6 +40,10 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         .into_owned();
     let (mut backend, mut event_loop) =
         winit::init::<GlesRenderer>().map_err(|error| anyhow!(error.to_string()))?;
+    {
+        let (renderer, _) = backend.bind()?;
+        state.enable_dmabuf(renderer.dmabuf_formats());
+    }
     let ipc = IpcServer::bind(&socket_name)?;
     let started = Instant::now();
     let mut tracked_size = backend.window_size();
@@ -82,6 +86,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         let buffer_age = backend.buffer_age().unwrap_or(0);
         let submitted_damage = {
             let (renderer, mut framebuffer) = backend.bind()?;
+            state.validate_dmabuf_imports(renderer);
             // Scene construction includes layout transforms, popup discovery and sorting; retain
             // it for frame callbacks instead of rebuilding the same scene twice per frame.
             let roots = state.render_roots();

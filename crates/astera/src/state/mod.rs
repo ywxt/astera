@@ -39,15 +39,20 @@ use astera_ipc::{
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::{
     backend::{
+        allocator::{Format, dmabuf::Dmabuf},
         input::{
             AbsolutePositionEvent, Axis, ButtonState as BackendButtonState, Event, InputBackend,
             InputEvent, KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent,
             PointerButtonEvent, PointerMotionEvent,
         },
-        renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
+        renderer::{
+            ImportDma,
+            utils::{on_commit_buffer_handler, with_renderer_surface_state},
+        },
     },
-    delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_layer_shell,
-    delegate_output, delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
+    delegate_layer_shell, delegate_output, delegate_seat, delegate_shm, delegate_viewporter,
+    delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -70,6 +75,7 @@ use smithay::{
             CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
             TraversalAction, with_states, with_surface_tree_downward,
         },
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         fractional_scale::{
             FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
         },
@@ -110,6 +116,8 @@ pub struct Astera {
     config_watcher: Option<ConfigWatcher>,
     should_quit: bool,
     output_configuration_supported: bool,
+    pending_dmabufs: Vec<(Dmabuf, ImportNotifier)>,
+    dmabuf_enabled: bool,
     serial: u32,
 }
 
@@ -200,6 +208,7 @@ impl Astera {
                 shm_state,
                 seat_state,
                 data_device_state,
+                dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
                 keyboard,
@@ -227,6 +236,8 @@ impl Astera {
             config_watcher: None,
             should_quit: false,
             output_configuration_supported: true,
+            pending_dmabufs: Vec::new(),
+            dmabuf_enabled: false,
             serial: 1,
         }
     }
