@@ -25,3 +25,4 @@ smithay-drm-extras = { version = "0.1", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 winit = { version = "0.30", default-features = false, features = ["wayland", "x11", "rwh_06"] }
+xkbcommon = "0.8"

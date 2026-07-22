@@ -10,4 +10,4 @@ astera-core.workspace = true
 ron.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-
+xkbcommon.workspace = true
