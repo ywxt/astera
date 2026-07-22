@@ -12,6 +12,7 @@ use smithay::{
 pub(super) struct MappedWindow {
     pub(super) id: WindowId,
     pub(super) surface: ToplevelSurface,
+    pub(super) mapped: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -31,6 +32,7 @@ pub(super) struct MappedLayer {
     pub(super) surface: LayerSurface,
     pub(super) layer: Layer,
     pub(super) output: OutputId,
+    pub(super) mapped: bool,
 }
 
 #[derive(Debug)]

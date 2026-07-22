@@ -397,13 +397,13 @@ impl NativeLoop {
         else {
             return;
         };
-        match surface.drm.render_frame(
+        let submitted = match surface.drm.render_frame(
             &mut renderer,
             &elements,
             Color32F::new(0.025, 0.035, 0.06, 1.0),
             FrameFlags::empty(),
         ) {
-            Ok(frame) if frame.is_empty => {}
+            Ok(frame) if frame.is_empty => true,
             Ok(frame) => {
                 if frame.needs_sync()
                     && let PrimaryPlaneElement::Swapchain(primary) = frame.primary_element
@@ -412,18 +412,25 @@ impl NativeLoop {
                 }
                 if let Err(error) = surface.drm.queue_frame(()) {
                     tracing::warn!(?node, ?crtc, ?error, "could not queue DRM frame");
-                    return;
-                }
-                surface.pending = true;
-                let frame_time = self.started.elapsed().as_millis() as u32;
-                for (root, _, _) in roots {
-                    send_frames_surface_tree(&root, frame_time);
-                    for (popup, _) in PopupManager::popups_for_surface(&root) {
-                        send_frames_surface_tree(popup.wl_surface(), frame_time);
-                    }
+                    false
+                } else {
+                    surface.pending = true;
+                    true
                 }
             }
-            Err(error) => tracing::warn!(?node, ?crtc, ?error, "could not render DRM frame"),
+            Err(error) => {
+                tracing::warn!(?node, ?crtc, ?error, "could not render DRM frame");
+                false
+            }
+        };
+        if submitted {
+            let frame_time = self.started.elapsed().as_millis() as u32;
+            for (root, _, _) in roots {
+                send_frames_surface_tree(&root, frame_time);
+                for (popup, _) in PopupManager::popups_for_surface(&root) {
+                    send_frames_surface_tree(popup.wl_surface(), frame_time);
+                }
+            }
         }
     }
 }
@@ -433,6 +440,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dy
     let handle = event_loop.handle();
     let display = Display::<Astera>::new()?;
     let mut state = Astera::new(&display.handle(), config);
+    state.set_output_configuration_supported(false);
     state.watch_config(config_path);
     state.disconnect_output(astera_core::OutputId(0))?;
     let listener = ListeningSocket::bind_auto("astera", 1..32)?;

@@ -32,21 +32,22 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::{
     backend::{
         input::{
-            AbsolutePositionEvent, ButtonState as BackendButtonState, Event, InputBackend,
-            InputEvent, KeyState, KeyboardKeyEvent, MouseButton, PointerButtonEvent,
-            PointerMotionEvent,
+            AbsolutePositionEvent, Axis, ButtonState as BackendButtonState, Event, InputBackend,
+            InputEvent, KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent,
+            PointerButtonEvent, PointerMotionEvent,
         },
-        renderer::utils::on_commit_buffer_handler,
+        renderer::utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
     delegate_compositor, delegate_data_device, delegate_fractional_scale, delegate_layer_shell,
     delegate_output, delegate_seat, delegate_shm, delegate_viewporter, delegate_xdg_shell,
     desktop::{
-        PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, find_popup_root_surface,
+        PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
+        find_popup_root_surface, utils::under_from_surface_tree,
     },
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::{FilterResult, ModifiersState},
-        pointer::{ButtonEvent, Focus as PointerFocusMode, MotionEvent, PointerHandle},
+        pointer::{AxisFrame, ButtonEvent, Focus as PointerFocusMode, MotionEvent, PointerHandle},
     },
     output::{Mode, Output as SmithayOutput, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::{
@@ -113,6 +114,7 @@ pub struct Astera {
     config: Config,
     config_watcher: Option<ConfigWatcher>,
     should_quit: bool,
+    output_configuration_supported: bool,
     serial: u32,
 }
 
@@ -213,6 +215,7 @@ impl Astera {
             config,
             config_watcher: None,
             should_quit: false,
+            output_configuration_supported: true,
             serial: 1,
         }
     }
@@ -256,8 +259,14 @@ impl Astera {
         );
         if self.desktop.outputs.len() == 1 {
             self.active_output = output.id;
+            for layer in &mut self.layers {
+                if !self.desktop.outputs.contains_key(&layer.output) {
+                    layer.output = output.id;
+                }
+            }
         }
         self.reflow_outputs();
+        self.map_buffered_toplevels();
         self.refresh_visible_scales();
         let workspace = self.desktop.active_workspace_id(output.id);
         tracing::info!(
@@ -388,6 +397,26 @@ impl Astera {
                 event.state(),
                 event.time_msec(),
             ),
+            InputEvent::PointerAxis { event } => {
+                let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
+                for axis in [Axis::Horizontal, Axis::Vertical] {
+                    frame = frame.relative_direction(axis, event.relative_direction(axis));
+                    if let Some(value) = event.amount(axis) {
+                        frame = frame.value(axis, value);
+                        if value == 0.0 {
+                            frame = frame.stop(axis);
+                        }
+                    }
+                    if let Some(v120) = event.amount_v120(axis) {
+                        frame = frame
+                            .v120(axis, v120.round() as i32)
+                            .value(axis, v120 / 120.0 * 15.0);
+                    }
+                }
+                let pointer = self.pointer.clone();
+                pointer.axis(self, frame);
+                pointer.frame(self);
+            }
             _ => {}
         }
     }
@@ -476,12 +505,27 @@ impl Astera {
                 continue;
             };
             if point_inside(location, origin, size, scale) {
-                candidates.push((
-                    (mode_layer(mode), index, 0usize),
-                    mapped.surface.wl_surface().clone(),
-                    (origin.x as f64, origin.y as f64).into(),
-                    Some(mapped.id),
+                let local = SmithayPoint::from((
+                    (location.x - origin.x as f64) / scale,
+                    (location.y - origin.y as f64) / scale,
                 ));
+                if let Some((surface, offset)) = under_from_surface_tree(
+                    mapped.surface.wl_surface(),
+                    local,
+                    (0, 0),
+                    WindowSurfaceType::ALL,
+                ) {
+                    candidates.push((
+                        (mode_layer(mode), index, 0usize),
+                        surface,
+                        (
+                            origin.x as f64 + f64::from(offset.x) * scale,
+                            origin.y as f64 + f64::from(offset.y) * scale,
+                        )
+                            .into(),
+                        Some(mapped.id),
+                    ));
+                }
             }
             for (popup_index, (popup, popup_offset)) in
                 PopupManager::popups_for_surface(mapped.surface.wl_surface()).enumerate()
@@ -493,17 +537,32 @@ impl Astera {
                 );
                 let popup_size = Size::new(i64::from(geometry.size.w), i64::from(geometry.size.h));
                 if point_inside(location, popup_origin, popup_size, scale) {
-                    candidates.push((
-                        (mode_layer(mode), index, popup_index + 1),
-                        popup.wl_surface().clone(),
-                        (popup_origin.x as f64, popup_origin.y as f64).into(),
-                        Some(mapped.id),
+                    let local = SmithayPoint::from((
+                        (location.x - popup_origin.x as f64) / scale,
+                        (location.y - popup_origin.y as f64) / scale,
                     ));
+                    if let Some((surface, offset)) = under_from_surface_tree(
+                        popup.wl_surface(),
+                        local,
+                        (0, 0),
+                        WindowSurfaceType::ALL,
+                    ) {
+                        candidates.push((
+                            (mode_layer(mode), index, popup_index + 1),
+                            surface,
+                            (
+                                popup_origin.x as f64 + f64::from(offset.x) * scale,
+                                popup_origin.y as f64 + f64::from(offset.y) * scale,
+                            )
+                                .into(),
+                            Some(mapped.id),
+                        ));
+                    }
                 }
             }
         }
         for (index, mapped) in self.layers.iter().enumerate() {
-            if mapped.output != self.active_output {
+            if !mapped.mapped || mapped.output != self.active_output {
                 continue;
             }
             let Some((origin, size)) = self.layer_geometry(mapped) else {
@@ -511,12 +570,27 @@ impl Astera {
             };
             let order = layer_rank(mapped.layer);
             if point_inside(location, origin, size, 1.0) {
-                candidates.push((
-                    (order, index, 0),
-                    mapped.surface.wl_surface().clone(),
-                    (origin.x as f64, origin.y as f64).into(),
-                    None,
+                let local = SmithayPoint::from((
+                    location.x - origin.x as f64,
+                    location.y - origin.y as f64,
                 ));
+                if let Some((surface, offset)) = under_from_surface_tree(
+                    mapped.surface.wl_surface(),
+                    local,
+                    (0, 0),
+                    WindowSurfaceType::ALL,
+                ) {
+                    candidates.push((
+                        (order, index, 0),
+                        surface,
+                        (
+                            origin.x as f64 + f64::from(offset.x),
+                            origin.y as f64 + f64::from(offset.y),
+                        )
+                            .into(),
+                        None,
+                    ));
+                }
             }
             for (popup_index, (popup, popup_offset)) in
                 PopupManager::popups_for_surface(mapped.surface.wl_surface()).enumerate()
@@ -528,12 +602,27 @@ impl Astera {
                 );
                 let popup_size = Size::new(i64::from(geometry.size.w), i64::from(geometry.size.h));
                 if point_inside(location, popup_origin, popup_size, 1.0) {
-                    candidates.push((
-                        (order, index, popup_index + 1),
-                        popup.wl_surface().clone(),
-                        (popup_origin.x as f64, popup_origin.y as f64).into(),
-                        None,
+                    let local = SmithayPoint::from((
+                        location.x - popup_origin.x as f64,
+                        location.y - popup_origin.y as f64,
                     ));
+                    if let Some((surface, offset)) = under_from_surface_tree(
+                        popup.wl_surface(),
+                        local,
+                        (0, 0),
+                        WindowSurfaceType::ALL,
+                    ) {
+                        candidates.push((
+                            (order, index, popup_index + 1),
+                            surface,
+                            (
+                                popup_origin.x as f64 + f64::from(offset.x),
+                                popup_origin.y as f64 + f64::from(offset.y),
+                            )
+                                .into(),
+                            None,
+                        ));
+                    }
                 }
             }
         }
@@ -676,7 +765,7 @@ impl Astera {
 
     fn layer_accepts_keyboard(&self, surface: &WlSurface) -> bool {
         self.layers.iter().any(|mapped| {
-            if mapped.surface.wl_surface() != surface {
+            if !mapped.mapped || mapped.surface.wl_surface() != surface {
                 return false;
             }
             let state = with_states(surface, |states| {
@@ -969,6 +1058,10 @@ impl Astera {
         self.should_quit
     }
 
+    pub fn set_output_configuration_supported(&mut self, supported: bool) {
+        self.output_configuration_supported = supported;
+    }
+
     pub fn watch_config(&mut self, path: std::path::PathBuf) {
         tracing::info!(path = %path.display(), "configuration watcher enabled");
         self.config_watcher = Some(ConfigWatcher::new(path));
@@ -1100,7 +1193,9 @@ impl Astera {
         let scale = self.output_scale(output);
         self.layers
             .iter()
-            .filter(move |mapped| mapped.output == output && mapped.layer == wanted)
+            .filter(move |mapped| {
+                mapped.mapped && mapped.output == output && mapped.layer == wanted
+            })
             .filter_map(move |mapped| {
                 let (origin, _) = self.layer_geometry(mapped)?;
                 Some((
@@ -1238,10 +1333,6 @@ impl Astera {
         }
     }
 
-    fn active_scale(&self) -> f64 {
-        self.output_scale(self.active_output)
-    }
-
     fn output_scale(&self, output: OutputId) -> f64 {
         self.desktop.outputs[&output].output.native_scale.0 as f64 / 120.0
     }
@@ -1253,11 +1344,18 @@ impl Astera {
             .copied()
             .map(|output| {
                 let scale = self.output_scale(output);
-                let visible = self
+                let roots = self
                     .render_roots_for_output(output)
                     .into_iter()
                     .map(|(surface, _, _)| surface)
                     .collect::<Vec<_>>();
+                let mut visible = Vec::new();
+                for root in roots {
+                    for (popup, _) in PopupManager::popups_for_surface(&root) {
+                        extend_surface_tree(&mut visible, popup.wl_surface());
+                    }
+                    extend_surface_tree(&mut visible, &root);
+                }
                 (output, (scale, visible))
             })
             .collect();
@@ -1283,6 +1381,75 @@ impl Astera {
             }
             runtime.entered_surfaces = visible;
         }
+    }
+
+    fn map_buffered_toplevels(&mut self) {
+        let pending = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, window)| {
+                (!window.mapped
+                    && with_renderer_surface_state(window.surface.wl_surface(), |state| {
+                        state.buffer().is_some()
+                    })
+                    .unwrap_or(false))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in pending {
+            self.map_toplevel(index);
+        }
+    }
+
+    fn map_toplevel(&mut self, index: usize) {
+        let Some(workspace_id) = self.desktop.active_workspace_id(self.active_output) else {
+            return;
+        };
+        let id = self.windows[index].id;
+        let workspace = self.desktop.workspace(workspace_id).unwrap();
+        let anchor = workspace
+            .focused_window
+            .and_then(|focused| workspace.tiled.get(&focused))
+            .map(|window| window.geometry.center())
+            .unwrap_or(Point::ORIGIN);
+        let transaction = WindowTransaction::InsertTiled {
+            id,
+            size: DEFAULT_WINDOW_SIZE,
+            anchor,
+            seed_direction: workspace.layout_direction_hint,
+        };
+        if let Err(error) = self.desktop.apply_window(workspace_id, transaction) {
+            tracing::error!(?id, %error, "could not map toplevel");
+            return;
+        }
+        self.windows[index].mapped = true;
+        self.windows[index].surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Activated);
+        });
+        self.windows[index].surface.send_pending_configure();
+        tracing::info!(window = ?id, workspace = ?workspace_id, output = ?self.active_output, "toplevel mapped");
+        self.refresh_visible_scales();
+        self.sync_keyboard_focus();
+    }
+
+    fn unmap_toplevel(&mut self, index: usize) {
+        let id = self.windows[index].id;
+        if let Ok(workspace) = self.desktop.find_window(id)
+            && let Err(error) = self
+                .desktop
+                .apply_window(workspace, WindowTransaction::Remove { id })
+        {
+            tracing::warn!(?id, %error, "could not unmap toplevel");
+            return;
+        }
+        self.windows[index].mapped = false;
+        if self.drag.is_some_and(|drag| drag.window == id) {
+            self.drag = None;
+        }
+        tracing::info!(window = ?id, "toplevel unmapped");
+        self.refresh_visible_scales();
+        self.sync_keyboard_focus();
     }
 
     pub fn remove_dead_windows(&mut self) {
@@ -1329,8 +1496,12 @@ impl Astera {
                 self.refresh_visible_scales();
                 self.sync_keyboard_focus();
                 Response::Ok(
-                    DesktopSnapshot::from(&self.desktop)
-                        .with_active_output(Some(self.active_output)),
+                    DesktopSnapshot::from(&self.desktop).with_active_output(
+                        self.desktop
+                            .outputs
+                            .contains_key(&self.active_output)
+                            .then_some(self.active_output),
+                    ),
                 )
             }
             Err((code, message)) => {
@@ -1417,18 +1588,24 @@ impl Astera {
     }
 
     fn sync_keyboard_focus(&mut self) {
-        let layer_target = self.layers.iter().rev().find_map(|mapped| {
-            let state = with_states(mapped.surface.wl_surface(), |states| {
-                *states
-                    .cached_state
-                    .get::<LayerSurfaceCachedState>()
-                    .current()
-            });
-            (mapped.output == self.active_output
-                && mapped.surface.alive()
-                && state.keyboard_interactivity == KeyboardInteractivity::Exclusive)
-                .then(|| mapped.surface.wl_surface().clone())
-        });
+        let layer_target = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, mapped)| {
+                let state = with_states(mapped.surface.wl_surface(), |states| {
+                    *states
+                        .cached_state
+                        .get::<LayerSurfaceCachedState>()
+                        .current()
+                });
+                mapped.mapped
+                    && mapped.output == self.active_output
+                    && mapped.surface.alive()
+                    && state.keyboard_interactivity == KeyboardInteractivity::Exclusive
+            })
+            .max_by_key(|(index, mapped)| (layer_rank(mapped.layer), *index))
+            .map(|(_, mapped)| mapped.surface.wl_surface().clone());
         let focused = self
             .desktop
             .workspace_for_output(self.active_output)
@@ -1510,6 +1687,13 @@ impl Astera {
                 native_scale,
                 transform,
             } => {
+                if !self.output_configuration_supported {
+                    return Err((
+                        ErrorCode::Conflict,
+                        "the native backend does not support live KMS output reconfiguration"
+                            .to_owned(),
+                    ));
+                }
                 let output = self.resolve_output(output)?;
                 self.configure_output(output, physical_size, logical_size, native_scale, transform)
                     .map_err(map_desktop_error)
@@ -1648,7 +1832,11 @@ fn map_desktop_error(error: astera_core::DesktopError) -> (ErrorCode, String) {
         | astera_core::DesktopError::UnknownWindow(_) => ErrorCode::NotFound,
         astera_core::DesktopError::DuplicateWindow { .. }
         | astera_core::DesktopError::DuplicateWorkspaceName(_)
+        | astera_core::DesktopError::DuplicateOutputStableKey(_)
+        | astera_core::DesktopError::InvalidWorkspaceState(_)
         | astera_core::DesktopError::Layout(_) => ErrorCode::Conflict,
+        astera_core::DesktopError::InvalidOutputSize
+        | astera_core::DesktopError::InvalidOutputScale => ErrorCode::InvalidCommand,
     };
     (code, error.to_string())
 }
@@ -1661,7 +1849,15 @@ impl OutputHandler for Astera {}
 
 impl FractionalScaleHandler for Astera {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
-        let scale = self.active_scale();
+        let Some(scale) = self.output_runtime.iter().find_map(|(output, runtime)| {
+            runtime
+                .entered_surfaces
+                .contains(&surface)
+                .then(|| self.output_scale(*output))
+        }) else {
+            // Background and not-yet-mapped surfaces intentionally have no preferred output.
+            return;
+        };
         with_states(&surface, |states| {
             with_fractional_scale(states, |fractional| {
                 fractional.set_preferred_scale(scale);
@@ -1685,13 +1881,36 @@ impl CompositorHandler for Astera {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
         self.popup_manager.commit(surface);
+        if let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| window.surface.wl_surface() == surface)
+        {
+            let has_buffer = with_renderer_surface_state(surface, |state| state.buffer().is_some())
+                .unwrap_or(false);
+            match (self.windows[index].mapped, has_buffer) {
+                (false, true) => self.map_toplevel(index),
+                (true, false) => self.unmap_toplevel(index),
+                _ => {}
+            }
+        }
         if let Some(layer) = self
             .layers
             .iter()
             .find(|mapped| mapped.surface.wl_surface() == surface)
             .map(|mapped| mapped.surface.clone())
         {
+            let has_buffer = with_renderer_surface_state(surface, |state| state.buffer().is_some())
+                .unwrap_or(false);
+            if let Some(mapped) = self
+                .layers
+                .iter_mut()
+                .find(|mapped| mapped.surface.wl_surface() == surface)
+            {
+                mapped.mapped = has_buffer;
+            }
             self.configure_layer_surface(&layer);
+            self.refresh_visible_scales();
             self.sync_keyboard_focus();
         }
     }
@@ -1721,10 +1940,10 @@ impl WlrLayerShellHandler for Astera {
             surface: surface.clone(),
             layer,
             output,
+            mapped: false,
         });
-        tracing::info!(?output, ?layer, "layer surface mapped");
+        tracing::debug!(?output, ?layer, "layer surface role created");
         self.configure_layer_surface(&surface);
-        self.refresh_visible_scales();
     }
 
     fn new_popup(&mut self, _parent: LayerSurface, popup: PopupSurface) {
@@ -1753,31 +1972,6 @@ impl XdgShellHandler for Astera {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let id = WindowId(self.next_window_id);
         self.next_window_id += 1;
-        let workspace_id = self
-            .desktop
-            .active_workspace_id(self.active_output)
-            .expect("active output has a workspace");
-        let workspace = self.desktop.workspace(workspace_id).unwrap();
-        let anchor = workspace
-            .focused_window
-            .and_then(|focused| workspace.tiled.get(&focused))
-            .map(|window| window.geometry.center())
-            .unwrap_or(Point::ORIGIN);
-        let seed_direction = workspace.layout_direction_hint;
-        let result = self.desktop.apply_window(
-            workspace_id,
-            WindowTransaction::InsertTiled {
-                id,
-                size: DEFAULT_WINDOW_SIZE,
-                anchor,
-                seed_direction,
-            },
-        );
-        if let Err(error) = result {
-            tracing::error!(?id, %error, "could not place toplevel");
-            return;
-        }
-
         surface.with_pending_state(|state| {
             state.size = Some(
                 (
@@ -1786,18 +1980,14 @@ impl XdgShellHandler for Astera {
                 )
                     .into(),
             );
-            state.states.set(xdg_toplevel::State::Activated);
         });
         surface.send_configure();
-        self.windows.push(MappedWindow { id, surface });
-        tracing::info!(
-            window = ?id,
-            workspace = ?workspace_id,
-            output = ?self.active_output,
-            "toplevel mapped"
-        );
-        self.refresh_visible_scales();
-        self.sync_keyboard_focus();
+        self.windows.push(MappedWindow {
+            id,
+            surface,
+            mapped: false,
+        });
+        tracing::debug!(window = ?id, "toplevel role created");
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -1811,6 +2001,101 @@ impl XdgShellHandler for Astera {
         }
         if let Err(error) = surface.send_configure() {
             tracing::warn!(%error, "could not configure xdg popup");
+        }
+    }
+
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
+        let Some(window) = self
+            .windows
+            .iter()
+            .find(|window| window.mapped && window.surface == surface)
+            .map(|window| window.id)
+        else {
+            return;
+        };
+        let Ok(workspace) = self.desktop.find_window(window) else {
+            return;
+        };
+        if let Some(requested) = output
+            && !self.output_runtime.iter().any(|(output, runtime)| {
+                runtime.wayland.owns(&requested)
+                    && self.desktop.active_workspace_id(*output) == Some(workspace)
+            })
+        {
+            tracing::warn!(
+                ?window,
+                "fullscreen request targeted another workspace output"
+            );
+            return;
+        }
+        let Some(viewport_size) = self
+            .desktop
+            .workspace_location(workspace)
+            .ok()
+            .and_then(|location| location.output)
+            .and_then(|output| self.desktop.output(output))
+            .map(|output| output.logical_size)
+        else {
+            return;
+        };
+        if self
+            .desktop
+            .apply_window(
+                workspace,
+                WindowTransaction::SetMode {
+                    id: window,
+                    mode: WindowMode::Fullscreen,
+                    viewport_size,
+                },
+            )
+            .is_ok()
+        {
+            self.configure_window_mode(window, WindowMode::Fullscreen);
+            self.refresh_visible_scales();
+            self.sync_keyboard_focus();
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let Some(window) = self
+            .windows
+            .iter()
+            .find(|window| window.mapped && window.surface == surface)
+            .map(|window| window.id)
+        else {
+            return;
+        };
+        let Ok(mode) = self.toggle_fullscreen_mode(window) else {
+            return;
+        };
+        let Ok(workspace) = self.desktop.find_window(window) else {
+            return;
+        };
+        let Some(viewport_size) = self
+            .desktop
+            .workspace_location(workspace)
+            .ok()
+            .and_then(|location| location.output)
+            .and_then(|output| self.desktop.output(output))
+            .map(|output| output.logical_size)
+        else {
+            return;
+        };
+        if self
+            .desktop
+            .apply_window(
+                workspace,
+                WindowTransaction::SetMode {
+                    id: window,
+                    mode,
+                    viewport_size,
+                },
+            )
+            .is_ok()
+        {
+            self.configure_window_mode(window, mode);
+            self.refresh_visible_scales();
+            self.sync_keyboard_focus();
         }
     }
 
@@ -1835,6 +2120,30 @@ impl XdgShellHandler for Astera {
             serial,
             PointerFocusMode::Keep,
         );
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| window.surface == surface)
+        else {
+            return;
+        };
+        let window = self.windows.remove(index);
+        if window.mapped
+            && let Ok(workspace) = self.desktop.find_window(window.id)
+        {
+            let _ = self
+                .desktop
+                .apply_window(workspace, WindowTransaction::Remove { id: window.id });
+        }
+        if self.drag.is_some_and(|drag| drag.window == window.id) {
+            self.drag = None;
+        }
+        tracing::info!(window = ?window.id, "toplevel role destroyed");
+        self.refresh_visible_scales();
+        self.sync_keyboard_focus();
     }
 
     fn reposition_request(
@@ -1906,6 +2215,20 @@ pub fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
                 .drain(..)
             {
                 callback.done(time);
+            }
+        },
+        |_, _, &()| true,
+    );
+}
+
+fn extend_surface_tree(surfaces: &mut Vec<WlSurface>, root: &WlSurface) {
+    with_surface_tree_downward(
+        root,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |surface, _, &()| {
+            if !surfaces.contains(surface) {
+                surfaces.push(surface.clone());
             }
         },
         |_, _, &()| true,
@@ -2030,7 +2353,7 @@ mod tests {
     }
 
     #[test]
-    fn xdg_toplevel_lifecycle_updates_compositor_state() {
+    fn uncommitted_toplevel_does_not_map_and_role_destroy_cleans_up() {
         let mut display = Display::<Astera>::new().unwrap();
         let mut state = Astera::new(&display.handle(), Config::default());
         let (server_socket, client_socket) = UnixStream::pair().unwrap();
@@ -2040,6 +2363,8 @@ mod tests {
             .unwrap();
         let (mapped_tx, mapped_rx) = mpsc::sync_channel(0);
         let (destroy_tx, destroy_rx) = mpsc::sync_channel(0);
+        let (role_destroyed_tx, role_destroyed_rx) = mpsc::sync_channel(0);
+        let (surface_destroy_tx, surface_destroy_rx) = mpsc::sync_channel(0);
 
         let client = thread::spawn(move || {
             let connection = Connection::from_socket(client_socket).unwrap();
@@ -2059,6 +2384,9 @@ mod tests {
             destroy_rx.recv().unwrap();
             toplevel.destroy();
             xdg_surface.destroy();
+            connection.flush().unwrap();
+            role_destroyed_tx.send(()).unwrap();
+            surface_destroy_rx.recv().unwrap();
             surface.destroy();
             connection.flush().unwrap();
             // Consume any final configure/ping without waiting for another roundtrip.
@@ -2067,12 +2395,19 @@ mod tests {
 
         dispatch_until(&mut display, &mut state, |_| mapped_rx.try_recv().is_ok());
         dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+        let role_window = state.windows[0].id;
+        assert!(!state.windows[0].mapped);
+        assert_eq!(
+            state.desktop.find_window(role_window),
+            Err(astera_core::DesktopError::UnknownWindow(role_window))
+        );
         destroy_tx.send(()).unwrap();
-        client.join().unwrap();
-        dispatch_until(&mut display, &mut state, |state| {
-            state.remove_dead_windows();
-            state.windows.is_empty()
+        dispatch_until(&mut display, &mut state, |_| {
+            role_destroyed_rx.try_recv().is_ok()
         });
+        dispatch_until(&mut display, &mut state, |state| state.windows.is_empty());
+        surface_destroy_tx.send(()).unwrap();
+        client.join().unwrap();
     }
 
     #[test]
