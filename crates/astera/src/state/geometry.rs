@@ -5,6 +5,7 @@ use smithay::{
 };
 
 pub(super) fn mode_layer(mode: WindowMode) -> u8 {
+    // Values intentionally leave slots for layer-shell surfaces between window classes.
     match mode {
         WindowMode::Tiled => 2,
         WindowMode::Floating => 3,
@@ -48,6 +49,7 @@ pub(super) fn saturating_i32(value: i64) -> i32 {
 }
 
 pub(super) fn physical_point(origin: Point, scale: f64) -> SmithayPoint<i32, Physical> {
+    // Renderer coordinates are bounded to i32 even though the infinite world uses i64.
     (
         (origin.x as f64 * scale)
             .round()

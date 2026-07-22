@@ -18,8 +18,11 @@ pub(super) struct MappedWindow {
 pub(super) struct DragState {
     pub(super) window: WindowId,
     pub(super) mode: WindowMode,
+    /// Pointer-to-window offset captured at grab time to prevent the window from jumping.
     pub(super) grab_offset: (f64, f64),
+    /// Latest candidate position; tiled geometry is committed only when the grab ends.
     pub(super) target: Point,
+    /// Original position used to seed the radial solver with a movement direction.
     pub(super) start: Point,
 }
 
@@ -34,6 +37,8 @@ pub(super) struct MappedLayer {
 pub(super) struct OutputRuntime {
     pub(super) wayland: SmithayOutput,
     pub(super) global: GlobalId,
+    /// Surfaces that received wl_surface.enter for this output during the last refresh.
     pub(super) entered_surfaces: Vec<WlSurface>,
+    /// Logical position in the compositor's output topology.
     pub(super) location: Point,
 }

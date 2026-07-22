@@ -8,9 +8,12 @@ use astera_config::{Config, ConfigError};
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
 pub(super) struct ConfigWatcher {
+    /// Target file, rather than an open descriptor, so atomic rename saves are observed.
     path: PathBuf,
+    /// Last modification stamp used for cheap polling from either backend event loop.
     stamp: Option<SystemTime>,
     exists: bool,
+    /// Deferred reload deadline that coalesces multi-step editor saves.
     reload_at: Option<Instant>,
 }
 
@@ -38,6 +41,7 @@ impl ConfigWatcher {
             .as_ref()
             .and_then(|metadata| metadata.modified().ok());
         if exists != self.exists || stamp != self.stamp {
+            // Resetting the deadline debounces a rapid remove/create/rename sequence.
             self.exists = exists;
             self.stamp = stamp;
             self.reload_at = Some(now + RELOAD_DEBOUNCE);
@@ -46,6 +50,8 @@ impl ConfigWatcher {
             return None;
         }
         self.reload_at = None;
+        // A deleted implicit config returns to defaults; parse errors are returned to the caller,
+        // which keeps the last valid runtime configuration active.
         Some(if self.exists {
             Config::load(&self.path)
         } else {

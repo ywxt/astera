@@ -769,6 +769,8 @@ impl Astera {
             modifiers.shift,
             modifiers.logo,
         );
+        // Prefer an explicitly configured physical key over the layout-dependent keysym.
+        // XKB keycodes are evdev codes plus eight, so remove the offset for config lookup.
         let binding = keycode
             .raw()
             .checked_sub(8)
@@ -788,6 +790,7 @@ impl Astera {
             tracing::warn!(%message, "key binding action failed");
         }
         if binding.repeat {
+            // Registration happens only after the initial action, matching normal key repeat.
             self.key_repeat.register(
                 keycode,
                 modifiers,
@@ -799,6 +802,7 @@ impl Astera {
     }
 
     pub fn process_key_repeats(&mut self) {
+        // Read modifiers again on every tick; releasing a modifier cancels the held action.
         let state = self.keyboard.modifier_state();
         let current = BindingModifiers::from_state(state.ctrl, state.alt, state.shift, state.logo);
         let Some(action) =
@@ -813,11 +817,13 @@ impl Astera {
     }
 
     fn execute_action(&mut self, action: Action) -> Result<(), String> {
+        // Resolve focus once so every focused-window action observes the same state snapshot.
         let focused = self
             .desktop
             .workspace_for_output(self.active_output)
             .and_then(|workspace| workspace.focused_window);
         let command = match action {
+            // Process actions bypass IPC but still return errors through the same binding path.
             Action::Spawn(argv) => return process::spawn(argv),
             Action::SpawnShell(script) => {
                 return process::spawn(vec!["/bin/sh".into(), "-c".into(), script]);
@@ -879,6 +885,7 @@ impl Astera {
                     .iter()
                     .find(|mapped| mapped.id == window)
                     .ok_or_else(|| "focused window is not mapped".to_owned())?;
+                // Request a cooperative close; never terminate the owning client process here.
                 mapped.surface.send_close();
                 None
             }
@@ -888,6 +895,7 @@ impl Astera {
             }
         };
         if let Some(command) = command {
+            // Reuse the command executor so bindings and IPC have identical transaction rules.
             match self.execute_command(command) {
                 Response::Ok(_) => Ok(()),
                 Response::Error { message, .. } => Err(message),
@@ -964,6 +972,7 @@ impl Astera {
         };
         match result {
             Ok(config) => {
+                // apply_config is transactional; a rejected layout keeps the old config alive.
                 if let Err(error) = self.apply_config(config) {
                     tracing::error!(path = %path.display(), %error, "configuration reload rejected");
                 }
@@ -975,6 +984,7 @@ impl Astera {
     }
 
     fn apply_config(&mut self, config: Config) -> Result<(), String> {
+        // Validate layout changes on a clone before publishing any part of the new config.
         let mut desktop = self.desktop.clone();
         desktop
             .reconfigure_layout(config.gap, config.camera)
@@ -983,6 +993,7 @@ impl Astera {
             config.key_repeat.rate as i32,
             config.key_repeat.delay_ms as i32,
         );
+        // Existing repeat actions belong to the old binding map and must not survive reload.
         self.key_repeat.cancel_repeats();
         self.desktop = desktop;
         self.config = config;

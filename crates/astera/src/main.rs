@@ -15,6 +15,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let options = LaunchOptions::parse();
     let explicit = options.config.is_some();
     let config_path = options.config.clone().unwrap_or(default_config_path()?);
+    // An explicit missing path is a user error; an absent conventional path starts with defaults
+    // and remains watchable so creating the file later activates it without a restart.
     let config = if config_path.exists() {
         Config::load(&config_path)?
     } else if explicit {

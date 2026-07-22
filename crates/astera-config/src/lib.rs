@@ -32,6 +32,7 @@ impl Default for KeyRepeatConfig {
 
 #[derive(Clone, Debug, Default)]
 pub struct Bindings {
+    /// Canonical keys make differently spelled but equivalent bindings collide during loading.
     entries: BTreeMap<BindingKey, Binding>,
 }
 
@@ -75,7 +76,9 @@ impl Modifiers {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum KeyTrigger {
+    /// Layout-aware XKB symbol used by normal human-readable bindings.
     Keysym(u32),
+    /// Linux evdev code available as an explicit physical-key escape hatch.
     Code(u32),
 }
 
@@ -163,6 +166,7 @@ pub enum WorkspaceSelector {
 
 impl Action {
     pub fn can_repeat(&self) -> bool {
+        // Exclude toggles and process actions to prevent mode oscillation or process storms.
         matches!(
             self,
             Self::FocusWorkspace { .. }
@@ -304,6 +308,7 @@ impl Config {
     }
 
     pub fn from_ron(contents: &str) -> Result<Self, ConfigError> {
+        // Materialize the optional output argument before serde parses WorkspaceSelector.
         let normalized = normalize_workspace_selectors(contents);
         let raw: FileConfig = ron::from_str(&normalized)?;
         let mut entries = BTreeMap::new();
@@ -323,6 +328,7 @@ impl Config {
             }
             validate_action(&binding.action, &source)?;
             if entries.insert(key, binding).is_some() {
+                // Aliases must not silently depend on map iteration order to choose a winner.
                 return Err(ConfigError::Invalid(format!(
                     "binding {source:?} duplicates another normalized binding"
                 )));
@@ -368,6 +374,7 @@ fn normalize_workspace_selectors(source: &str) -> String {
             return output;
         };
         let arguments = &source[arguments_start..end];
+        // Convert the concise `Index(1)` spelling into the enum's actual two-field shape.
         if let Some(comma) = find_unquoted_comma(arguments) {
             let index = arguments[..comma].trim();
             let key = arguments[comma + 1..].trim();
@@ -387,6 +394,7 @@ fn find_next_selector(source: &str, start: usize) -> Option<usize> {
     while index < bytes.len() {
         match bytes[index] {
             b'"' => {
+                // Selector-like text inside a string literal must remain untouched.
                 index += 1;
                 while index < bytes.len() {
                     match bytes[index] {
@@ -400,6 +408,7 @@ fn find_next_selector(source: &str, start: usize) -> Option<usize> {
                 }
             }
             b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                // RON accepts Rust-style comments; skip selector-like text inside them.
                 index += 2;
                 while index < bytes.len() && bytes[index] != b'\n' {
                     index += 1;
@@ -494,6 +503,7 @@ fn parse_binding_key(source: &str) -> Result<BindingKey, ConfigError> {
             )));
         }
         trigger = Some(if let Some(code) = component.strip_prefix("code:") {
+            // Config uses conventional evdev codes; the runtime adds XKB's offset of eight.
             let code = code
                 .strip_prefix("0x")
                 .map(|hex| u32::from_str_radix(hex, 16))
@@ -506,6 +516,7 @@ fn parse_binding_key(source: &str) -> Result<BindingKey, ConfigError> {
             }
             KeyTrigger::Code(code)
         } else {
+            // Normalize printable keys so uppercase behavior remains an explicit Shift modifier.
             let normalized;
             let component = if component.len() == 1 && component.is_ascii() {
                 normalized = component.to_ascii_lowercase();
