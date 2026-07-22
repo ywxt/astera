@@ -1,30 +1,38 @@
 use std::{
     fs,
-    io::{Read, Write},
+    future::Future,
+    io,
     os::unix::fs::PermissionsExt,
-    os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, SyncSender},
-    },
-    thread,
+    sync::{Arc, mpsc},
     time::Duration,
 };
 
 use astera_ipc::{DesktopSnapshot, ErrorCode, PROTOCOL_VERSION, Request, Response};
+use smol::{
+    Executor, Timer,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::unix::{UnixListener, UnixStream},
+};
 
 use crate::state::Astera;
 
+const MAX_CLIENTS: usize = 64;
+const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+const IO_TIMEOUT: Duration = Duration::from_secs(2);
+
 struct PendingRequest {
     request: Request,
-    reply: SyncSender<Response<DesktopSnapshot>>,
-    cancelled: Arc<AtomicBool>,
+    reply: smol::channel::Sender<Response<DesktopSnapshot>>,
 }
 
+/// Cooperative IPC server driven by the compositor event loop.
+///
+/// No runtime or client threads are created. Socket futures only make progress when `dispatch`
+/// ticks the executor, keeping all compositor state access on its owning thread.
 pub struct IpcServer {
-    requests: Receiver<PendingRequest>,
+    executor: Arc<Executor<'static>>,
+    requests: mpsc::Receiver<PendingRequest>,
     pub path: PathBuf,
 }
 
@@ -34,57 +42,55 @@ impl IpcServer {
             .map(PathBuf::from)
             .ok_or("XDG_RUNTIME_DIR is required for the IPC socket")?;
         let path = runtime.join(format!("{display_name}.ipc"));
-        if path.exists() {
-            match UnixStream::connect(&path) {
-                Ok(_) => {
-                    return Err(format!("IPC socket {} is already active", path.display()).into());
-                }
-                Err(_) => fs::remove_file(&path)?,
-            }
-        }
+        remove_stale_socket(&path)?;
+
         let listener = UnixListener::bind(&path)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        let (sender, requests) = mpsc::channel();
-        let thread_path = path.clone();
-        let active_clients = Arc::new(AtomicUsize::new(0));
-        thread::Builder::new()
-            .name("astera-ipc".to_owned())
-            .spawn(move || {
-                for stream in listener.incoming() {
-                    let Ok(stream) = stream else {
-                        break;
+        let executor = Arc::new(Executor::new());
+        let (sender, requests) = mpsc::sync_channel(MAX_CLIENTS);
+        let accept_executor = executor.clone();
+        let log_path = path.clone();
+        executor
+            .spawn(async move {
+                let clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                loop {
+                    let (stream, _) = match listener.accept().await {
+                        Ok(client) => client,
+                        Err(error) => {
+                            tracing::warn!(%error, path = %log_path.display(), "IPC accept failed");
+                            break;
+                        }
                     };
-                    if active_clients.fetch_add(1, Ordering::AcqRel) >= 64 {
-                        active_clients.fetch_sub(1, Ordering::AcqRel);
-                        tracing::warn!(path = %thread_path.display(), "IPC client limit reached");
+                    if clients.load(std::sync::atomic::Ordering::Acquire) >= MAX_CLIENTS {
+                        tracing::warn!(path = %log_path.display(), "IPC client limit reached");
                         continue;
                     }
+                    clients.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     let sender = sender.clone();
-                    let path = thread_path.clone();
-                    let worker_clients = active_clients.clone();
-                    if let Err(error) = thread::Builder::new()
-                        .name("astera-ipc-client".to_owned())
-                        .spawn(move || {
-                            if let Err(error) = handle_client(stream, &sender) {
+                    let clients = clients.clone();
+                    let path = log_path.clone();
+                    accept_executor
+                        .spawn(async move {
+                            if let Err(error) = handle_client(stream, sender).await {
                                 tracing::warn!(%error, path = %path.display(), "IPC request failed");
                             }
-                            worker_clients.fetch_sub(1, Ordering::AcqRel);
+                            clients.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         })
-                    {
-                        active_clients.fetch_sub(1, Ordering::AcqRel);
-                        tracing::warn!(%error, path = %thread_path.display(), "could not spawn IPC client worker");
-                    }
+                        .detach();
                 }
-            })?;
+            })
+            .detach();
         tracing::info!(path = %path.display(), "IPC server is ready");
-        Ok(Self { requests, path })
+        Ok(Self {
+            executor,
+            requests,
+            path,
+        })
     }
 
     pub fn dispatch(&self, state: &mut Astera) {
+        self.drain_tasks();
         while let Ok(pending) = self.requests.try_recv() {
-            if pending.cancelled.load(Ordering::Acquire) {
-                continue;
-            }
             let response = if pending.request.version != PROTOCOL_VERSION {
                 Response::Error {
                     code: ErrorCode::VersionMismatch,
@@ -96,8 +102,13 @@ impl IpcServer {
             } else {
                 state.execute_command(pending.request.command)
             };
-            let _ = pending.reply.send(response);
+            let _ = pending.reply.try_send(response);
         }
+        self.drain_tasks();
+    }
+
+    fn drain_tasks(&self) {
+        while self.executor.try_tick() {}
     }
 }
 
@@ -107,14 +118,31 @@ impl Drop for IpcServer {
     }
 }
 
-fn handle_client(
+fn remove_stale_socket(path: &PathBuf) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("IPC socket {} is already active", path.display()),
+        )),
+        Err(_) => fs::remove_file(path),
+    }
+}
+
+async fn handle_client(
     mut stream: UnixStream,
-    sender: &mpsc::Sender<PendingRequest>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    sender: mpsc::SyncSender<PendingRequest>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut payload = String::new();
-    (&mut stream).take(64 * 1024).read_to_string(&mut payload)?;
+    with_timeout(
+        IO_TIMEOUT,
+        (&mut stream)
+            .take(MAX_REQUEST_BYTES)
+            .read_to_string(&mut payload),
+    )
+    .await??;
     let request = match ron::from_str::<Request>(&payload) {
         Ok(request) => request,
         Err(error) => {
@@ -122,24 +150,28 @@ fn handle_client(
                 code: ErrorCode::InvalidCommand,
                 message: error.to_string(),
             };
-            stream.write_all(ron::to_string(&response)?.as_bytes())?;
-            return Ok(());
+            return write_response(&mut stream, response).await;
         }
     };
-    let (reply, response) = mpsc::sync_channel(1);
-    let cancelled = Arc::new(AtomicBool::new(false));
-    sender.send(PendingRequest {
-        request,
-        reply,
-        cancelled: cancelled.clone(),
-    })?;
-    let response = match response.recv_timeout(Duration::from_secs(5)) {
-        Ok(response) => response,
-        Err(error) => {
-            cancelled.store(true, Ordering::Release);
-            return Err(error.into());
-        }
-    };
-    stream.write_all(ron::to_string(&response)?.as_bytes())?;
+    let (reply, response) = smol::channel::bounded(1);
+    sender.try_send(PendingRequest { request, reply })?;
+    let response = with_timeout(Duration::from_secs(5), response.recv()).await??;
+    write_response(&mut stream, response).await
+}
+
+async fn write_response(
+    stream: &mut UnixStream,
+    response: Response<DesktopSnapshot>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let payload = ron::to_string(&response)?;
+    with_timeout(IO_TIMEOUT, stream.write_all(payload.as_bytes())).await??;
     Ok(())
+}
+
+async fn with_timeout<T>(duration: Duration, future: impl Future<Output = T>) -> io::Result<T> {
+    smol::future::race(async move { Ok(future.await) }, async move {
+        Timer::after(duration).await;
+        Err(io::Error::new(io::ErrorKind::TimedOut, "IPC timed out"))
+    })
+    .await
 }

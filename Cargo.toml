@@ -21,6 +21,7 @@ astera-ipc = { path = "crates/astera-ipc" }
 clap = { version = "4.6", features = ["derive"] }
 ron = "0.12"
 serde = { version = "1", features = ["derive"] }
+smol = "2"
 thiserror = "2"
 smithay = { version = "0.7", default-features = false, features = ["backend_drm", "backend_gbm", "backend_libinput", "backend_session_libseat", "backend_udev", "backend_winit", "desktop", "renderer_gl", "renderer_multi", "renderer_pixman", "wayland_frontend"] }
 smithay-drm-extras = { version = "0.1", default-features = false }
