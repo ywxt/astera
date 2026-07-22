@@ -1,4 +1,21 @@
 use super::*;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+#[error("{message}")]
+struct CommandError {
+    code: ErrorCode,
+    message: String,
+}
+
+impl CommandError {
+    fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
 
 impl Astera {
     pub fn execute_command(&mut self, command: Command) -> Response<DesktopSnapshot> {
@@ -27,9 +44,12 @@ impl Astera {
                     ),
                 )
             }
-            Err((code, message)) => {
-                tracing::warn!(?code, %message, "command failed");
-                Response::Error { code, message }
+            Err(error) => {
+                tracing::warn!(code = ?error.code, %error, "command failed");
+                Response::Error {
+                    code: error.code,
+                    message: error.to_string(),
+                }
             }
         }
     }
@@ -156,7 +176,7 @@ impl Astera {
         keyboard.set_focus(self, target, serial);
     }
 
-    fn resolve_output(&self, selector: OutputSelector) -> Result<OutputId, (ErrorCode, String)> {
+    fn resolve_output(&self, selector: OutputSelector) -> Result<OutputId, CommandError> {
         let output = match selector {
             OutputSelector::Id(output) => Some(output),
             OutputSelector::Key(key) => self
@@ -168,13 +188,10 @@ impl Astera {
         };
         output
             .filter(|output| self.desktop.outputs.contains_key(output))
-            .ok_or_else(|| (ErrorCode::NotFound, "unknown output".to_owned()))
+            .ok_or_else(|| CommandError::new(ErrorCode::NotFound, "unknown output"))
     }
 
-    fn resolve_workspace(
-        &self,
-        selector: WorkspaceSelector,
-    ) -> Result<WorkspaceId, (ErrorCode, String)> {
+    fn resolve_workspace(&self, selector: WorkspaceSelector) -> Result<WorkspaceId, CommandError> {
         let workspace = match selector {
             WorkspaceSelector::Id(workspace) => self
                 .desktop
@@ -192,10 +209,10 @@ impl Astera {
                     .map(|workspace| workspace.id)
             }
         };
-        workspace.ok_or_else(|| (ErrorCode::NotFound, "unknown workspace".to_owned()))
+        workspace.ok_or_else(|| CommandError::new(ErrorCode::NotFound, "unknown workspace"))
     }
 
-    fn execute_command_inner(&mut self, command: Command) -> Result<(), (ErrorCode, String)> {
+    fn execute_command_inner(&mut self, command: Command) -> Result<(), CommandError> {
         match command {
             Command::GetState => Ok(()),
             Command::FocusOutput(output) => {
@@ -284,11 +301,11 @@ impl Astera {
         logical_size: Size,
         native_scale: astera_core::Scale120,
         transform: OutputTransform,
-    ) -> Result<(), (ErrorCode, String)> {
+    ) -> Result<(), CommandError> {
         if !self.output_configuration_supported {
-            return Err((
+            return Err(CommandError::new(
                 ErrorCode::Conflict,
-                "the native backend does not support live KMS output reconfiguration".to_owned(),
+                "the native backend does not support live KMS output reconfiguration",
             ));
         }
         let output = self.resolve_output(selector)?;
@@ -296,17 +313,14 @@ impl Astera {
             .map_err(map_desktop_error)
     }
 
-    fn focus_workspace_command(
-        &mut self,
-        selector: WorkspaceSelector,
-    ) -> Result<(), (ErrorCode, String)> {
+    fn focus_workspace_command(&mut self, selector: WorkspaceSelector) -> Result<(), CommandError> {
         let workspace = self.resolve_workspace(selector)?;
         let output = self
             .desktop
             .workspace_location(workspace)
             .map_err(map_desktop_error)?
             .output
-            .ok_or_else(|| (ErrorCode::Conflict, "workspace is detached".to_owned()))?;
+            .ok_or_else(|| CommandError::new(ErrorCode::Conflict, "workspace is detached"))?;
         self.desktop
             .apply(WorkspaceTransaction::Focus { output, workspace })
             .map_err(map_desktop_error)?;
@@ -318,7 +332,7 @@ impl Astera {
         &mut self,
         window: WindowId,
         mode: WindowMode,
-    ) -> Result<(), (ErrorCode, String)> {
+    ) -> Result<(), CommandError> {
         let workspace = self
             .desktop
             .find_window(window)
@@ -343,7 +357,7 @@ impl Astera {
             .map_err(map_desktop_error)
     }
 
-    fn focus_window_command(&mut self, window: WindowId) -> Result<(), (ErrorCode, String)> {
+    fn focus_window_command(&mut self, window: WindowId) -> Result<(), CommandError> {
         let workspace = self
             .desktop
             .focus_window(window)
@@ -362,15 +376,12 @@ impl Astera {
     fn focus_direction_command(
         &mut self,
         direction: astera_core::Direction,
-    ) -> Result<(), (ErrorCode, String)> {
+    ) -> Result<(), CommandError> {
         let workspace = self
             .desktop
             .active_workspace_id(self.active_output)
             .ok_or_else(|| {
-                (
-                    ErrorCode::Conflict,
-                    "active output has no workspace".to_owned(),
-                )
+                CommandError::new(ErrorCode::Conflict, "active output has no workspace")
             })?;
         self.desktop
             .focus_direction(workspace, direction)
@@ -379,7 +390,7 @@ impl Astera {
     }
 }
 
-fn map_desktop_error(error: astera_core::DesktopError) -> (ErrorCode, String) {
+fn map_desktop_error(error: astera_core::DesktopError) -> CommandError {
     let code = match error {
         astera_core::DesktopError::UnknownWorkspace(_)
         | astera_core::DesktopError::UnknownOutput(_)
@@ -392,5 +403,5 @@ fn map_desktop_error(error: astera_core::DesktopError) -> (ErrorCode, String) {
         astera_core::DesktopError::InvalidOutputSize
         | astera_core::DesktopError::InvalidOutputScale => ErrorCode::InvalidCommand,
     };
-    (code, error.to_string())
+    CommandError::new(code, error.to_string())
 }

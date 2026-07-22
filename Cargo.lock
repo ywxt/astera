@@ -106,6 +106,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "appendlist"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -130,6 +136,7 @@ checksum = "175571dd1d178ced59193a6fc02dde1b972eb0bc56c892cde9beeceac5bf0f6b"
 name = "astera"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "astera-config",
  "astera-core",
  "astera-ipc",
@@ -138,6 +145,7 @@ dependencies = [
  "smithay",
  "smithay-drm-extras",
  "smol",
+ "thiserror 2.0.19",
  "tracing",
  "tracing-subscriber",
  "wayland-client",

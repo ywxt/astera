@@ -7,12 +7,14 @@ rust-version.workspace = true
 default-run = "astera"
 
 [dependencies]
+anyhow.workspace = true
 astera-config.workspace = true
 astera-core.workspace = true
 astera-ipc.workspace = true
 clap.workspace = true
 ron.workspace = true
 smol.workspace = true
+thiserror.workspace = true
 smithay.workspace = true
 smithay-drm-extras.workspace = true
 tracing.workspace = true

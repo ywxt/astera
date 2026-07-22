@@ -1,11 +1,13 @@
-pub(super) fn spawn(argv: Vec<String>) -> Result<(), String> {
+use anyhow::{Context, Result};
+
+pub(super) fn spawn(argv: Vec<String>) -> Result<()> {
     let (program, arguments) = argv
         .split_first()
-        .ok_or_else(|| "Spawn requires a non-empty argv".to_owned())?;
+        .ok_or_else(|| anyhow::anyhow!("Spawn requires a non-empty argv"))?;
     let mut child = std::process::Command::new(program)
         .args(arguments)
         .spawn()
-        .map_err(|error| format!("could not spawn {program:?}: {error}"))?;
+        .with_context(|| format!("could not spawn {program:?}"))?;
     let program = program.clone();
     // Never wait on the compositor thread. The detached waiter prevents zombie processes while
     // leaving the child independent from the compositor's shutdown lifecycle.

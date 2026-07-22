@@ -1,6 +1,7 @@
-use std::{error::Error, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use ::winit::platform::pump_events::PumpStatus;
+use anyhow::{Context, Result, anyhow};
 use astera_config::Config;
 use astera_ipc::Command;
 use smithay::{
@@ -26,7 +27,7 @@ use crate::{
     state::{Astera, ClientState, send_frames_surface_tree},
 };
 
-pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dyn Error>> {
+pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     let mut display: Display<Astera> = Display::new()?;
     let mut state = Astera::new(&display.handle(), config);
     state.watch_config(config_path);
@@ -34,10 +35,11 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dy
     let listener = ListeningSocket::bind_auto("astera", 1..32)?;
     let socket_name = listener
         .socket_name()
-        .ok_or("Wayland listening socket has no name")?
+        .context("Wayland listening socket has no name")?
         .to_string_lossy()
         .into_owned();
-    let (mut backend, mut event_loop) = winit::init::<GlesRenderer>()?;
+    let (mut backend, mut event_loop) =
+        winit::init::<GlesRenderer>().map_err(|error| anyhow!(error.to_string()))?;
     let ipc = IpcServer::bind(&socket_name)?;
     let started = Instant::now();
 

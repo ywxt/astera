@@ -24,6 +24,7 @@ use geometry::{
 use key_repeat::KeyRepeatState;
 use model::{DragState, MappedLayer, MappedWindow, OutputRuntime, ProtocolState};
 
+use anyhow::{Result as AnyResult, anyhow};
 use astera_config::{
     Action, BindingKey, Config, Modifiers as BindingModifiers,
     WorkspaceSelector as BindingWorkspaceSelector,
@@ -743,7 +744,7 @@ impl Astera {
         }
     }
 
-    fn execute_action(&mut self, action: Action) -> Result<(), String> {
+    fn execute_action(&mut self, action: Action) -> AnyResult<()> {
         // Resolve focus once so every focused-window action observes the same state snapshot.
         let focused = self
             .desktop
@@ -756,14 +757,14 @@ impl Astera {
                 return process::spawn(vec!["/bin/sh".into(), "-c".into(), script]);
             }
             Action::FocusWorkspace { workspace } => Some(Command::FocusWorkspace {
-                workspace: self.resolve_binding_workspace(workspace)?,
+                workspace: self.resolve_binding_workspace(workspace),
             }),
             Action::MoveWindowToWorkspace {
                 workspace,
                 activate,
             } => Some(Command::MoveWindow {
-                window: focused.ok_or_else(|| "no focused window".to_owned())?,
-                target: self.resolve_binding_workspace(workspace)?,
+                window: focused.ok_or_else(|| anyhow!("no focused window"))?,
+                target: self.resolve_binding_workspace(workspace),
                 activate,
             }),
             Action::FocusOutput { output } => {
@@ -777,7 +778,7 @@ impl Astera {
                 workspace: self
                     .desktop
                     .active_workspace_id(self.active_output)
-                    .ok_or_else(|| "active output has no workspace".to_owned())?,
+                    .ok_or_else(|| anyhow!("active output has no workspace"))?,
                 target_output: OutputSelector::Key(output),
                 target_index: index.map(|index| index - 1),
                 activate,
@@ -789,29 +790,29 @@ impl Astera {
                 workspace: self
                     .desktop
                     .active_workspace_id(self.active_output)
-                    .ok_or_else(|| "active output has no workspace".to_owned())?,
+                    .ok_or_else(|| anyhow!("active output has no workspace"))?,
                 dx: x,
                 dy: y,
             }),
             Action::SetWindowMode(mode) => Some(Command::SetWindowMode {
-                window: focused.ok_or_else(|| "no focused window".to_owned())?,
+                window: focused.ok_or_else(|| anyhow!("no focused window"))?,
                 mode,
             }),
             Action::ToggleFloating => Some(Command::SetWindowMode {
-                window: focused.ok_or_else(|| "no focused window".to_owned())?,
+                window: focused.ok_or_else(|| anyhow!("no focused window"))?,
                 mode: self.toggle_floating_mode(focused.unwrap())?,
             }),
             Action::ToggleFullscreen => Some(Command::SetWindowMode {
-                window: focused.ok_or_else(|| "no focused window".to_owned())?,
+                window: focused.ok_or_else(|| anyhow!("no focused window"))?,
                 mode: self.toggle_fullscreen_mode(focused.unwrap())?,
             }),
             Action::CloseWindow => {
-                let window = focused.ok_or_else(|| "no focused window".to_owned())?;
+                let window = focused.ok_or_else(|| anyhow!("no focused window"))?;
                 let mapped = self
                     .windows
                     .iter()
                     .find(|mapped| mapped.id == window)
-                    .ok_or_else(|| "focused window is not mapped".to_owned())?;
+                    .ok_or_else(|| anyhow!("focused window is not mapped"))?;
                 // Request a cooperative close; never terminate the owning client process here.
                 mapped.surface.send_close();
                 None
@@ -825,18 +826,15 @@ impl Astera {
             // Reuse the command executor so bindings and IPC have identical transaction rules.
             match self.execute_command(command) {
                 Response::Ok(_) => Ok(()),
-                Response::Error { message, .. } => Err(message),
+                Response::Error { message, .. } => Err(anyhow!(message)),
             }
         } else {
             Ok(())
         }
     }
 
-    fn resolve_binding_workspace(
-        &self,
-        selector: BindingWorkspaceSelector,
-    ) -> Result<WorkspaceSelector, String> {
-        Ok(match selector {
+    fn resolve_binding_workspace(&self, selector: BindingWorkspaceSelector) -> WorkspaceSelector {
+        match selector {
             BindingWorkspaceSelector::Index(index, output) => WorkspaceSelector::LocalIndex {
                 output: output
                     .map(OutputSelector::Key)
@@ -844,14 +842,11 @@ impl Astera {
                 index,
             },
             BindingWorkspaceSelector::Name(name) => WorkspaceSelector::Name(name),
-        })
+        }
     }
 
-    fn toggle_floating_mode(&self, window: WindowId) -> Result<WindowMode, String> {
-        let workspace = self
-            .desktop
-            .find_window(window)
-            .map_err(|error| error.to_string())?;
+    fn toggle_floating_mode(&self, window: WindowId) -> AnyResult<WindowMode> {
+        let workspace = self.desktop.find_window(window)?;
         match self
             .desktop
             .workspace(workspace)
@@ -860,15 +855,12 @@ impl Astera {
         {
             Some(WindowMode::Floating) => Ok(WindowMode::Tiled),
             Some(WindowMode::Tiled | WindowMode::Fullscreen) => Ok(WindowMode::Floating),
-            None => Err("focused window has no mode".into()),
+            None => Err(anyhow!("focused window has no mode")),
         }
     }
 
-    fn toggle_fullscreen_mode(&self, window: WindowId) -> Result<WindowMode, String> {
-        let workspace = self
-            .desktop
-            .find_window(window)
-            .map_err(|error| error.to_string())?;
+    fn toggle_fullscreen_mode(&self, window: WindowId) -> AnyResult<WindowMode> {
+        let workspace = self.desktop.find_window(window)?;
         let state = self.desktop.workspace(workspace).unwrap();
         match state.window_mode(window) {
             Some(WindowMode::Fullscreen) => match &state.fullscreen.as_ref().unwrap().restore {
@@ -876,7 +868,7 @@ impl Astera {
                 astera_core::RestorePlacement::Floating { .. } => Ok(WindowMode::Floating),
             },
             Some(WindowMode::Tiled | WindowMode::Floating) => Ok(WindowMode::Fullscreen),
-            None => Err("focused window has no mode".into()),
+            None => Err(anyhow!("focused window has no mode")),
         }
     }
 
@@ -914,12 +906,10 @@ impl Astera {
         }
     }
 
-    fn apply_config(&mut self, config: Config) -> Result<(), String> {
+    fn apply_config(&mut self, config: Config) -> AnyResult<()> {
         // Validate layout changes on a clone before publishing any part of the new config.
         let mut desktop = self.desktop.clone();
-        desktop
-            .reconfigure_layout(config.gap, config.camera)
-            .map_err(|error| error.to_string())?;
+        desktop.reconfigure_layout(config.gap, config.camera)?;
         self.keyboard.change_repeat_info(
             config.key_repeat.rate as i32,
             config.key_repeat.delay_ms as i32,

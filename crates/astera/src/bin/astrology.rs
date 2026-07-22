@@ -1,12 +1,12 @@
 use std::{
     env,
-    error::Error,
     io::{Read, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
     path::PathBuf,
 };
 
+use anyhow::{Context, Result, bail};
 use astera_ipc::{
     Command as IpcCommand, DesktopSnapshot, PROTOCOL_VERSION, Request, Response, WorkspaceSnapshot,
 };
@@ -29,13 +29,13 @@ enum AstrologyCommand {
     Overview,
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
     let args = Args::parse();
     let _command = args.command.unwrap_or(AstrologyCommand::Overview);
     let display = env::var("WAYLAND_DISPLAY")?;
     let runtime = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .ok_or("XDG_RUNTIME_DIR is required")?;
+        .context("XDG_RUNTIME_DIR is required")?;
     let mut stream = UnixStream::connect(runtime.join(format!("{display}.ipc")))?;
     let request = Request {
         version: PROTOCOL_VERSION,
@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     stream.read_to_string(&mut payload)?;
     match ron::from_str::<Response<DesktopSnapshot>>(&payload)? {
         Response::Ok(snapshot) => print!("{}", format_overview(&snapshot)),
-        Response::Error { code, message } => return Err(format!("{code:?}: {message}").into()),
+        Response::Error { code, message } => bail!("{code:?}: {message}"),
     }
     Ok(())
 }

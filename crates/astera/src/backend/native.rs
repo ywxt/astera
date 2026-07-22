@@ -1,11 +1,11 @@
 use std::{
     collections::HashMap,
-    error::Error,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use anyhow::{Context, Result, anyhow};
 use astera_config::Config;
 use astera_core::{Output, OutputId, Size};
 use smithay::{
@@ -114,7 +114,7 @@ struct NativeSurface {
 }
 
 impl NativeLoop {
-    fn device_added(&mut self, node: DrmNode, path: &Path) -> Result<(), Box<dyn Error>> {
+    fn device_added(&mut self, node: DrmNode, path: &Path) -> Result<()> {
         if self.devices.contains_key(&node) {
             return Ok(());
         }
@@ -435,7 +435,7 @@ impl NativeLoop {
     }
 }
 
-pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dyn Error>> {
+pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     let mut event_loop: EventLoop<NativeLoop> = EventLoop::try_new()?;
     let handle = event_loop.handle();
     let display = Display::<Astera>::new()?;
@@ -446,7 +446,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dy
     let listener = ListeningSocket::bind_auto("astera", 1..32)?;
     let socket_name = listener
         .socket_name()
-        .ok_or("Wayland listening socket has no name")?
+        .context("Wayland listening socket has no name")?
         .to_string_lossy()
         .into_owned();
     let ipc = IpcServer::bind(&socket_name)?;
@@ -472,7 +472,8 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dy
         .handle()
         .insert_source(input, |event, _, runtime| {
             runtime.state.process_input(event);
-        })?;
+        })
+        .map_err(|error| anyhow!(error.to_string()))?;
     event_loop
         .handle()
         .insert_source(session_notifier, |event, _, runtime| match event {
@@ -494,7 +495,8 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dy
                 }
                 tracing::info!("native session activated");
             }
-        })?;
+        })
+        .map_err(|error| anyhow!(error.to_string()))?;
     event_loop
         .handle()
         .insert_source(udev, |event, _, runtime| match event {
@@ -516,7 +518,8 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<(), Box<dy
                     runtime.device_removed(node);
                 }
             }
-        })?;
+        })
+        .map_err(|error| anyhow!(error.to_string()))?;
 
     let mut runtime = NativeLoop {
         handle,

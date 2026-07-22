@@ -8,12 +8,14 @@ use std::{
     time::Duration,
 };
 
+use anyhow::{Context, Result};
 use astera_ipc::{DesktopSnapshot, ErrorCode, PROTOCOL_VERSION, Request, Response};
 use smol::{
     Executor, Timer,
     io::{AsyncReadExt, AsyncWriteExt},
     net::unix::{UnixListener, UnixStream},
 };
+use thiserror::Error;
 
 use crate::state::Astera;
 
@@ -24,6 +26,21 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 struct PendingRequest {
     request: Request,
     reply: smol::channel::Sender<Response<DesktopSnapshot>>,
+}
+
+#[derive(Debug, Error)]
+pub enum IpcServerError {
+    #[error("XDG_RUNTIME_DIR is required for the IPC socket")]
+    MissingRuntimeDirectory,
+    #[error("IPC socket {0} is already active")]
+    AddressInUse(PathBuf),
+    #[error("could not {operation} IPC socket {path}")]
+    Socket {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// Cooperative IPC server driven by the compositor event loop.
@@ -37,15 +54,25 @@ pub struct IpcServer {
 }
 
 impl IpcServer {
-    pub fn bind(display_name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn bind(display_name: &str) -> std::result::Result<Self, IpcServerError> {
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
-            .ok_or("XDG_RUNTIME_DIR is required for the IPC socket")?;
+            .ok_or(IpcServerError::MissingRuntimeDirectory)?;
         let path = runtime.join(format!("{display_name}.ipc"));
         remove_stale_socket(&path)?;
 
-        let listener = UnixListener::bind(&path)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        let listener = UnixListener::bind(&path).map_err(|source| IpcServerError::Socket {
+            operation: "bind",
+            path: path.clone(),
+            source,
+        })?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+            IpcServerError::Socket {
+                operation: "set permissions on",
+                path: path.clone(),
+                source,
+            }
+        })?;
         let executor = Arc::new(Executor::new());
         let (sender, requests) = mpsc::sync_channel(MAX_CLIENTS);
         let accept_executor = executor.clone();
@@ -118,23 +145,24 @@ impl Drop for IpcServer {
     }
 }
 
-fn remove_stale_socket(path: &PathBuf) -> io::Result<()> {
+fn remove_stale_socket(path: &PathBuf) -> std::result::Result<(), IpcServerError> {
     if !path.exists() {
         return Ok(());
     }
     match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::AddrInUse,
-            format!("IPC socket {} is already active", path.display()),
-        )),
-        Err(_) => fs::remove_file(path),
+        Ok(_) => Err(IpcServerError::AddressInUse(path.clone())),
+        Err(_) => fs::remove_file(path).map_err(|source| IpcServerError::Socket {
+            operation: "remove stale",
+            path: path.clone(),
+            source,
+        }),
     }
 }
 
 async fn handle_client(
     mut stream: UnixStream,
     sender: mpsc::SyncSender<PendingRequest>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<()> {
     let mut payload = String::new();
     with_timeout(
         IO_TIMEOUT,
@@ -142,7 +170,8 @@ async fn handle_client(
             .take(MAX_REQUEST_BYTES)
             .read_to_string(&mut payload),
     )
-    .await??;
+    .await
+    .context("timed out while reading IPC request")??;
     let request = match ron::from_str::<Request>(&payload) {
         Ok(request) => request,
         Err(error) => {
@@ -154,17 +183,24 @@ async fn handle_client(
         }
     };
     let (reply, response) = smol::channel::bounded(1);
-    sender.try_send(PendingRequest { request, reply })?;
-    let response = with_timeout(Duration::from_secs(5), response.recv()).await??;
+    sender
+        .try_send(PendingRequest { request, reply })
+        .context("IPC command queue is full")?;
+    let response = with_timeout(Duration::from_secs(5), response.recv())
+        .await
+        .context("timed out waiting for compositor response")?
+        .context("compositor dropped IPC response")?;
     write_response(&mut stream, response).await
 }
 
 async fn write_response(
     stream: &mut UnixStream,
     response: Response<DesktopSnapshot>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let payload = ron::to_string(&response)?;
-    with_timeout(IO_TIMEOUT, stream.write_all(payload.as_bytes())).await??;
+) -> Result<()> {
+    let payload = ron::to_string(&response).context("could not serialize IPC response")?;
+    with_timeout(IO_TIMEOUT, stream.write_all(payload.as_bytes()))
+        .await
+        .context("timed out while writing IPC response")??;
     Ok(())
 }
 

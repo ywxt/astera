@@ -3,14 +3,13 @@ mod cli;
 mod ipc_server;
 mod state;
 
-use std::error::Error;
-
+use anyhow::{Context, Result, bail};
 use astera_config::Config;
 use clap::Parser;
 
 use crate::cli::{BackendKind, LaunchOptions};
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
     init_tracing();
     let options = LaunchOptions::parse();
     let explicit = options.config.is_some();
@@ -20,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = if config_path.exists() {
         Config::load(&config_path)?
     } else if explicit {
-        return Err(format!("configuration file {:?} does not exist", config_path).into());
+        bail!("configuration file {:?} does not exist", config_path);
     } else {
         Config::default()
     };
@@ -30,11 +29,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn default_config_path() -> Result<std::path::PathBuf, Box<dyn Error>> {
+fn default_config_path() -> Result<std::path::PathBuf> {
     if let Some(directory) = std::env::var_os("XDG_CONFIG_HOME") {
         return Ok(std::path::PathBuf::from(directory).join("astera/config.ron"));
     }
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
     Ok(std::path::PathBuf::from(home).join(".config/astera/config.ron"))
 }
 

@@ -15,6 +15,7 @@ license = "MIT"
 rust-version = "1.95"
 
 [workspace.dependencies]
+anyhow = "1"
 astera-core = { path = "crates/astera-core" }
 astera-config = { path = "crates/astera-config" }
 astera-ipc = { path = "crates/astera-ipc" }
