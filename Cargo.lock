@@ -139,6 +139,8 @@ dependencies = [
  "smithay-drm-extras",
  "tracing",
  "tracing-subscriber",
+ "wayland-client",
+ "wayland-protocols",
  "winit",
 ]
 
