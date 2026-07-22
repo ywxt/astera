@@ -17,6 +17,7 @@ rust-version = "1.85"
 astera-core = { path = "crates/astera-core" }
 astera-config = { path = "crates/astera-config" }
 astera-ipc = { path = "crates/astera-ipc" }
+clap = { version = "4.6", features = ["derive"] }
 ron = "0.12"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

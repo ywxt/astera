@@ -10,6 +10,7 @@ default-run = "astera"
 astera-config.workspace = true
 astera-core.workspace = true
 astera-ipc.workspace = true
+clap.workspace = true
 ron.workspace = true
 smithay.workspace = true
 smithay-drm-extras.workspace = true

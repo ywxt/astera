@@ -1,18 +1,20 @@
 mod backend;
+mod cli;
 mod ipc_server;
 mod state;
 
 use std::error::Error;
 
 use astera_config::Config;
+use clap::Parser;
 
-use crate::backend::{BackendKind, LaunchOptions};
+use crate::cli::{BackendKind, LaunchOptions};
 
 fn main() -> Result<(), Box<dyn Error>> {
     init_tracing();
-    let options = LaunchOptions::from_args()?;
-    let explicit = options.config_path.is_some();
-    let config_path = options.config_path.unwrap_or(default_config_path()?);
+    let options = LaunchOptions::parse();
+    let explicit = options.config.is_some();
+    let config_path = options.config.clone().unwrap_or(default_config_path()?);
     let config = if config_path.exists() {
         Config::load(&config_path)?
     } else if explicit {
@@ -20,7 +22,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         Config::default()
     };
-    match options.backend {
+    match options.effective_backend() {
         BackendKind::Winit => backend::winit::run(config, config_path),
         BackendKind::Native => backend::native::run(config, config_path),
     }
