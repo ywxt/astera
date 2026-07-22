@@ -28,8 +28,8 @@ struct PendingRequest {
 
 /// Cooperative IPC server driven by the compositor event loop.
 ///
-/// No runtime or client threads are created. Socket futures only make progress when `dispatch`
-/// ticks the executor, keeping all compositor state access on its owning thread.
+/// No IPC accept or per-client worker threads are created. Socket tasks are cooperatively ticked
+/// by `dispatch`, keeping all compositor state access on its owning thread.
 pub struct IpcServer {
     executor: Arc<Executor<'static>>,
     requests: mpsc::Receiver<PendingRequest>,
