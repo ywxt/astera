@@ -6,6 +6,8 @@ mod geometry;
 mod key_repeat;
 mod model;
 mod process;
+#[cfg(test)]
+mod snapshot;
 
 use clock::{Clock, SystemClock};
 use config_watcher::ConfigWatcher;
