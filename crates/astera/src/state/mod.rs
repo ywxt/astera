@@ -1085,15 +1085,5 @@ impl ClientData for ClientState {
     }
 }
 
-delegate_xdg_shell!(Astera);
-delegate_layer_shell!(Astera);
-delegate_fractional_scale!(Astera);
-delegate_viewporter!(Astera);
-delegate_output!(Astera);
-delegate_compositor!(Astera);
-delegate_shm!(Astera);
-delegate_seat!(Astera);
-delegate_data_device!(Astera);
-
 #[cfg(test)]
 mod tests;
