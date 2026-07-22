@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, os::fd::OwnedFd};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    os::fd::OwnedFd,
+};
 
 use astera_config::Config;
 use astera_core::{
@@ -118,6 +121,7 @@ pub struct Astera {
     next_window_id: u64,
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
     drag: Option<DragState>,
+    intercepted_keys: BTreeSet<smithay::backend::input::Keycode>,
     serial: u32,
 }
 
@@ -205,6 +209,7 @@ impl Astera {
             next_window_id: 1,
             pointer_location: (0.0, 0.0).into(),
             drag: None,
+            intercepted_keys: BTreeSet::new(),
             serial: 1,
         }
     }
@@ -285,21 +290,30 @@ impl Astera {
         match event {
             InputEvent::Keyboard { event } => {
                 let pressed = event.state() == KeyState::Pressed;
+                let key_code = event.key_code();
                 let keyboard = self.keyboard.clone();
                 let serial = self.next_serial();
                 keyboard.input::<(), _>(
                     self,
-                    event.key_code(),
+                    key_code,
                     event.state(),
                     serial,
                     event.time_msec(),
                     move |state, modifiers, key| {
+                        if !pressed {
+                            return if state.intercepted_keys.remove(&key_code) {
+                                FilterResult::Intercept(())
+                            } else {
+                                FilterResult::Forward
+                            };
+                        }
                         let symbol = key
                             .raw_latin_sym_or_raw_current_sym()
                             .map(|symbol| symbol.raw());
                         if symbol
                             .is_some_and(|symbol| state.handle_shortcut(modifiers, symbol, pressed))
                         {
+                            state.intercepted_keys.insert(key_code);
                             FilterResult::Intercept(())
                         } else {
                             FilterResult::Forward
@@ -724,7 +738,7 @@ impl Astera {
     }
 
     fn handle_shortcut(&mut self, modifiers: &ModifiersState, symbol: u32, pressed: bool) -> bool {
-        if !modifiers.logo {
+        if !pressed || !modifiers.logo {
             return false;
         }
         let workspace_id = self.desktop.active_workspace_id(self.active_output);
