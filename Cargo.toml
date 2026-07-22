@@ -6,12 +6,13 @@ members = [
     "crates/astera",
 ]
 resolver = "3"
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.95"
 
 [workspace.dependencies]
 astera-core = { path = "crates/astera-core" }
@@ -27,3 +28,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 winit = { version = "0.30", default-features = false, features = ["wayland", "x11", "rwh_06"] }
 xkbcommon = "0.8"
+
+[workspace.lints.rust]
+unsafe_code = "deny"

@@ -11,3 +11,6 @@ ron.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 xkbcommon.workspace = true
+
+[lints]
+workspace = true

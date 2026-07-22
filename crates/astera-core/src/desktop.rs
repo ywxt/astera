@@ -417,10 +417,10 @@ impl Desktop {
         if let Some(viewport) = viewport {
             working.workspace_mut(workspace)?.follow_focus(viewport);
         }
-        if let Ok(location) = working.workspace_location(workspace) {
-            if let Some(output) = location.output {
-                working.outputs.get_mut(&output).unwrap().active = location.index;
-            }
+        if let Ok(location) = working.workspace_location(workspace)
+            && let Some(output) = location.output
+        {
+            working.outputs.get_mut(&output).unwrap().active = location.index;
         }
         working.validate()?;
         *self = working;
@@ -520,12 +520,12 @@ impl Desktop {
                 activate,
             } => self.move_workspace(workspace, target_output, target_index, activate),
             WorkspaceTransaction::SetName { workspace, name } => {
-                if let Some(name) = name.as_deref() {
-                    if self.workspaces().any(|candidate| {
+                if let Some(name) = name.as_deref()
+                    && self.workspaces().any(|candidate| {
                         candidate.id != workspace && candidate.name.as_deref() == Some(name)
-                    }) {
-                        return Err(DesktopError::DuplicateWorkspaceName(name.to_owned()));
-                    }
+                    })
+                {
+                    return Err(DesktopError::DuplicateWorkspaceName(name.to_owned()));
                 }
                 self.workspace_mut(workspace)?.name = name.clone();
                 Ok(DesktopEvent::WorkspaceNamed { workspace, name })
@@ -695,12 +695,11 @@ impl Desktop {
             }
         }
         self.reset_original_output_for_ordinary(target);
-        if activate {
-            if let Ok(location) = self.workspace_location(target) {
-                if let Some(output) = location.output {
-                    self.outputs.get_mut(&output).unwrap().active = location.index;
-                }
-            }
+        if activate
+            && let Ok(location) = self.workspace_location(target)
+            && let Some(output) = location.output
+        {
+            self.outputs.get_mut(&output).unwrap().active = location.index;
         }
         Ok(DesktopEvent::WindowSent {
             window,
@@ -797,10 +796,10 @@ impl Desktop {
                 self.primary_output.unwrap_or(OutputId(u32::MAX)),
             ));
         }
-        if let Some(primary) = self.primary_output {
-            if !self.outputs.contains_key(&primary) {
-                return Err(DesktopError::UnknownOutput(primary));
-            }
+        if let Some(primary) = self.primary_output
+            && !self.outputs.contains_key(&primary)
+        {
+            return Err(DesktopError::UnknownOutput(primary));
         }
         let mut ids = BTreeMap::new();
         let mut names = BTreeMap::new();
@@ -821,10 +820,10 @@ impl Desktop {
             if ids.insert(workspace.id, ()).is_some() {
                 return Err(DesktopError::UnknownWorkspace(workspace.id));
             }
-            if let Some(name) = &workspace.name {
-                if names.insert(name, workspace.id).is_some() {
-                    return Err(DesktopError::DuplicateWorkspaceName(name.clone()));
-                }
+            if let Some(name) = &workspace.name
+                && names.insert(name, workspace.id).is_some()
+            {
+                return Err(DesktopError::DuplicateWorkspaceName(name.clone()));
             }
             for window in workspace
                 .tiled
@@ -858,10 +857,10 @@ fn store_workspace_viewport(workspace: &mut Workspace, key: &str, size: Size) {
     for placement in workspace.floating.values_mut() {
         placement.viewport.store_for_output(key, size);
     }
-    if let Some(fullscreen) = &mut workspace.fullscreen {
-        if let RestorePlacement::Floating { viewport } = &mut fullscreen.restore {
-            viewport.store_for_output(key, size);
-        }
+    if let Some(fullscreen) = &mut workspace.fullscreen
+        && let RestorePlacement::Floating { viewport } = &mut fullscreen.restore
+    {
+        viewport.store_for_output(key, size);
     }
 }
 
@@ -874,10 +873,10 @@ fn migrate_workspace_viewport(
     for placement in workspace.floating.values_mut() {
         migrate_viewport_placement(&mut placement.viewport, source, target_key, target_size);
     }
-    if let Some(fullscreen) = &mut workspace.fullscreen {
-        if let RestorePlacement::Floating { viewport } = &mut fullscreen.restore {
-            migrate_viewport_placement(viewport, source, target_key, target_size);
-        }
+    if let Some(fullscreen) = &mut workspace.fullscreen
+        && let RestorePlacement::Floating { viewport } = &mut fullscreen.restore
+    {
+        migrate_viewport_placement(viewport, source, target_key, target_size);
     }
 }
 
@@ -914,10 +913,10 @@ fn remap_floating(workspace: &mut Workspace, key: &str, old: Size, new: Size) {
     for placement in workspace.floating.values_mut() {
         remap_viewport(&mut placement.viewport, key, old, new);
     }
-    if let Some(fullscreen) = &mut workspace.fullscreen {
-        if let RestorePlacement::Floating { viewport } = &mut fullscreen.restore {
-            remap_viewport(viewport, key, old, new);
-        }
+    if let Some(fullscreen) = &mut workspace.fullscreen
+        && let RestorePlacement::Floating { viewport } = &mut fullscreen.restore
+    {
+        remap_viewport(viewport, key, old, new);
     }
 }
 

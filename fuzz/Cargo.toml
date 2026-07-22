@@ -1,0 +1,19 @@
+[package]
+name = "astera-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+astera-core = { path = "../crates/astera-core" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "layout_transactions"
+path = "fuzz_targets/layout_transactions.rs"
+test = false
+doc = false
+bench = false

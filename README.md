@@ -33,6 +33,27 @@ cargo test --workspace
 cargo run -p astera
 ```
 
+## Testing
+
+`cargo test --workspace --all-targets` runs deterministic core, configuration, IPC and
+compositor-state tests. The layout solver also uses reproducible `proptest` cases; a failure
+prints a seed that must be retained when turning it into a regression test. Key repeat and
+animation-facing state use an injectable monotonic clock, so tests do not sleep.
+
+GitHub Actions runs formatting, Clippy, tests, a nested Xvfb smoke test, coverage, Miri and an
+aarch64 portability check. Nightly jobs add ASan and a five-minute layout fuzz run. Run the same
+fuzzer locally with:
+
+```sh
+cargo install cargo-fuzz
+cargo fuzz run layout_transactions
+```
+
+Core line coverage is currently ratcheted from its measured 77% baseline toward 90%, and the
+whole workspace from 51% toward 70%; pull requests already require 90% coverage on changed lines.
+Coverage XML and any render diagnostics are uploaded as workflow artifacts. Pixel golden files
+are never accepted automatically.
+
 The default is the nested winit backend. To run directly on DRM/KMS through
 libseat, use:
 

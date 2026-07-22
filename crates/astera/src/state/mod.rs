@@ -1,11 +1,13 @@
-use std::{collections::BTreeMap, os::fd::OwnedFd, time::Instant};
+use std::{collections::BTreeMap, os::fd::OwnedFd, sync::Arc};
 
+mod clock;
 mod config_watcher;
 mod geometry;
 mod key_repeat;
 mod model;
 mod process;
 
+use clock::{Clock, SystemClock};
 use config_watcher::ConfigWatcher;
 use geometry::{
     layer_rank, mode_layer, output_transform, physical_point, point_inside, saturating_i32,
@@ -105,6 +107,7 @@ pub struct Astera {
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
     drag: Option<DragState>,
     key_repeat: KeyRepeatState,
+    clock: Arc<dyn Clock>,
     config: Config,
     config_watcher: Option<ConfigWatcher>,
     should_quit: bool,
@@ -113,6 +116,10 @@ pub struct Astera {
 
 impl Astera {
     pub fn new(display: &DisplayHandle, config: Config) -> Self {
+        Self::new_with_clock(display, config, Arc::new(SystemClock))
+    }
+
+    fn new_with_clock(display: &DisplayHandle, config: Config, clock: Arc<dyn Clock>) -> Self {
         let compositor_state = CompositorState::new::<Self>(display);
         let xdg_shell_state = XdgShellState::new::<Self>(display);
         let layer_shell_state = WlrLayerShellState::new::<Self>(display);
@@ -200,6 +207,7 @@ impl Astera {
             pointer_location: (0.0, 0.0).into(),
             drag: None,
             key_repeat: KeyRepeatState::default(),
+            clock,
             config,
             config_watcher: None,
             should_quit: false,
@@ -272,10 +280,10 @@ impl Astera {
         }
         self.display.disable_global::<Self>(runtime.global);
         self.layers.retain(|mapped| mapped.output != output);
-        if self.active_output == output {
-            if let Some(next) = self.desktop.outputs.keys().next().copied() {
-                self.active_output = next;
-            }
+        if self.active_output == output
+            && let Some(next) = self.desktop.outputs.keys().next().copied()
+        {
+            self.active_output = next;
         }
         self.reflow_outputs();
         tracing::info!(?output, ?event, "output disconnected");
@@ -302,10 +310,11 @@ impl Astera {
                     event.time_msec(),
                     move |state, modifiers, key| {
                         if !pressed {
-                            return if state
-                                .key_repeat
-                                .release(key_code, state.config.key_repeat.rate)
-                            {
+                            return if state.key_repeat.release(
+                                key_code,
+                                state.config.key_repeat.rate,
+                                state.clock.now(),
+                            ) {
                                 FilterResult::Intercept(())
                             } else {
                                 FilterResult::Forward
@@ -598,18 +607,18 @@ impl Astera {
             return;
         }
 
-        if state == BackendButtonState::Pressed {
-            if let Some((surface, _, window)) = self.surface_under(self.pointer_location) {
-                if let Some(window) = window {
-                    if self.desktop.find_window(window).is_ok() {
-                        let _ = self.desktop.focus_window(window);
-                    }
-                    self.sync_keyboard_focus();
-                } else if self.layer_accepts_keyboard(&surface) {
-                    let keyboard = self.keyboard.clone();
-                    let serial = self.next_serial();
-                    keyboard.set_focus(self, Some(surface), serial);
+        if state == BackendButtonState::Pressed
+            && let Some((surface, _, window)) = self.surface_under(self.pointer_location)
+        {
+            if let Some(window) = window {
+                if self.desktop.find_window(window).is_ok() {
+                    let _ = self.desktop.focus_window(window);
                 }
+                self.sync_keyboard_focus();
+            } else if self.layer_accepts_keyboard(&surface) {
+                let keyboard = self.keyboard.clone();
+                let serial = self.next_serial();
+                keyboard.set_focus(self, Some(surface), serial);
             }
         }
         let pointer = self.pointer.clone();
@@ -796,6 +805,7 @@ impl Astera {
                 modifiers,
                 binding.action,
                 self.config.key_repeat.delay_ms,
+                self.clock.now(),
             );
         }
         true
@@ -807,7 +817,7 @@ impl Astera {
         let current = BindingModifiers::from_state(state.ctrl, state.alt, state.shift, state.logo);
         let Some(action) =
             self.key_repeat
-                .next_action(Instant::now(), current, self.config.key_repeat.rate)
+                .next_action(self.clock.now(), current, self.config.key_repeat.rate)
         else {
             return;
         };
@@ -967,7 +977,7 @@ impl Astera {
             return;
         };
         let path = watcher.path().to_owned();
-        let Some(result) = watcher.poll(Instant::now()) else {
+        let Some(result) = watcher.poll(self.clock.now()) else {
             return;
         };
         match result {
@@ -1927,10 +1937,27 @@ delegate_data_device!(Astera);
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
     use astera_core::{Scale120, WorkspaceTransaction};
     use smithay::reexports::wayland_server::Display;
 
+    use super::clock::testing::ManualClock;
     use super::*;
+
+    #[test]
+    fn compositor_time_can_be_advanced_without_sleeping() {
+        let display = Display::<Astera>::new().unwrap();
+        let start = Instant::now();
+        let clock = Arc::new(ManualClock::new(start));
+        let state = Astera::new_with_clock(&display.handle(), Config::default(), clock.clone());
+        assert_eq!(state.clock.now(), start);
+        clock.advance(Duration::from_millis(300));
+        assert_eq!(state.clock.now(), start + Duration::from_millis(300));
+    }
 
     #[test]
     fn hotplug_moves_disconnected_workspaces_to_primary() {

@@ -537,6 +537,7 @@ fn viewport_rect_to_world(rect: Rect, workspace: &Workspace, viewport: Size) -> 
 mod tests {
     use super::*;
     use crate::WorkspaceId;
+    use proptest::prelude::*;
 
     fn insert(solver: &RadialSolver, workspace: &mut Workspace, id: u64, anchor: Point) {
         solver
@@ -694,5 +695,76 @@ mod tests {
             .unwrap();
         assert_eq!(workspace.tiled[&WindowId(2)].geometry.origin.x, 108);
         assert!(workspace.tiled_windows_are_stable(8));
+    }
+
+    fn apply_fixture(fixture: &[(i16, i16, u16, u16)]) -> Result<Workspace, LayoutError> {
+        let solver = RadialSolver::new(8);
+        let mut workspace = Workspace::new(WorkspaceId(1));
+        for (index, &(x, y, width, height)) in fixture.iter().enumerate() {
+            solver.apply(
+                &mut workspace,
+                WindowTransaction::InsertTiled {
+                    id: WindowId(index as u64 + 1),
+                    size: Size::new(i64::from(width), i64::from(height)),
+                    anchor: Point::new(i64::from(x), i64::from(y)),
+                    seed_direction: if index % 2 == 0 {
+                        Direction::RIGHT
+                    } else {
+                        Direction::new(0.0, 1.0)
+                    },
+                },
+            )?;
+        }
+        Ok(workspace)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            max_shrink_iters: 4096,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn arbitrary_insertions_are_stable_and_deterministic(
+            fixture in prop::collection::vec(
+                (-2_000_i16..=2_000, -2_000_i16..=2_000, 1_u16..=600, 1_u16..=400),
+                0..20,
+            )
+        ) {
+            let first = apply_fixture(&fixture);
+            let second = apply_fixture(&fixture);
+            prop_assert!(first.is_ok(), "first solve failed: {first:?}");
+            prop_assert!(second.is_ok(), "second solve failed: {second:?}");
+            let first = first.unwrap();
+            let second = second.unwrap();
+            prop_assert!(first.tiled_windows_are_stable(8));
+            prop_assert_eq!(first.tiled, second.tiled);
+            prop_assert_eq!(first.generation, fixture.len() as u64);
+        }
+
+        #[test]
+        fn failed_insert_is_atomic(
+            x in -10_000_i64..=10_000,
+            y in -10_000_i64..=10_000,
+            invalid_width in -100_i64..=0,
+        ) {
+            let solver = RadialSolver::new(8);
+            let mut workspace = Workspace::new(WorkspaceId(1));
+            insert(&solver, &mut workspace, 1, Point::new(x, y));
+            let before = workspace.clone();
+            let result = solver.apply(
+                &mut workspace,
+                WindowTransaction::InsertTiled {
+                    id: WindowId(2),
+                    size: Size::new(invalid_width, 100),
+                    anchor: Point::new(x, y),
+                    seed_direction: Direction::new(-1.0, 0.0),
+                },
+            );
+            prop_assert_eq!(result, Err(LayoutError::InvalidSize));
+            prop_assert_eq!(workspace.tiled, before.tiled);
+            prop_assert_eq!(workspace.generation, before.generation);
+        }
     }
 }

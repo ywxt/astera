@@ -47,6 +47,7 @@ use smithay::{
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::{
+    backend::native_policy::{ModeCandidate, select_mode, stable_output_key},
     ipc_server::IpcServer,
     state::{Astera, ClientState, send_frames_surface_tree},
 };
@@ -94,15 +95,7 @@ fn edid_output_key(device: &impl ControlDevice, connector: connector::Handle) ->
         if edid.len() < 16 {
             continue;
         }
-        let manufacturer = u16::from_be_bytes([edid[8], edid[9]]);
-        let product = u16::from_le_bytes([edid[10], edid[11]]);
-        let serial = u32::from_le_bytes([edid[12], edid[13], edid[14], edid[15]]);
-        let fingerprint = edid.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        });
-        return Some(format!(
-            "edid:{manufacturer:04x}:{product:04x}:{serial:08x}:{fingerprint:016x}"
-        ));
+        return Some(stable_output_key(Some(&edid), "invalid-edid"));
     }
     None
 }
@@ -193,12 +186,21 @@ impl NativeLoop {
                         tracing::warn!(?node, connector = ?connector.handle(), "connector has no usable mode");
                         continue;
                     }
-                    let mode = connector
+                    let candidates = connector
                         .modes()
                         .iter()
-                        .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
-                        .copied()
-                        .unwrap_or(connector.modes()[0]);
+                        .map(|mode| {
+                            let (width, height) = mode.size();
+                            ModeCandidate {
+                                width,
+                                height,
+                                refresh_millihz: mode.vrefresh(),
+                                preferred: mode.mode_type().contains(ModeTypeFlags::PREFERRED),
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let mode = connector.modes()
+                        [select_mode(&candidates).expect("non-empty connector mode list")];
                     let (width, height) = mode.size();
                     let name = format!(
                         "{}-{}",
@@ -281,10 +283,10 @@ impl NativeLoop {
                     if let Err(error) = self.state.disconnect_output(id) {
                         tracing::error!(?node, ?id, %error, "could not unregister output");
                     }
-                    if let Some(crtc) = crtc {
-                        if let Some(device) = self.devices.get_mut(&node) {
-                            device.outputs.remove(&crtc);
-                        }
+                    if let Some(crtc) = crtc
+                        && let Some(device) = self.devices.get_mut(&node)
+                    {
+                        device.outputs.remove(&crtc);
                     }
                 }
             }
@@ -395,10 +397,10 @@ impl NativeLoop {
         ) {
             Ok(frame) if frame.is_empty => {}
             Ok(frame) => {
-                if frame.needs_sync() {
-                    if let PrimaryPlaneElement::Swapchain(primary) = frame.primary_element {
-                        let _ = primary.sync.wait();
-                    }
+                if frame.needs_sync()
+                    && let PrimaryPlaneElement::Swapchain(primary) = frame.primary_element
+                {
+                    let _ = primary.sync.wait();
                 }
                 if let Err(error) = surface.drm.queue_frame(()) {
                     tracing::warn!(?node, ?crtc, ?error, "could not queue DRM frame");

@@ -38,16 +38,14 @@ impl KeyRepeatState {
         self.intercepted.insert(keycode);
     }
 
-    pub(super) fn release(&mut self, keycode: Keycode, rate: u32) -> bool {
+    pub(super) fn release(&mut self, keycode: Keycode, rate: u32, now: Instant) -> bool {
         let intercepted = self.intercepted.remove(&keycode);
         // Remember whether removing this key exposes an older repeat candidate.
         let was_active = self.held.last().is_some_and(|held| held.keycode == keycode);
         self.held.retain(|held| held.keycode != keycode);
-        if was_active {
-            if let Some(previous) = self.held.last_mut() {
-                // Resume after a full interval instead of firing the older action immediately.
-                previous.next_at = Instant::now() + repeat_interval(rate);
-            }
+        if was_active && let Some(previous) = self.held.last_mut() {
+            // Resume after a full interval instead of firing the older action immediately.
+            previous.next_at = now + repeat_interval(rate);
         }
         intercepted
     }
@@ -58,6 +56,7 @@ impl KeyRepeatState {
         modifiers: Modifiers,
         action: Action,
         delay_ms: u64,
+        now: Instant,
     ) {
         // A second press for the same key replaces stale state instead of creating two timers.
         self.held.retain(|held| held.keycode != keycode);
@@ -65,7 +64,7 @@ impl KeyRepeatState {
             keycode,
             modifiers,
             action,
-            next_at: Instant::now() + Duration::from_millis(delay_ms),
+            next_at: now + Duration::from_millis(delay_ms),
         });
     }
 
@@ -95,4 +94,32 @@ impl KeyRepeatState {
 
 fn repeat_interval(rate: u32) -> Duration {
     Duration::from_secs_f64(1.0 / rate as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(raw: u32) -> Keycode {
+        Keycode::new(raw)
+    }
+
+    #[test]
+    fn repeat_deadline_is_driven_by_caller_clock() {
+        let start = Instant::now();
+        let mut state = KeyRepeatState::default();
+        let modifiers = Modifiers::default();
+        state.intercept(key(30));
+        state.register(key(30), modifiers, Action::Quit, 300, start);
+
+        assert_eq!(state.next_action(start, modifiers, 25), None);
+        assert_eq!(
+            state.next_action(start + Duration::from_millis(299), modifiers, 25),
+            None
+        );
+        assert_eq!(
+            state.next_action(start + Duration::from_millis(300), modifiers, 25),
+            Some(Action::Quit)
+        );
+    }
 }
