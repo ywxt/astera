@@ -14,7 +14,18 @@ use wayland_client::{
     protocol::{wl_compositor::WlCompositor, wl_registry::WlRegistry, wl_surface::WlSurface},
 };
 use wayland_protocols::xdg::shell::client::{
-    xdg_surface::XdgSurface, xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
+    xdg_popup::XdgPopup, xdg_positioner::XdgPositioner, xdg_surface::XdgSurface,
+    xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
+};
+use wayland_protocols::wp::{
+    fractional_scale::v1::client::{
+        wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        wp_fractional_scale_v1::WpFractionalScaleV1,
+    },
+    viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
+};
+use wayland_protocols_wlr::layer_shell::v1::client::{
+    zwlr_layer_shell_v1::ZwlrLayerShellV1, zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
 };
 
 use super::clock::testing::ManualClock;
@@ -37,6 +48,32 @@ impl Dispatch<WlRegistry, wayland_client::globals::GlobalListContents> for TestC
 delegate_noop!(TestClient: ignore WlCompositor);
 delegate_noop!(TestClient: ignore WlSurface);
 delegate_noop!(TestClient: ignore XdgToplevel);
+delegate_noop!(TestClient: ignore XdgPopup);
+delegate_noop!(TestClient: ignore XdgPositioner);
+delegate_noop!(TestClient: ignore WpViewporter);
+delegate_noop!(TestClient: ignore WpViewport);
+delegate_noop!(TestClient: ignore WpFractionalScaleManagerV1);
+delegate_noop!(TestClient: ignore WpFractionalScaleV1);
+delegate_noop!(TestClient: ignore ZwlrLayerShellV1);
+
+impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
+    fn event(
+        _state: &mut Self,
+        proxy: &ZwlrLayerSurfaceV1,
+        event: wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if let wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event::Configure {
+            serial,
+            ..
+        } = event
+        {
+            proxy.ack_configure(serial);
+        }
+    }
+}
 
 impl Dispatch<XdgWmBase, ()> for TestClient {
     fn event(
@@ -84,6 +121,81 @@ fn dispatch_until(
         thread::yield_now();
     }
     panic!("Wayland harness condition did not become true");
+}
+
+#[test]
+fn layer_exclusive_zone_reduces_usable_viewport() {
+    use wayland_protocols_wlr::layer_shell::v1::client::{
+        zwlr_layer_shell_v1::Layer, zwlr_layer_surface_v1::Anchor,
+    };
+
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    state
+        .configure_output(
+            OutputId(0),
+            Size::new(1280, 720),
+            Size::new(1280, 720),
+            Scale120::ONE,
+            OutputTransform::Normal,
+        )
+        .unwrap();
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals
+            .bind::<ZwlrLayerShellV1, _, _>(&queue, 1..=4, ())
+            .unwrap();
+        let xdg = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let viewporter = globals.bind::<WpViewporter, _, _>(&queue, 1..=1, ()).unwrap();
+        let fractional = globals
+            .bind::<WpFractionalScaleManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let viewport = viewporter.get_viewport(&surface, &queue, ());
+        viewport.set_destination(1280, 720);
+        let _fractional_scale = fractional.get_fractional_scale(&surface, &queue, ());
+        let layer =
+            shell.get_layer_surface(&surface, None, Layer::Top, "test-panel".into(), &queue, ());
+        layer.set_size(0, 32);
+        layer.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right);
+        layer.set_exclusive_zone(32);
+        surface.commit();
+
+        let popup_surface = compositor.create_surface(&queue, ());
+        let popup_xdg_surface = xdg.get_xdg_surface(&popup_surface, &queue, ());
+        let positioner = xdg.create_positioner(&queue, ());
+        positioner.set_size(200, 120);
+        positioner.set_anchor_rect(0, 0, 1, 1);
+        let _popup = popup_xdg_surface.get_popup(None, &positioner, &queue, ());
+        popup_surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        state
+            .usable_rect(OutputId(0))
+            .is_some_and(|rect| rect.origin.y == 32)
+    });
+    let usable = state.usable_rect(OutputId(0)).unwrap();
+    assert_eq!(usable, astera_core::Rect::new(0, 32, 1280, 688));
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
 }
 
 #[test]

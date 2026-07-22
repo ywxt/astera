@@ -32,6 +32,7 @@ winit = { version = "0.30", default-features = false, features = ["wayland", "x1
 xkbcommon = "0.8"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
