@@ -155,7 +155,7 @@ impl Astera {
         output_id: OutputId,
         id: WindowId,
     ) -> Option<(Point, Size, f64, WindowMode)> {
-        let _output = self.desktop.outputs.get(&output_id)?;
+        let output = self.desktop.outputs.get(&output_id)?;
         let usable = self.usable_rect(output_id)?;
         let workspace = self.desktop.workspace_for_output(output_id)?;
         let mode = workspace.window_mode(id)?;
@@ -190,7 +190,8 @@ impl Astera {
                 }
                 Some((rect.origin, rect.size, 1.0, mode))
             }
-            WindowMode::Fullscreen => Some((usable.origin, usable.size, 1.0, mode)),
+            WindowMode::Maximized => Some((usable.origin, usable.size, 1.0, mode)),
+            WindowMode::Fullscreen => Some((Point::ORIGIN, output.output.logical_size, 1.0, mode)),
         }
     }
 }

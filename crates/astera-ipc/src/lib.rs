@@ -159,6 +159,7 @@ pub mod wire {
         pub enum WindowMode {
             Tiled,
             Floating,
+            Maximized,
             Fullscreen,
         }
         #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -245,6 +246,7 @@ pub mod wire {
                 match value {
                     astera_core::WindowMode::Tiled => Self::Tiled,
                     astera_core::WindowMode::Floating => Self::Floating,
+                    astera_core::WindowMode::Maximized => Self::Maximized,
                     astera_core::WindowMode::Fullscreen => Self::Fullscreen,
                 }
             }
@@ -303,6 +305,7 @@ pub mod wire {
                 match value {
                     WindowMode::Tiled => Self::Tiled,
                     WindowMode::Floating => Self::Floating,
+                    WindowMode::Maximized => Self::Maximized,
                     WindowMode::Fullscreen => Self::Fullscreen,
                 }
             }
@@ -426,10 +429,11 @@ pub mod wire {
             Error(Error),
         }
 
-        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+        #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
         pub struct DesktopSnapshot {
             pub active_output: Option<OutputId>,
             pub primary_output: Option<OutputId>,
+            pub focused_window: Option<WindowId>,
             pub outputs: Vec<OutputSnapshot>,
             pub layers: Vec<LayerSnapshot>,
             pub workspaces: Vec<WorkspaceSnapshot>,
@@ -536,20 +540,29 @@ pub mod wire {
         pub enum WindowPlacement {
             Tiled { world_geometry: Rect },
             Floating { viewport_geometry: Rect },
-            Maximized { restore: RestorePlacement },
-            Fullscreen { restore: RestorePlacement },
+            Maximized { restore: BaseRestore },
+            Fullscreen { restore: FullscreenRestore },
         }
 
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-        pub enum RestorePlacement {
+        pub enum BaseRestore {
             Tiled { world_geometry: Rect },
             Floating { viewport_geometry: Rect },
-            Maximized { viewport_geometry: Rect },
+        }
+
+        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+        pub enum FullscreenRestore {
+            Tiled { world_geometry: Rect },
+            Floating { viewport_geometry: Rect },
+            Maximized { restore: BaseRestore },
         }
 
         #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
         pub struct ConfigSnapshot {
             pub source: Option<String>,
+            pub generation: u64,
+            pub failed: bool,
+            pub error: Option<String>,
         }
 
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -596,21 +609,31 @@ pub mod wire {
             WindowClosed {
                 window: WindowId,
             },
-            ActivationChanged {
+            WorkspaceActivated {
                 output: OutputId,
+                workspace: WorkspaceId,
+                focused: bool,
+            },
+            WorkspaceActiveWindowChanged {
                 workspace: WorkspaceId,
                 window: Option<WindowId>,
             },
-            FocusChanged {
+            WindowFocusChanged {
+                id: Option<WindowId>,
+            },
+            ActiveOutputChanged {
                 output: Option<OutputId>,
-                workspace: Option<WorkspaceId>,
-                window: Option<WindowId>,
+            },
+            PrimaryOutputChanged {
+                output: Option<OutputId>,
             },
             CameraChanged {
                 camera: CameraSnapshot,
             },
             ConfigLoaded {
-                config: ConfigSnapshot,
+                generation: u64,
+                failed: bool,
+                error: Option<String>,
             },
             PlacementChanged {
                 window: WindowId,
@@ -655,14 +678,30 @@ pub mod wire {
                         }));
                         if let Some(full) = &workspace.fullscreen {
                             let restore = match &full.restore {
-                                astera_core::RestorePlacement::Tiled { world_rect } => {
-                                    RestorePlacement::Tiled {
+                                astera_core::FullscreenRestorePlacement::Tiled { world_rect } => {
+                                    FullscreenRestore::Tiled {
                                         world_geometry: (*world_rect).into(),
                                     }
                                 }
-                                astera_core::RestorePlacement::Floating { viewport } => {
-                                    RestorePlacement::Floating {
+                                astera_core::FullscreenRestorePlacement::Floating { viewport } => {
+                                    FullscreenRestore::Floating {
                                         viewport_geometry: viewport.rect.into(),
+                                    }
+                                }
+                                astera_core::FullscreenRestorePlacement::Maximized { restore } => {
+                                    FullscreenRestore::Maximized {
+                                        restore: match restore {
+                                            astera_core::RestorePlacement::Tiled { world_rect } => {
+                                                BaseRestore::Tiled {
+                                                    world_geometry: (*world_rect).into(),
+                                                }
+                                            }
+                                            astera_core::RestorePlacement::Floating {
+                                                viewport,
+                                            } => BaseRestore::Floating {
+                                                viewport_geometry: viewport.rect.into(),
+                                            },
+                                        },
                                     }
                                 }
                             };
@@ -726,6 +765,7 @@ pub mod wire {
                 Self {
                     active_output: None,
                     primary_output: desktop.primary_output.map(Into::into),
+                    focused_window: None,
                     outputs,
                     layers: Vec::new(),
                     workspaces,
@@ -739,6 +779,18 @@ pub mod wire {
         impl DesktopSnapshot {
             pub fn with_active_output(mut self, output: Option<astera_core::OutputId>) -> Self {
                 self.active_output = output.map(Into::into);
+                self.focused_window = output
+                    .and_then(|output| {
+                        self.outputs
+                            .iter()
+                            .find(|candidate| candidate.id == output.into())
+                    })
+                    .and_then(|output| {
+                        self.workspaces
+                            .iter()
+                            .find(|workspace| workspace.id == output.active_workspace)
+                    })
+                    .and_then(|workspace| workspace.active_window);
                 self
             }
         }
@@ -820,7 +872,7 @@ mod tests {
             event: wire::v1::Event::PlacementChanged {
                 window: wire::v1::WindowId(7),
                 placement: wire::v1::WindowPlacement::Fullscreen {
-                    restore: wire::v1::RestorePlacement::Tiled {
+                    restore: wire::v1::FullscreenRestore::Tiled {
                         world_geometry: wire::v1::Rect::new(1, 2, 3, 4),
                     },
                 },
@@ -830,6 +882,19 @@ mod tests {
         assert_eq!(
             decode_frame::<wire::v1::EventEnvelope>(&encoded, 1).unwrap(),
             event
+        );
+
+        let nested = wire::v1::WindowPlacement::Fullscreen {
+            restore: wire::v1::FullscreenRestore::Maximized {
+                restore: wire::v1::BaseRestore::Floating {
+                    viewport_geometry: wire::v1::Rect::new(5, 6, 7, 8),
+                },
+            },
+        };
+        let encoded = encode_frame(1, &nested).unwrap();
+        assert_eq!(
+            decode_frame::<wire::v1::WindowPlacement>(&encoded, 1).unwrap(),
+            nested
         );
     }
 }

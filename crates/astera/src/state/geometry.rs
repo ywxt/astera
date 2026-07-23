@@ -8,7 +8,7 @@ pub(super) fn mode_layer(mode: WindowMode) -> u8 {
     // Values intentionally leave slots for layer-shell surfaces between window classes.
     match mode {
         WindowMode::Tiled => 2,
-        WindowMode::Floating => 3,
+        WindowMode::Floating | WindowMode::Maximized => 3,
         WindowMode::Fullscreen => 5,
     }
 }

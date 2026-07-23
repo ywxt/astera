@@ -143,6 +143,7 @@ mod tests {
         let snapshot = DesktopSnapshot {
             active_output: Some(OutputId(2)),
             primary_output: Some(OutputId(2)),
+            focused_window: Some(WindowId(9)),
             outputs: vec![OutputSnapshot {
                 id: OutputId(2),
                 stable_key: "DP-1".to_owned(),

@@ -45,12 +45,7 @@ impl Astera {
                 if returns_state {
                     Response::Success(Success::State {
                         sequence,
-                        snapshot: DesktopSnapshot::from(&self.desktop).with_active_output(
-                            self.desktop
-                                .outputs
-                                .contains_key(&self.active_output)
-                                .then_some(self.active_output),
-                        ),
+                        snapshot: self.public_snapshot(),
                     })
                 } else {
                     Response::Success(Success::Handled { sequence })
@@ -75,15 +70,22 @@ impl Astera {
         let Some(mapped) = self.windows.iter().find(|mapped| mapped.id == window) else {
             return;
         };
-        let size = if mode == WindowMode::Fullscreen {
-            self.desktop
+        let size = match mode {
+            WindowMode::Fullscreen => self
+                .desktop
+                .workspace_location(workspace_id)
+                .ok()
+                .and_then(|location| location.output)
+                .and_then(|output| self.desktop.output(output))
+                .map(|output| output.logical_size),
+            WindowMode::Maximized => self
+                .desktop
                 .workspace_location(workspace_id)
                 .ok()
                 .and_then(|location| location.output)
                 .and_then(|output| self.usable_rect(output))
-                .map(|rect| rect.size)
-        } else {
-            workspace.window_size(window)
+                .map(|rect| rect.size),
+            WindowMode::Tiled | WindowMode::Floating => workspace.window_size(window),
         };
         mapped.surface.with_pending_state(|state| {
             state.size =
@@ -93,19 +95,41 @@ impl Astera {
             } else {
                 state.states.unset(xdg_toplevel::State::Fullscreen);
             }
+            if mode == WindowMode::Maximized {
+                state.states.set(xdg_toplevel::State::Maximized);
+            } else {
+                state.states.unset(xdg_toplevel::State::Maximized);
+            }
         });
         mapped.surface.send_pending_configure();
     }
 
     pub(super) fn configure_fullscreen_windows(&self) {
         for workspace in self.desktop.workspaces() {
-            let output = self
+            let Some(output_id) = self
                 .desktop
                 .workspace_location(workspace.id)
                 .ok()
-                .and_then(|location| location.output);
-            let (Some(fullscreen), Some(output_id)) = (workspace.fullscreen.as_ref(), output)
+                .and_then(|location| location.output)
             else {
+                continue;
+            };
+            if let Some(maximized) = workspace.maximized.as_ref()
+                && let Some(mapped) = self
+                    .windows
+                    .iter()
+                    .find(|mapped| mapped.id == maximized.window)
+            {
+                let size = self.usable_rect(output_id).unwrap().size;
+                mapped.surface.with_pending_state(|state| {
+                    state.size =
+                        Some((saturating_i32(size.width), saturating_i32(size.height)).into());
+                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                    state.states.set(xdg_toplevel::State::Maximized);
+                });
+                mapped.surface.send_pending_configure();
+            }
+            let Some(fullscreen) = workspace.fullscreen.as_ref() else {
                 continue;
             };
             let Some(mapped) = self
@@ -115,10 +139,11 @@ impl Astera {
             else {
                 continue;
             };
-            let size = self.usable_rect(output_id).unwrap().size;
+            let size = self.desktop.outputs[&output_id].output.logical_size;
             mapped.surface.with_pending_state(|state| {
                 state.size = Some((saturating_i32(size.width), saturating_i32(size.height)).into());
                 state.states.set(xdg_toplevel::State::Fullscreen);
+                state.states.unset(xdg_toplevel::State::Maximized);
             });
             mapped.surface.send_pending_configure();
         }

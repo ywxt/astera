@@ -79,6 +79,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
 
         let size = backend.window_size();
         state.update_output_size(i64::from(size.w), i64::from(size.h));
+        state.publish_public_state();
         if size != tracked_size {
             tracked_size = size;
             damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Flipped180);

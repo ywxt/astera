@@ -7,17 +7,20 @@ use std::{
 
 mod clock;
 mod config_watcher;
+mod event_hub;
 mod geometry;
 mod key_repeat;
 mod model;
 mod output;
 mod process;
+mod public_state;
 mod scene;
 #[cfg(test)]
 mod snapshot;
 
 use clock::{Clock, SystemClock};
 use config_watcher::ConfigWatcher;
+use event_hub::EventHub;
 use geometry::{
     layer_rank, mode_layer, output_transform, physical_point, point_inside, saturating_i32,
 };
@@ -33,9 +36,7 @@ use astera_core::{
     Desktop, Output, OutputId, OutputTransform, Point, Size, WindowId, WindowMode,
     WindowTransaction, WorkspaceId, WorkspaceTransaction,
 };
-use astera_ipc::{
-    Command, DesktopSnapshot, ErrorCode, OutputSelector, Response, Success, WorkspaceSelector,
-};
+use astera_ipc::{Command, ErrorCode, OutputSelector, Response, Success, WorkspaceSelector};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::{
     backend::{
@@ -108,12 +109,18 @@ pub struct Astera {
     windows: Vec<MappedWindow>,
     layers: Vec<MappedLayer>,
     next_window_id: u64,
+    next_layer_id: u64,
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
     drag: Option<DragState>,
     key_repeat: KeyRepeatState,
     clock: Arc<dyn Clock>,
     config: Config,
+    config_source: Option<String>,
+    config_generation: u64,
+    config_failed: bool,
+    config_error: Option<String>,
     config_watcher: Option<ConfigWatcher>,
+    event_hub: EventHub,
     should_quit: bool,
     output_configuration_supported: bool,
     pending_dmabufs: Vec<(Dmabuf, ImportNotifier)>,
@@ -158,7 +165,7 @@ impl Astera {
         );
         let output_global = wayland_output.create_global::<Self>(display);
         let initial_mode = Mode {
-            size: (1, 1).into(),
+            size: (1280, 720).into(),
             refresh: 60_000,
         };
         wayland_output.change_current_state(
@@ -228,12 +235,18 @@ impl Astera {
             windows: Vec::new(),
             layers: Vec::new(),
             next_window_id: 1,
+            next_layer_id: 1,
             pointer_location: (0.0, 0.0).into(),
             drag: None,
             key_repeat: KeyRepeatState::default(),
             clock,
             config,
+            config_source: None,
+            config_generation: 0,
+            config_failed: false,
+            config_error: None,
             config_watcher: None,
+            event_hub: EventHub::default(),
             should_quit: false,
             output_configuration_supported: true,
             pending_dmabufs: Vec::new(),
@@ -576,7 +589,7 @@ impl Astera {
         let Some((_, _, _, mode)) = self.visual_geometry(window) else {
             return;
         };
-        if mode == WindowMode::Fullscreen {
+        if matches!(mode, WindowMode::Maximized | WindowMode::Fullscreen) {
             return;
         }
         let workspace_id = self.desktop.find_window(window).unwrap();
@@ -586,7 +599,7 @@ impl Astera {
         let start = match mode {
             WindowMode::Tiled => workspace.tiled[&window].geometry.origin,
             WindowMode::Floating => workspace.floating[&window].viewport.rect.origin,
-            WindowMode::Fullscreen => unreachable!(),
+            WindowMode::Maximized | WindowMode::Fullscreen => unreachable!(),
         };
         self.drag = Some(DragState {
             window,
@@ -681,7 +694,7 @@ impl Astera {
                     viewport_size,
                 }
             }
-            WindowMode::Fullscreen => return,
+            WindowMode::Maximized | WindowMode::Fullscreen => return,
         };
         if let Err(error) = self.desktop.apply_window(workspace, transaction) {
             tracing::warn!(%error, window = ?drag.window, "drag transaction failed");
@@ -873,7 +886,9 @@ impl Astera {
             .window_mode(window)
         {
             Some(WindowMode::Floating) => Ok(WindowMode::Tiled),
-            Some(WindowMode::Tiled | WindowMode::Fullscreen) => Ok(WindowMode::Floating),
+            Some(WindowMode::Tiled | WindowMode::Maximized | WindowMode::Fullscreen) => {
+                Ok(WindowMode::Floating)
+            }
             None => Err(anyhow!("focused window has no mode")),
         }
     }
@@ -883,10 +898,17 @@ impl Astera {
         let state = self.desktop.workspace(workspace).unwrap();
         match state.window_mode(window) {
             Some(WindowMode::Fullscreen) => match &state.fullscreen.as_ref().unwrap().restore {
-                astera_core::RestorePlacement::Tiled { .. } => Ok(WindowMode::Tiled),
-                astera_core::RestorePlacement::Floating { .. } => Ok(WindowMode::Floating),
+                astera_core::FullscreenRestorePlacement::Tiled { .. } => Ok(WindowMode::Tiled),
+                astera_core::FullscreenRestorePlacement::Floating { .. } => {
+                    Ok(WindowMode::Floating)
+                }
+                astera_core::FullscreenRestorePlacement::Maximized { .. } => {
+                    Ok(WindowMode::Maximized)
+                }
             },
-            Some(WindowMode::Tiled | WindowMode::Floating) => Ok(WindowMode::Fullscreen),
+            Some(WindowMode::Tiled | WindowMode::Floating | WindowMode::Maximized) => {
+                Ok(WindowMode::Fullscreen)
+            }
             None => Err(anyhow!("focused window has no mode")),
         }
     }
@@ -901,7 +923,11 @@ impl Astera {
 
     pub fn watch_config(&mut self, path: std::path::PathBuf) {
         tracing::info!(path = %path.display(), "configuration watcher enabled");
-        self.config_watcher = Some(ConfigWatcher::new(path));
+        let watcher = ConfigWatcher::new(path);
+        self.config_source = watcher
+            .exists()
+            .then(|| watcher.path().to_string_lossy().into_owned());
+        self.config_watcher = Some(watcher);
     }
 
     pub fn poll_config(&mut self) {
@@ -917,10 +943,16 @@ impl Astera {
                 // apply_config is transactional; a rejected layout keeps the old config alive.
                 if let Err(error) = self.apply_config(config) {
                     tracing::error!(path = %path.display(), %error, "configuration reload rejected");
+                    self.record_config_loaded(Some(error.to_string()));
+                } else {
+                    self.config_source =
+                        path.is_file().then(|| path.to_string_lossy().into_owned());
+                    self.record_config_loaded(None);
                 }
             }
             Err(error) => {
-                tracing::error!(path = %path.display(), %error, "configuration reload failed")
+                tracing::error!(path = %path.display(), %error, "configuration reload failed");
+                self.record_config_loaded(Some(error.to_string()));
             }
         }
     }

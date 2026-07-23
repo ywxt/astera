@@ -68,6 +68,7 @@ pub(super) struct DragState {
 
 #[derive(Clone, Debug)]
 pub(super) struct MappedLayer {
+    pub(super) id: u64,
     pub(super) surface: LayerSurface,
     pub(super) layer: Layer,
     pub(super) output: OutputId,

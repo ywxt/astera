@@ -18,6 +18,7 @@ pub enum WindowMode {
     #[default]
     Tiled,
     Floating,
+    Maximized,
     Fullscreen,
 }
 
@@ -185,13 +186,13 @@ mod tests {
     fn fullscreen_size_uses_saved_mode_geometry() {
         let tiled = FullscreenPlacement {
             window: WindowId(1),
-            restore: RestorePlacement::Tiled {
+            restore: FullscreenRestorePlacement::Tiled {
                 world_rect: Rect::new(0, 0, 640, 480),
             },
         };
         let floating = FullscreenPlacement {
             window: WindowId(2),
-            restore: RestorePlacement::Floating {
+            restore: FullscreenRestorePlacement::Floating {
                 viewport: ViewportPlacement::new(Rect::new(0, 0, 320, 240), Size::new(800, 600)),
             },
         };
@@ -213,16 +214,34 @@ pub enum RestorePlacement {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MaximizedPlacement {
+    pub window: WindowId,
+    /// Maximized is a finite wrapper around an ordinary tiled/floating placement.
+    pub restore: RestorePlacement,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FullscreenRestorePlacement {
+    Tiled { world_rect: Rect },
+    Floating { viewport: ViewportPlacement },
+    Maximized { restore: RestorePlacement },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FullscreenPlacement {
     pub window: WindowId,
-    pub restore: RestorePlacement,
+    pub restore: FullscreenRestorePlacement,
 }
 
 impl FullscreenPlacement {
     pub fn size(&self) -> Size {
         match &self.restore {
-            RestorePlacement::Tiled { world_rect } => world_rect.size,
-            RestorePlacement::Floating { viewport } => viewport.rect.size,
+            FullscreenRestorePlacement::Tiled { world_rect } => world_rect.size,
+            FullscreenRestorePlacement::Floating { viewport } => viewport.rect.size,
+            FullscreenRestorePlacement::Maximized { restore } => match restore {
+                RestorePlacement::Tiled { world_rect } => world_rect.size,
+                RestorePlacement::Floating { viewport } => viewport.rect.size,
+            },
         }
     }
 }
@@ -234,6 +253,7 @@ pub struct Workspace {
     pub original_output: Option<String>,
     pub tiled: BTreeMap<WindowId, TiledWindow>,
     pub floating: BTreeMap<WindowId, FloatingPlacement>,
+    pub maximized: Option<MaximizedPlacement>,
     pub fullscreen: Option<FullscreenPlacement>,
     pub camera: CameraState,
     pub focused_window: Option<WindowId>,
@@ -250,6 +270,7 @@ impl Workspace {
             original_output: None,
             tiled: BTreeMap::new(),
             floating: BTreeMap::new(),
+            maximized: None,
             fullscreen: None,
             camera: CameraState::default(),
             focused_window: None,
@@ -269,6 +290,12 @@ impl Workspace {
         } else if self.floating.contains_key(&id) {
             Some(WindowMode::Floating)
         } else if self
+            .maximized
+            .as_ref()
+            .is_some_and(|maximized| maximized.window == id)
+        {
+            Some(WindowMode::Maximized)
+        } else if self
             .fullscreen
             .as_ref()
             .is_some_and(|full| full.window == id)
@@ -287,6 +314,14 @@ impl Workspace {
         match self.window_mode(id)? {
             WindowMode::Tiled => Some(self.tiled[&id].geometry.size),
             WindowMode::Floating => Some(self.floating[&id].viewport.rect.size),
+            WindowMode::Maximized => {
+                self.maximized
+                    .as_ref()
+                    .map(|placement| match &placement.restore {
+                        RestorePlacement::Tiled { world_rect } => world_rect.size,
+                        RestorePlacement::Floating { viewport } => viewport.rect.size,
+                    })
+            }
             WindowMode::Fullscreen => self.fullscreen.as_ref().map(FullscreenPlacement::size),
         }
     }

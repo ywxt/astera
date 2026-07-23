@@ -102,7 +102,12 @@ impl Astera {
         roots.extend(
             windows
                 .iter()
-                .filter(|(_, _, _, mode)| matches!(mode, WindowMode::Floating | WindowMode::Tiled))
+                .filter(|(_, _, _, mode)| {
+                    matches!(
+                        mode,
+                        WindowMode::Maximized | WindowMode::Floating | WindowMode::Tiled
+                    )
+                })
                 .map(|(surface, location, scale, _)| {
                     (surface.wl_surface().clone(), *location, *scale)
                 }),

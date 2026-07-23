@@ -34,6 +34,10 @@ impl ConfigWatcher {
         &self.path
     }
 
+    pub(super) fn exists(&self) -> bool {
+        self.exists
+    }
+
     pub(super) fn poll(&mut self, now: Instant) -> Option<Result<Config, ConfigError>> {
         let metadata = std::fs::metadata(&self.path).ok();
         let exists = metadata.is_some();

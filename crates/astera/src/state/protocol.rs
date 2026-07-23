@@ -90,6 +90,7 @@ impl CompositorHandler for Astera {
                 .find(|mapped| mapped.surface.wl_surface() == surface)
             {
                 mapped.mapped = has_buffer;
+                mapped.layer = layer.layer();
             }
             self.configure_layer_surface(&layer);
             self.refresh_visible_scales();
@@ -121,7 +122,13 @@ impl WlrLayerShellHandler for Astera {
             })
             .unwrap_or(self.active_output);
         let mapped_surface = smithay::desktop::LayerSurface::new(surface.clone(), namespace);
+        let id = self.next_layer_id;
+        self.next_layer_id = self
+            .next_layer_id
+            .checked_add(1)
+            .expect("layer surface runtime ID space exhausted");
         self.layers.push(MappedLayer {
+            id,
             surface: mapped_surface.clone(),
             layer,
             output,
@@ -170,7 +177,10 @@ impl XdgShellHandler for Astera {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let id = WindowId(self.next_window_id);
-        self.next_window_id += 1;
+        self.next_window_id = self
+            .next_window_id
+            .checked_add(1)
+            .expect("window runtime ID space exhausted");
         surface.with_pending_state(|state| {
             state.size = Some(
                 (

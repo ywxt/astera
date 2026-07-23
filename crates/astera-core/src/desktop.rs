@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::{
-    LayoutError, Output, OutputId, OutputTransform, OutputWorkspaceSet, Point, RadialSolver,
-    RestorePlacement, Scale120, Size, WindowId, WindowMode, WindowTransaction, Workspace,
-    WorkspaceId,
+    FullscreenRestorePlacement, LayoutError, Output, OutputId, OutputTransform, OutputWorkspaceSet,
+    Point, RadialSolver, RestorePlacement, Scale120, Size, WindowId, WindowMode, WindowTransaction,
+    Workspace, WorkspaceId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -472,13 +472,13 @@ impl Desktop {
         let Some(mode) = state.window_mode(focused) else {
             return Ok(None);
         };
-        if mode == WindowMode::Fullscreen {
+        if matches!(mode, WindowMode::Maximized | WindowMode::Fullscreen) {
             return Ok(None);
         }
         let origin = match mode {
             WindowMode::Tiled => state.tiled[&focused].geometry.center(),
             WindowMode::Floating => state.floating[&focused].viewport.rect.center(),
-            WindowMode::Fullscreen => unreachable!(),
+            WindowMode::Maximized | WindowMode::Fullscreen => unreachable!(),
         };
         let direction = direction.normalized();
         let candidates: Box<dyn Iterator<Item = (WindowId, Point)> + '_> = match mode {
@@ -494,7 +494,7 @@ impl Desktop {
                     .iter()
                     .map(|(id, window)| (*id, window.viewport.rect.center())),
             ),
-            WindowMode::Fullscreen => unreachable!(),
+            WindowMode::Maximized | WindowMode::Fullscreen => unreachable!(),
         };
         let target = candidates
             .filter(|(id, _)| *id != focused)
@@ -711,14 +711,36 @@ impl Desktop {
                     .insert(window, placement);
                 self.workspace_mut(target)?.focus(window);
             }
+            WindowMode::Maximized => {
+                if let Some(maximized) = &self.workspace(target)?.maximized {
+                    return Err(LayoutError::MaximizedOccupied(maximized.window).into());
+                }
+                let mut maximized = self.workspace_mut(source)?.maximized.take().unwrap();
+                if let (RestorePlacement::Floating { viewport }, Some((target_key, target_size))) =
+                    (&mut maximized.restore, &target_viewport)
+                {
+                    migrate_viewport_placement(
+                        viewport,
+                        source_viewport
+                            .as_ref()
+                            .map(|(key, size)| (key.as_str(), *size)),
+                        target_key,
+                        *target_size,
+                    );
+                }
+                self.workspace_mut(source)?.remove_focus(window);
+                self.workspace_mut(target)?.maximized = Some(maximized);
+                self.workspace_mut(target)?.focus(window);
+            }
             WindowMode::Fullscreen => {
                 if let Some(fullscreen) = &self.workspace(target)?.fullscreen {
                     return Err(LayoutError::FullscreenOccupied(fullscreen.window).into());
                 }
                 let mut fullscreen = self.workspace_mut(source)?.fullscreen.take().unwrap();
-                if let (RestorePlacement::Floating { viewport }, Some((target_key, target_size))) =
-                    (&mut fullscreen.restore, &target_viewport)
-                {
+                if let (Some(viewport), Some((target_key, target_size))) = (
+                    fullscreen_floating_restore_mut(&mut fullscreen.restore),
+                    &target_viewport,
+                ) {
                     migrate_viewport_placement(
                         viewport,
                         source_viewport
@@ -884,6 +906,12 @@ impl Desktop {
                 .tiled
                 .keys()
                 .chain(workspace.floating.keys())
+                .chain(
+                    workspace
+                        .maximized
+                        .iter()
+                        .map(|maximized| &maximized.window),
+                )
                 .chain(workspace.fullscreen.iter().map(|full| &full.window))
             {
                 if let Some(first) = windows.insert(*window, workspace.id) {
@@ -938,6 +966,7 @@ impl Workspace {
         self.name.is_some()
             || !self.tiled.is_empty()
             || !self.floating.is_empty()
+            || self.maximized.is_some()
             || self.fullscreen.is_some()
     }
 }
@@ -946,8 +975,13 @@ fn store_workspace_viewport(workspace: &mut Workspace, key: &str, size: Size) {
     for placement in workspace.floating.values_mut() {
         placement.viewport.store_for_output(key, size);
     }
+    if let Some(maximized) = &mut workspace.maximized
+        && let RestorePlacement::Floating { viewport } = &mut maximized.restore
+    {
+        viewport.store_for_output(key, size);
+    }
     if let Some(fullscreen) = &mut workspace.fullscreen
-        && let RestorePlacement::Floating { viewport } = &mut fullscreen.restore
+        && let Some(viewport) = fullscreen_floating_restore_mut(&mut fullscreen.restore)
     {
         viewport.store_for_output(key, size);
     }
@@ -962,8 +996,13 @@ fn migrate_workspace_viewport(
     for placement in workspace.floating.values_mut() {
         migrate_viewport_placement(&mut placement.viewport, source, target_key, target_size);
     }
+    if let Some(maximized) = &mut workspace.maximized
+        && let RestorePlacement::Floating { viewport } = &mut maximized.restore
+    {
+        migrate_viewport_placement(viewport, source, target_key, target_size);
+    }
     if let Some(fullscreen) = &mut workspace.fullscreen
-        && let RestorePlacement::Floating { viewport } = &mut fullscreen.restore
+        && let Some(viewport) = fullscreen_floating_restore_mut(&mut fullscreen.restore)
     {
         migrate_viewport_placement(viewport, source, target_key, target_size);
     }
@@ -1002,10 +1041,30 @@ fn remap_floating(workspace: &mut Workspace, key: &str, old: Size, new: Size) {
     for placement in workspace.floating.values_mut() {
         remap_viewport(&mut placement.viewport, key, old, new);
     }
-    if let Some(fullscreen) = &mut workspace.fullscreen
-        && let RestorePlacement::Floating { viewport } = &mut fullscreen.restore
+    if let Some(maximized) = &mut workspace.maximized
+        && let RestorePlacement::Floating { viewport } = &mut maximized.restore
     {
         remap_viewport(viewport, key, old, new);
+    }
+    if let Some(fullscreen) = &mut workspace.fullscreen
+        && let Some(viewport) = fullscreen_floating_restore_mut(&mut fullscreen.restore)
+    {
+        remap_viewport(viewport, key, old, new);
+    }
+}
+
+fn fullscreen_floating_restore_mut(
+    restore: &mut FullscreenRestorePlacement,
+) -> Option<&mut crate::ViewportPlacement> {
+    match restore {
+        FullscreenRestorePlacement::Floating { viewport }
+        | FullscreenRestorePlacement::Maximized {
+            restore: RestorePlacement::Floating { viewport },
+        } => Some(viewport),
+        FullscreenRestorePlacement::Tiled { .. }
+        | FullscreenRestorePlacement::Maximized {
+            restore: RestorePlacement::Tiled { .. },
+        } => None,
     }
 }
 

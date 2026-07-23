@@ -1,5 +1,4 @@
 use std::{
-    cell::Cell,
     fs,
     future::Future,
     io,
@@ -57,7 +56,6 @@ pub struct IpcServer {
     executor: Arc<Executor<'static>>,
     requests: mpsc::Receiver<PendingRequest>,
     pub path: PathBuf,
-    sequence: Cell<u64>,
 }
 
 impl IpcServer {
@@ -119,7 +117,6 @@ impl IpcServer {
             executor,
             requests,
             path,
-            sequence: Cell::new(0),
         })
     }
 
@@ -128,8 +125,7 @@ impl IpcServer {
         // not wait for the next render iteration.
         self.drain_tasks();
         while let Ok(pending) = self.requests.try_recv() {
-            let sequence = self.sequence.get().wrapping_add(1);
-            self.sequence.set(sequence);
+            let sequence = state.public_sequence();
             let response = match pending.request.kind {
                 RequestKind::Command(command) => state.execute_command_at(command, sequence),
                 RequestKind::EventStream => Response::Error(Error {

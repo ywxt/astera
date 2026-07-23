@@ -3,8 +3,9 @@ use std::collections::{BTreeSet, VecDeque};
 use thiserror::Error;
 
 use crate::{
-    Direction, FloatingPlacement, FullscreenPlacement, Point, Rect, RestorePlacement, Size,
-    TiledWindow, WindowId, WindowMode, Workspace,
+    Direction, FloatingPlacement, FullscreenPlacement, FullscreenRestorePlacement,
+    MaximizedPlacement, Point, Rect, RestorePlacement, Size, TiledWindow, WindowId, WindowMode,
+    Workspace,
 };
 
 #[derive(Clone, Debug)]
@@ -59,6 +60,8 @@ pub enum LayoutError {
     InvalidSize,
     #[error("workspace already has fullscreen window {0:?}")]
     FullscreenOccupied(WindowId),
+    #[error("workspace already has maximized window {0:?}")]
+    MaximizedOccupied(WindowId),
     #[error("layout did not converge after {0} operations")]
     DidNotConverge(usize),
     #[error("solver produced an overlapping layout")]
@@ -236,6 +239,11 @@ impl RadialSolver {
                 let removed = workspace.tiled.remove(&id).is_some()
                     || workspace.floating.remove(&id).is_some()
                     || workspace
+                        .maximized
+                        .as_ref()
+                        .is_some_and(|maximized| maximized.window == id)
+                        && workspace.maximized.take().is_some()
+                    || workspace
                         .fullscreen
                         .as_ref()
                         .is_some_and(|full| full.window == id)
@@ -308,11 +316,14 @@ impl RadialSolver {
                 return Err(LayoutError::FullscreenOccupied(fullscreen.window));
             }
             let restore = match current {
-                WindowMode::Tiled => RestorePlacement::Tiled {
+                WindowMode::Tiled => FullscreenRestorePlacement::Tiled {
                     world_rect: workspace.tiled.remove(&id).unwrap().geometry,
                 },
-                WindowMode::Floating => RestorePlacement::Floating {
+                WindowMode::Floating => FullscreenRestorePlacement::Floating {
                     viewport: workspace.floating.remove(&id).unwrap().viewport,
+                },
+                WindowMode::Maximized => FullscreenRestorePlacement::Maximized {
+                    restore: workspace.maximized.take().unwrap().restore,
                 },
                 WindowMode::Fullscreen => unreachable!(),
             };
@@ -324,22 +335,61 @@ impl RadialSolver {
             return Ok((None, workspace.layout_direction_hint, Vec::new()));
         }
 
-        let (rect, geometry_mode, saved_viewport) = match current {
-            WindowMode::Tiled => (
-                workspace.tiled.remove(&id).unwrap().geometry,
-                WindowMode::Tiled,
-                None,
-            ),
+        if target == WindowMode::Maximized {
+            if let Some(maximized) = &workspace.maximized {
+                return Err(LayoutError::MaximizedOccupied(maximized.window));
+            }
+            let restore = match current {
+                WindowMode::Tiled => RestorePlacement::Tiled {
+                    world_rect: workspace.tiled.remove(&id).unwrap().geometry,
+                },
+                WindowMode::Floating => RestorePlacement::Floating {
+                    viewport: workspace.floating.remove(&id).unwrap().viewport,
+                },
+                WindowMode::Fullscreen => match workspace.fullscreen.take().unwrap().restore {
+                    FullscreenRestorePlacement::Tiled { world_rect } => {
+                        RestorePlacement::Tiled { world_rect }
+                    }
+                    FullscreenRestorePlacement::Floating { viewport } => {
+                        RestorePlacement::Floating { viewport }
+                    }
+                    FullscreenRestorePlacement::Maximized { restore } => restore,
+                },
+                WindowMode::Maximized => unreachable!(),
+            };
+            workspace.maximized = Some(MaximizedPlacement {
+                window: id,
+                restore,
+            });
+            workspace.focus(id);
+            return Ok((None, workspace.layout_direction_hint, Vec::new()));
+        }
+
+        let base = match current {
+            WindowMode::Tiled => RestorePlacement::Tiled {
+                world_rect: workspace.tiled.remove(&id).unwrap().geometry,
+            },
             WindowMode::Floating => {
                 let viewport = workspace.floating.remove(&id).unwrap().viewport;
+                RestorePlacement::Floating { viewport }
+            }
+            WindowMode::Maximized => workspace.maximized.take().unwrap().restore,
+            WindowMode::Fullscreen => match workspace.fullscreen.take().unwrap().restore {
+                FullscreenRestorePlacement::Tiled { world_rect } => {
+                    RestorePlacement::Tiled { world_rect }
+                }
+                FullscreenRestorePlacement::Floating { viewport } => {
+                    RestorePlacement::Floating { viewport }
+                }
+                FullscreenRestorePlacement::Maximized { restore } => restore,
+            },
+        };
+
+        let (rect, geometry_mode, saved_viewport) = match base {
+            RestorePlacement::Tiled { world_rect } => (world_rect, WindowMode::Tiled, None),
+            RestorePlacement::Floating { viewport } => {
                 (viewport.rect, WindowMode::Floating, Some(viewport))
             }
-            WindowMode::Fullscreen => match workspace.fullscreen.take().unwrap().restore {
-                RestorePlacement::Tiled { world_rect } => (world_rect, WindowMode::Tiled, None),
-                RestorePlacement::Floating { viewport } => {
-                    (viewport.rect, WindowMode::Floating, Some(viewport))
-                }
-            },
         };
 
         let source = match target {
@@ -378,7 +428,7 @@ impl RadialSolver {
                 );
                 None
             }
-            WindowMode::Fullscreen => unreachable!(),
+            WindowMode::Maximized | WindowMode::Fullscreen => unreachable!(),
         };
         workspace.focus(id);
         Ok((source, workspace.layout_direction_hint, Vec::new()))

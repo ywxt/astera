@@ -125,6 +125,69 @@ fn fullscreen_restores_original_floating_geometry() {
 }
 
 #[test]
+fn maximized_and_fullscreen_restore_stack_is_finite() {
+    let solver = RadialSolver::new(8);
+    let mut workspace = Workspace::new(WorkspaceId(1));
+    insert(&solver, &mut workspace, 1, Point::ORIGIN);
+    let original = workspace.tiled[&WindowId(1)].geometry;
+
+    for mode in [
+        WindowMode::Maximized,
+        WindowMode::Fullscreen,
+        WindowMode::Maximized,
+        WindowMode::Tiled,
+    ] {
+        solver
+            .apply(
+                &mut workspace,
+                WindowTransaction::SetMode {
+                    id: WindowId(1),
+                    mode,
+                    viewport_size: Size::new(1920, 1080),
+                },
+            )
+            .unwrap();
+        assert_eq!(workspace.window_mode(WindowId(1)), Some(mode));
+    }
+    assert_eq!(workspace.tiled[&WindowId(1)].geometry, original);
+    assert!(workspace.maximized.is_none());
+    assert!(workspace.fullscreen.is_none());
+}
+
+#[test]
+fn maximized_is_excluded_from_solver_and_occupancy_conflicts_are_atomic() {
+    let solver = RadialSolver::new(8);
+    let mut workspace = Workspace::new(WorkspaceId(1));
+    insert(&solver, &mut workspace, 1, Point::ORIGIN);
+    insert(&solver, &mut workspace, 2, Point::new(400, 0));
+    solver
+        .apply(
+            &mut workspace,
+            WindowTransaction::SetMode {
+                id: WindowId(1),
+                mode: WindowMode::Maximized,
+                viewport_size: Size::new(800, 600),
+            },
+        )
+        .unwrap();
+    let before = workspace.clone();
+    assert_eq!(
+        solver.apply(
+            &mut workspace,
+            WindowTransaction::SetMode {
+                id: WindowId(2),
+                mode: WindowMode::Maximized,
+                viewport_size: Size::new(800, 600),
+            },
+        ),
+        Err(LayoutError::MaximizedOccupied(WindowId(1)))
+    );
+    assert_eq!(workspace.maximized, before.maximized);
+    assert_eq!(workspace.tiled, before.tiled);
+    assert!(workspace.tiled_windows_are_stable(8));
+}
+
+#[test]
 fn removing_focus_restores_most_recent_live_window() {
     let solver = RadialSolver::new(8);
     let mut workspace = Workspace::new(WorkspaceId(1));
