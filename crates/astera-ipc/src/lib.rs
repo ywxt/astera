@@ -110,6 +110,12 @@ pub mod wire {
                 minimum: u16,
                 current: u16,
             },
+            InvalidFrame {
+                message: String,
+            },
+            InvalidRequest {
+                message: String,
+            },
         }
     }
 
