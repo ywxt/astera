@@ -858,6 +858,18 @@ mod tests {
     }
 
     #[test]
+    fn socket_write_timeout_interrupts_a_slow_reader() {
+        smol::block_on(async {
+            let (_client, mut server) = UnixStream::pair().unwrap();
+            let payload = vec![b'x'; 8 * 1024 * 1024];
+            let error = with_timeout(Duration::from_millis(10), server.write_all(&payload))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        });
+    }
+
+    #[test]
     fn closed_subscriber_does_not_drain_buffered_events() {
         smol::block_on(async {
             let (sender, receiver) = smol::channel::bounded(2);
@@ -895,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn event_stream_snapshot_is_followed_by_the_next_sequence() {
+    fn command_errors_multi_request_connections_and_stream_boundary_are_consistent() {
         let (directory, socket) = temporary_socket();
         let mut server = IpcServer::bind_path(socket.clone()).unwrap();
         let display = Display::<Astera>::new().unwrap();
@@ -904,6 +916,19 @@ mod tests {
         let (result_tx, result_rx) = sync_mpsc::sync_channel(1);
         let client = thread::spawn(move || {
             let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+            let invalid_focus = encode_frame(
+                CURRENT_VERSION,
+                &Request {
+                    kind: RequestKind::Command(Command::FocusWindow(
+                        astera_ipc::wire::v1::WindowId(u64::MAX),
+                    )),
+                },
+            )
+            .unwrap();
+            stream.write_all(invalid_focus.as_bytes()).unwrap();
+            let mut reader = SyncBufReader::new(stream.try_clone().unwrap());
+            let mut error = String::new();
+            reader.read_line(&mut error).unwrap();
             let get_state = encode_frame(
                 CURRENT_VERSION,
                 &Request {
@@ -912,7 +937,6 @@ mod tests {
             )
             .unwrap();
             stream.write_all(get_state.as_bytes()).unwrap();
-            let mut reader = SyncBufReader::new(stream.try_clone().unwrap());
             let mut first = String::new();
             reader.read_line(&mut first).unwrap();
             stream.write_all(get_state.as_bytes()).unwrap();
@@ -941,7 +965,9 @@ mod tests {
             let mut event = String::new();
             reader.read_line(&mut event).unwrap();
             let event: EventEnvelope = decode_frame(&event, CURRENT_VERSION).unwrap();
-            result_tx.send((first, second, sequence, event)).unwrap();
+            result_tx
+                .send((error, first, second, sequence, event))
+                .unwrap();
         });
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -959,15 +985,30 @@ mod tests {
                 assert_eq!(sequence, state.public_sequence());
             }
             server.finish_tick(&mut state);
-            if let Ok((first, second, sequence, event)) = result_rx.try_recv() {
-                assert!(matches!(
-                    decode_frame::<Response>(&first, CURRENT_VERSION).unwrap(),
-                    Response::Success(Success::State { .. })
-                ));
-                assert!(matches!(
-                    decode_frame::<Response>(&second, CURRENT_VERSION).unwrap(),
-                    Response::Success(Success::State { .. })
-                ));
+            if let Ok((error, first, second, sequence, event)) = result_rx.try_recv() {
+                let Response::Error(error) =
+                    decode_frame::<Response>(&error, CURRENT_VERSION).unwrap()
+                else {
+                    panic!("expected command error")
+                };
+                assert_eq!(error.code, ErrorCode::NotFound);
+                let Response::Success(Success::State {
+                    sequence: first_sequence,
+                    ..
+                }) = decode_frame::<Response>(&first, CURRENT_VERSION).unwrap()
+                else {
+                    panic!("expected first state response")
+                };
+                let Response::Success(Success::State {
+                    sequence: second_sequence,
+                    ..
+                }) = decode_frame::<Response>(&second, CURRENT_VERSION).unwrap()
+                else {
+                    panic!("expected second state response")
+                };
+                assert_eq!(error.sequence, first_sequence);
+                assert_eq!(first_sequence, second_sequence);
+                assert_eq!(second_sequence, sequence);
                 assert_eq!(event.sequence, sequence + 1);
                 assert!(matches!(event.event, wire::v1::Event::CameraChanged { .. }));
                 client.join().unwrap();
@@ -1003,6 +1044,69 @@ mod tests {
         assert!(server.subscribers.is_empty());
         assert!(receiver.is_closed());
         assert_eq!(cancellation.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn connection_version_is_locked_after_the_first_request() {
+        let (directory, socket) = temporary_socket();
+        let mut server = IpcServer::bind_path(socket.clone()).unwrap();
+        let display = Display::<Astera>::new().unwrap();
+        let mut state = Astera::new(&display.handle(), astera_config::Config::default());
+        let (result_tx, result_rx) = sync_mpsc::sync_channel(1);
+        let client = thread::spawn(move || {
+            let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+            stream
+                .write_all(
+                    encode_frame(
+                        CURRENT_VERSION,
+                        &Request {
+                            kind: RequestKind::Command(Command::GetState),
+                        },
+                    )
+                    .unwrap()
+                    .as_bytes(),
+                )
+                .unwrap();
+            let mut reader = SyncBufReader::new(stream.try_clone().unwrap());
+            let mut state = String::new();
+            reader.read_line(&mut state).unwrap();
+            stream
+                .write_all(
+                    encode_frame(BOOTSTRAP_VERSION, &wire::v0::Request::Versions)
+                        .unwrap()
+                        .as_bytes(),
+                )
+                .unwrap();
+            let mut mismatch = String::new();
+            reader.read_line(&mut mismatch).unwrap();
+            result_tx.send((state, mismatch)).unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            server.dispatch(&mut state);
+            server.finish_tick(&mut state);
+            if let Ok((state_response, mismatch)) = result_rx.try_recv() {
+                assert!(matches!(
+                    decode_frame::<Response>(&state_response, CURRENT_VERSION).unwrap(),
+                    Response::Success(Success::State { .. })
+                ));
+                let Response::Error(error) =
+                    decode_frame::<Response>(&mismatch, CURRENT_VERSION).unwrap()
+                else {
+                    panic!("expected version mismatch error")
+                };
+                assert_eq!(error.code, ErrorCode::InvalidRequest);
+                assert!(error.message.contains("locked version 1"));
+                assert_eq!(error.sequence, state.public_sequence());
+                client.join().unwrap();
+                drop(server);
+                fs::remove_dir(directory).unwrap();
+                return;
+            }
+            thread::yield_now();
+        }
+        panic!("timed out waiting for version mismatch response");
     }
 
     fn server_without_listener() -> IpcServer {

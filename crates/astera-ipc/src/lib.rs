@@ -851,12 +851,51 @@ mod tests {
 
     #[test]
     fn bootstrap_v0_is_frozen_and_reports_version_bounds() {
+        assert_eq!(
+            encode_frame(BOOTSTRAP_VERSION, &wire::v0::Request::Versions).unwrap(),
+            "0 Versions\n"
+        );
+        assert_eq!(
+            encode_frame(
+                BOOTSTRAP_VERSION,
+                &wire::v0::Response::Versions {
+                    minimum: 1,
+                    current: 1,
+                },
+            )
+            .unwrap(),
+            "0 Versions(minimum:1,current:1)\n"
+        );
+        assert_eq!(
+            encode_frame(
+                BOOTSTRAP_VERSION,
+                &wire::v0::Response::InvalidFrame {
+                    message: "bad frame".into(),
+                },
+            )
+            .unwrap(),
+            "0 InvalidFrame(message:\"bad frame\")\n"
+        );
+        assert_eq!(
+            encode_frame(
+                BOOTSTRAP_VERSION,
+                &wire::v0::Response::InvalidRequest {
+                    message: "bad request".into(),
+                },
+            )
+            .unwrap(),
+            "0 InvalidRequest(message:\"bad request\")\n"
+        );
         let response = wire::v0::Response::UnsupportedVersion {
             requested: 9,
             minimum: MIN_VERSION,
             current: CURRENT_VERSION,
         };
         let encoded = encode_frame(BOOTSTRAP_VERSION, &response).unwrap();
+        assert_eq!(
+            encoded,
+            "0 UnsupportedVersion(requested:9,minimum:1,current:1)\n"
+        );
         assert_eq!(
             decode_frame::<wire::v0::Response>(&encoded, 0).unwrap(),
             response
@@ -868,6 +907,57 @@ mod tests {
                 minimum: 1,
                 current: 1,
             })
+        );
+    }
+
+    #[test]
+    fn v1_textual_fixtures_are_stable() {
+        assert_eq!(
+            encode_frame(1, &request()).unwrap(),
+            "1 (kind:Command(FocusWorkspace(workspace:LocalIndex(output:Key(\"DP-1\"),index:3))))\n"
+        );
+        assert_eq!(
+            encode_frame(
+                1,
+                &wire::v1::Request {
+                    kind: wire::v1::RequestKind::EventStream,
+                },
+            )
+            .unwrap(),
+            "1 (kind:EventStream)\n"
+        );
+        assert_eq!(
+            encode_frame(
+                1,
+                &wire::v1::Response::Success(wire::v1::Success::Handled { sequence: 42 }),
+            )
+            .unwrap(),
+            "1 Success(Handled(sequence:42))\n"
+        );
+        assert_eq!(
+            encode_frame(
+                1,
+                &wire::v1::Response::Error(wire::v1::Error {
+                    code: wire::v1::ErrorCode::NotFound,
+                    message: "missing".into(),
+                    sequence: 42,
+                }),
+            )
+            .unwrap(),
+            "1 Error((code:NotFound,message:\"missing\",sequence:42))\n"
+        );
+        assert_eq!(
+            encode_frame(
+                1,
+                &wire::v1::EventEnvelope {
+                    sequence: 43,
+                    event: wire::v1::Event::WindowClosed {
+                        window: wire::v1::WindowId(7),
+                    },
+                },
+            )
+            .unwrap(),
+            "1 (sequence:43,event:WindowClosed(window:(7)))\n"
         );
     }
 

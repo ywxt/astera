@@ -59,6 +59,11 @@ impl EventHub {
         self.previous = Some(snapshot);
         &self.latest
     }
+
+    pub(super) fn clean_tick(&mut self) -> &[EventEnvelope] {
+        self.latest.clear();
+        &self.latest
+    }
 }
 
 fn by_output(snapshot: &DesktopSnapshot) -> BTreeMap<OutputId, &OutputSnapshot> {

@@ -223,6 +223,7 @@ impl Astera {
         self.configure_fullscreen_windows();
         self.configure_layer_surfaces();
         self.refresh_visible_scales();
+        self.mark_public_dirty();
         Ok(())
     }
 

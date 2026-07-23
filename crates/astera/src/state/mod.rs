@@ -121,6 +121,9 @@ pub struct Astera {
     config_error: Option<String>,
     config_watcher: Option<ConfigWatcher>,
     event_hub: EventHub,
+    public_dirty: bool,
+    #[cfg(test)]
+    public_snapshot_builds: u64,
     should_quit: bool,
     output_configuration_supported: bool,
     pending_dmabufs: Vec<(Dmabuf, ImportNotifier)>,
@@ -247,6 +250,10 @@ impl Astera {
             config_error: None,
             config_watcher: None,
             event_hub: EventHub::default(),
+            // The first publish establishes the event hub's authoritative baseline.
+            public_dirty: true,
+            #[cfg(test)]
+            public_snapshot_builds: 0,
             should_quit: false,
             output_configuration_supported: true,
             pending_dmabufs: Vec::new(),
@@ -311,6 +318,7 @@ impl Astera {
             outputs = self.desktop.outputs.len(),
             "output connected"
         );
+        self.mark_public_dirty();
         Ok(())
     }
 
@@ -335,6 +343,7 @@ impl Astera {
         tracing::info!(?output, ?event, "output disconnected");
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
+        self.mark_public_dirty();
         Ok(())
     }
 
@@ -504,6 +513,7 @@ impl Astera {
                 "pointer crossed output boundary"
             );
             self.sync_keyboard_focus();
+            self.mark_public_dirty();
         }
         location
     }
@@ -542,8 +552,10 @@ impl Astera {
             && let Some((surface, _, window)) = self.surface_under(self.pointer_location)
         {
             if let Some(window) = window {
-                if self.desktop.find_window(window).is_ok() {
-                    let _ = self.desktop.focus_window(window);
+                if self.desktop.find_window(window).is_ok()
+                    && self.desktop.focus_window(window).is_ok()
+                {
+                    self.mark_public_dirty();
                 }
                 self.sync_keyboard_focus();
             } else if self.layer_accepts_keyboard(&surface) {
@@ -612,7 +624,9 @@ impl Astera {
             start,
         });
         tracing::debug!(?window, ?workspace_id, ?mode, "compositor drag started");
-        let _ = self.desktop.focus_window(window);
+        if self.desktop.focus_window(window).is_ok() {
+            self.mark_public_dirty();
+        }
         self.sync_keyboard_focus();
     }
 
@@ -699,6 +713,7 @@ impl Astera {
         if let Err(error) = self.desktop.apply_window(workspace, transaction) {
             tracing::warn!(%error, window = ?drag.window, "drag transaction failed");
         } else {
+            self.mark_public_dirty();
             tracing::info!(
                 window = ?drag.window,
                 ?workspace,
@@ -928,6 +943,7 @@ impl Astera {
             .exists()
             .then(|| watcher.path().to_string_lossy().into_owned());
         self.config_watcher = Some(watcher);
+        self.mark_public_dirty();
     }
 
     pub fn poll_config(&mut self) {
@@ -969,6 +985,7 @@ impl Astera {
         self.key_repeat.cancel_repeats();
         self.desktop = desktop;
         self.config = config;
+        self.mark_public_dirty();
         tracing::info!(
             bindings = self.config.bindings.len(),
             "configuration reloaded"
@@ -1017,6 +1034,7 @@ impl Astera {
             return;
         }
         self.windows[index].mapped = true;
+        self.mark_public_dirty();
         self.windows[index].surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
         });
@@ -1037,6 +1055,7 @@ impl Astera {
             return;
         }
         self.windows[index].mapped = false;
+        self.mark_public_dirty();
         if self.drag.is_some_and(|drag| drag.window == id) {
             self.drag = None;
         }
@@ -1047,6 +1066,7 @@ impl Astera {
 
     pub fn remove_dead_windows(&mut self) {
         self.popup_manager.cleanup();
+        let layer_count = self.layers.len();
         self.layers.retain(|mapped| mapped.surface.alive());
         let dead: Vec<_> = self
             .windows
@@ -1055,6 +1075,9 @@ impl Astera {
             .map(|mapped| mapped.id)
             .collect();
         self.windows.retain(|mapped| mapped.surface.alive());
+        if self.layers.len() != layer_count || !dead.is_empty() {
+            self.mark_public_dirty();
+        }
         for id in dead {
             if let Ok(workspace) = self.desktop.find_window(id) {
                 match self

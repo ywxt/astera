@@ -237,8 +237,24 @@ impl Astera {
         }
     }
 
-    /// Publish a tick-end snapshot and return the resulting canonical diff for immediate routing.
+    /// Mark an externally observable mutation for canonical snapshot diffing at tick end.
+    pub(super) fn mark_public_dirty(&mut self) {
+        self.public_dirty = true;
+    }
+
+    /// Publish a tick-end snapshot only when externally observable state may have changed.
+    ///
+    /// Commands may still force the compositor to reach this boundary before replying; a clean
+    /// boundary neither rebuilds the snapshot nor manufactures an event.
     pub fn publish_public_state(&mut self) -> &[astera_ipc::wire::v1::EventEnvelope] {
+        if !self.public_dirty {
+            return self.event_hub.clean_tick();
+        }
+        self.public_dirty = false;
+        #[cfg(test)]
+        {
+            self.public_snapshot_builds += 1;
+        }
         let snapshot = self.public_snapshot();
         self.event_hub.publish(snapshot)
     }
@@ -261,6 +277,7 @@ impl Astera {
         self.config_error = error.clone();
         self.event_hub
             .config_loaded(self.config_generation, self.config_failed, error);
+        self.mark_public_dirty();
     }
 }
 
@@ -456,5 +473,47 @@ mod tests {
                 error: Some(error),
             }) if error == "invalid binding"
         ));
+    }
+
+    #[test]
+    fn clean_ticks_do_not_rebuild_the_public_snapshot() {
+        let display = Display::<Astera>::new().unwrap();
+        let mut state = Astera::new(&display.handle(), astera_config::Config::default());
+
+        state.publish_public_state();
+        assert_eq!(state.public_snapshot_builds, 1);
+        assert!(state.publish_public_state().is_empty());
+        assert!(state.publish_public_state().is_empty());
+        assert_eq!(state.public_snapshot_builds, 1);
+    }
+
+    #[test]
+    fn commands_output_changes_and_config_events_mark_public_state_dirty() {
+        let display = Display::<Astera>::new().unwrap();
+        let mut state = Astera::new(&display.handle(), astera_config::Config::default());
+        state.publish_public_state();
+
+        let workspace = state.public_snapshot().outputs[0].active_workspace;
+        assert!(matches!(
+            state.execute_command(astera_ipc::Command::PanCamera {
+                workspace,
+                dx: 1,
+                dy: 0,
+            }),
+            astera_ipc::Response::Success(_)
+        ));
+        assert!(!state.publish_public_state().is_empty());
+        assert_eq!(state.public_snapshot_builds, 2);
+
+        state.update_output_size(1024, 768);
+        assert!(!state.publish_public_state().is_empty());
+        assert_eq!(state.public_snapshot_builds, 3);
+
+        state.record_config_loaded(None);
+        assert!(state.publish_public_state().iter().any(|event| matches!(
+            event.event,
+            astera_ipc::wire::v1::Event::ConfigLoaded { .. }
+        )));
+        assert_eq!(state.public_snapshot_builds, 4);
     }
 }

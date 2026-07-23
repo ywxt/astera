@@ -36,6 +36,11 @@ impl Astera {
         };
         match self.execute_command_inner(command) {
             Ok(()) => {
+                if !returns_state {
+                    // The diff remains authoritative, so successful semantic no-ops still produce
+                    // no event even though they request one snapshot comparison.
+                    self.mark_public_dirty();
+                }
                 if let Some((window, mode)) = mode_change {
                     self.configure_window_mode(window.into(), mode.into());
                 }

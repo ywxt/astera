@@ -140,6 +140,7 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
             OutputTransform::Normal,
         )
         .unwrap();
+    state.publish_public_state();
     let (server_socket, client_socket) = UnixStream::pair().unwrap();
     display
         .handle()
@@ -196,6 +197,13 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
     });
     let usable = state.usable_rect(OutputId(0)).unwrap();
     assert_eq!(usable, astera_core::Rect::new(0, 32, 1280, 688));
+    assert!(
+        state.publish_public_state().iter().any(|event| matches!(
+            event.event,
+            astera_ipc::wire::v1::Event::OutputChanged { .. }
+        )),
+        "layer commits must invalidate public state"
+    );
     done_tx.send(()).unwrap();
     client.join().unwrap();
 }
@@ -312,12 +320,17 @@ fn compositor_time_can_be_advanced_without_sleeping() {
 fn hotplug_moves_disconnected_workspaces_to_primary() {
     let display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
+    state.publish_public_state();
     let mut second = Output::new(OutputId(1), "test-output-2", Size::new(2560, 1440));
     second.physical_size = Size::new(3840, 2160);
     second.native_scale = Scale120(180);
     second.transform = OutputTransform::Rotate90;
 
     state.connect_output(second).unwrap();
+    assert!(state.publish_public_state().iter().any(|event| matches!(
+        event.event,
+        astera_ipc::wire::v1::Event::OutputOpened { .. }
+    )));
     let runtime = &state.output_runtime[&OutputId(1)].wayland;
     assert_eq!(runtime.current_mode().unwrap().size, (3840, 2160).into());
     assert_eq!(runtime.current_scale().fractional_scale(), 1.5);
@@ -335,6 +348,10 @@ fn hotplug_moves_disconnected_workspaces_to_primary() {
         })
         .unwrap();
     state.disconnect_output(OutputId(0)).unwrap();
+    assert!(state.publish_public_state().iter().any(|event| matches!(
+        event.event,
+        astera_ipc::wire::v1::Event::OutputClosed { .. }
+    )));
 
     assert_eq!(state.active_output, OutputId(1));
     assert!(!state.output_runtime.contains_key(&OutputId(0)));

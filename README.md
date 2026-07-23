@@ -117,18 +117,55 @@ terminal with the printed value, for example:
 WAYLAND_DISPLAY=astera-1 weston-terminal
 ```
 
-The compositor also creates `<runtime-dir>/astera/<wayland-display>.ipc`. Every frame is
-one newline-terminated `<version> <RON>` record. A command connection processes
-multiple requests strictly in order and may be upgraded permanently to an event
-stream. Clients first send the frozen v0 `Versions` bootstrap request, choose an
-overlap with the returned bounds, then open a v1 connection. The
-current and minimum command protocol versions are both 1. Protocol v1 exposes
-output focus, workspace focus/move/name operations, window transfer, mode and
-camera commands, plus per-output physical/logical size, scale and transform
-updates. Outputs can be selected by ID, stable key or active output. Workspaces
-can be selected by global ID, unique name, or output-local index. `GetState`
-reports each output's ordered workspace set, active workspace and detached
-workspaces.
+The compositor also creates `<runtime-dir>/astera/<wayland-display>.ipc`. The
+parent directory is mode `0700`, the socket is mode `0600`, and Linux peer
+credentials must report the compositor user's UID. Every frame is one
+newline-terminated `<version> <RON>` record; inbound records are limited to
+64 KiB and each write has a two-second timeout.
+
+IPC has two connection modes:
+
+- A command connection processes multiple requests strictly in order. It reads
+  the next request only after writing the previous response. Query responses,
+  successful mutations and errors all carry the current public `sequence`.
+- Sending `EventStream` permanently upgrades that connection. Its handshake is
+  one authoritative `DesktopSnapshot` at sequence `N`; subsequent records are
+  `EventEnvelope`s numbered `N + 1`, `N + 2`, and so on. Commands therefore use
+  another connection once the upgrade completes.
+
+Clients first send the permanently frozen v0 `Versions` bootstrap request,
+choose an overlap with the returned bounds, then use that version for the whole
+connection. A mismatched later frame is an error. Wire schemas live in separate
+version modules so a newer server can encode responses for supported older
+clients. The current and minimum command protocol versions are both 1.
+
+The global sequence advances once per public event, including while nobody is
+subscribed. Stream registration and snapshot capture happen together on the
+compositor thread, so no event can fall between the snapshot and `N + 1`.
+Clients must treat a gap, malformed record, EOF or read error as loss of
+synchronization: discard all cached state and reconnect for a new snapshot.
+Sequences do not survive compositor restart. A stream has a bounded queue of
+256 events; a lagging subscriber is disconnected rather than stalling the
+compositor. Astera permits at most 64 event streams and 128 command connections.
+
+Protocol v1 exposes output focus and configuration, workspace
+focus/move/name operations, window transfer and mode changes, and camera
+commands. Outputs can be selected by ID, stable key or active output.
+Workspaces can be selected by global ID, unique name, or output-local index.
+`GetState` reports outputs, layers, ordered dynamic workspaces, windows,
+cameras, focus and config status in one snapshot. Incremental events cover
+output, layer, workspace and window lifecycle/changes, workspace activation,
+window/output focus, camera placement and config reload completion. A config
+reload event is emitted after all state changes caused by that reload.
+
+IPC coordinates are logical rather than physical pixels. Tiled placement uses
+the workspace's infinite-world coordinates. Floating placement is local to the
+complete output viewport and may overlap layer-shell exclusive zones.
+Maximized windows use the output usable area; fullscreen windows use the full
+viewport. `visible_geometry`, when present in a complete window snapshot, is
+the full camera-projected viewport-local rectangle and is not clipped. Pure
+camera/output visibility changes are represented by their own events rather
+than emitting placement changes for every affected window.
 
 For a human-readable workspace overview and output status, run:
 

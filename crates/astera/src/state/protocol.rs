@@ -70,6 +70,10 @@ impl CompositorHandler for Astera {
                 (true, false) => self.unmap_toplevel(index),
                 _ => {}
             }
+            // A mapped commit may update title/app-id even when buffer presence is unchanged.
+            if self.windows[index].mapped {
+                self.mark_public_dirty();
+            }
         }
         if let Some(layer) = self
             .layers
@@ -95,6 +99,7 @@ impl CompositorHandler for Astera {
             self.configure_layer_surface(&layer);
             self.refresh_visible_scales();
             self.sync_keyboard_focus();
+            self.mark_public_dirty();
         }
     }
 }
@@ -134,6 +139,7 @@ impl WlrLayerShellHandler for Astera {
             output,
             mapped: false,
         });
+        self.mark_public_dirty();
         if let Some(runtime) = self.output_runtime.get(&output)
             && let Err(error) = layer_map_for_output(&runtime.wayland).map_layer(&mapped_surface)
         {
@@ -164,6 +170,7 @@ impl WlrLayerShellHandler for Astera {
         }
         self.layers
             .retain(|mapped| mapped.surface.layer_surface() != &surface);
+        self.mark_public_dirty();
         tracing::debug!("layer surface destroyed");
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
@@ -262,6 +269,7 @@ impl XdgShellHandler for Astera {
             self.configure_window_mode(window, WindowMode::Fullscreen);
             self.refresh_visible_scales();
             self.sync_keyboard_focus();
+            self.mark_public_dirty();
         }
     }
 
@@ -305,6 +313,7 @@ impl XdgShellHandler for Astera {
             self.configure_window_mode(window, mode);
             self.refresh_visible_scales();
             self.sync_keyboard_focus();
+            self.mark_public_dirty();
         }
     }
 
@@ -351,6 +360,7 @@ impl XdgShellHandler for Astera {
             self.drag = None;
         }
         tracing::info!(window = ?window.id, "toplevel role destroyed");
+        self.mark_public_dirty();
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
     }
