@@ -32,6 +32,7 @@ use crate::{
 };
 
 const NESTED_REFRESH_HZ: u32 = 60;
+const IPC_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Paces the polling winit backend without coupling compositor progress to host redraw events.
 ///
@@ -63,10 +64,17 @@ impl FramePacer {
         }
     }
 
-    fn wait(&mut self) {
-        let delay = self.delay_at(Instant::now());
-        if !delay.is_zero() {
+    fn wait_with(&mut self, mut service: impl FnMut()) {
+        let now = Instant::now();
+        let delay = self.delay_at(now);
+        let target = now + delay;
+        while let Some(remaining) = target.checked_duration_since(Instant::now()) {
+            if remaining.is_zero() {
+                break;
+            }
+            let delay = remaining.min(IPC_POLL_INTERVAL);
             thread::sleep(delay);
+            service();
         }
     }
 }
@@ -196,7 +204,13 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         if let Some(damage) = submitted_damage {
             backend.submit(Some(&damage))?;
         }
-        frame_pacer.wait();
+        // Keep the expensive render loop at 60 Hz, but service the cooperative IPC executor
+        // between frame deadlines. Bootstrap negotiation and command execution therefore do not
+        // each accumulate another full-frame delay.
+        frame_pacer.wait_with(|| {
+            ipc.dispatch(&mut state);
+            ipc.finish_tick(&mut state);
+        });
     }
 }
 
