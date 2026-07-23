@@ -139,6 +139,34 @@ WAYLAND_DISPLAY=astera-1 cargo run -p astera --bin astrology -- overview
 The active output is marked with `*`; detached workspaces are shown as
 `background`.
 
+`astrology` also exposes the complete IPC surface:
+
+```sh
+# Pretty or compact authoritative state.
+astrology state
+astrology state --raw
+
+# Initial snapshot followed by one RON EventEnvelope per line. The command exits
+# non-zero if the stream disconnects and does not reconnect automatically.
+astrology events
+
+# Typed commands; omitted output selectors mean the active output.
+astrology focus-output
+astrology focus-workspace --index 3
+astrology move-window 42 --name code --activate
+astrology set-window-mode 42 fullscreen
+astrology pan-camera 3 160 0
+
+# Any v1 Command remains available without waiting for a dedicated CLI wrapper.
+astrology command 'SetWorkspaceName(workspace:(7),name:Some("work"))'
+```
+
+Output selectors accept a numeric ID, stable connector key, or `active`.
+Workspace selectors use exactly one of `--id`, `--name`, or `--index`; an index
+may include `--output`, and otherwise resolves on the active output. Successful
+mutation commands print the public sequence watermark. Server errors include
+their code, message, and sequence.
+
 When no configuration file exists, built-in bindings use the Super modifier:
 
 - `Super+1` through `Super+9`: focus that output-local workspace index;

@@ -1,9 +1,8 @@
 use std::{
     env,
-    io::{Read, Write},
-    net::Shutdown,
+    io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
@@ -11,13 +10,13 @@ use astera_ipc::{
     BOOTSTRAP_VERSION, CURRENT_VERSION, Command as IpcCommand, DesktopSnapshot, MIN_VERSION,
     Request, RequestKind, Response, Success, decode_frame, encode_frame, wire,
 };
-use clap::{Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "astrology",
     version,
-    about = "Inspect a running Astera compositor"
+    about = "Inspect and control a running Astera compositor"
 )]
 struct Args {
     #[command(subcommand)]
@@ -28,22 +27,218 @@ struct Args {
 enum AstrologyCommand {
     /// Print outputs, workspaces, focus, and window counts.
     Overview,
+    /// Print the complete authoritative desktop snapshot.
+    State {
+        /// Emit compact RON instead of pretty-printed RON.
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Print an initial snapshot followed by one RON EventEnvelope per line.
+    #[command(alias = "event-stream")]
+    Events,
+    /// Send any v1 Command encoded as RON.
+    Command {
+        /// For example: 'FocusWindow((42))'.
+        ron: String,
+    },
+    FocusWindow {
+        window: u64,
+    },
+    FocusDirection {
+        x: f64,
+        y: f64,
+    },
+    FocusOutput {
+        /// Output ID, stable key, or "active"; omitted means the active output.
+        output: Option<String>,
+    },
+    FocusWorkspace {
+        #[command(flatten)]
+        workspace: WorkspaceArgs,
+    },
+    MoveWindow {
+        window: u64,
+        #[command(flatten)]
+        workspace: WorkspaceArgs,
+        #[arg(long)]
+        activate: bool,
+    },
+    SetWindowMode {
+        window: u64,
+        mode: WindowModeArg,
+    },
+    PanCamera {
+        workspace: u32,
+        dx: i64,
+        dy: i64,
+    },
+}
+
+#[derive(Clone, Debug, ClapArgs)]
+struct WorkspaceArgs {
+    #[command(flatten)]
+    selector: WorkspaceSelectorArgs,
+    /// Output ID, stable key, or "active"; only used with --index.
+    #[arg(long, requires = "index")]
+    output: Option<String>,
+}
+
+#[derive(Clone, Debug, ClapArgs)]
+#[group(id = "workspace", required = true, multiple = false)]
+struct WorkspaceSelectorArgs {
+    /// Globally unique workspace ID.
+    #[arg(long)]
+    id: Option<u32>,
+    /// Unique workspace name.
+    #[arg(long)]
+    name: Option<String>,
+    /// One-based workspace index local to an output.
+    #[arg(long)]
+    index: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum WindowModeArg {
+    Tiled,
+    Floating,
+    Maximized,
+    Fullscreen,
+}
+
+impl From<WindowModeArg> for wire::v1::WindowMode {
+    fn from(value: WindowModeArg) -> Self {
+        match value {
+            WindowModeArg::Tiled => Self::Tiled,
+            WindowModeArg::Floating => Self::Floating,
+            WindowModeArg::Maximized => Self::Maximized,
+            WindowModeArg::Fullscreen => Self::Fullscreen,
+        }
+    }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let _command = args.command.unwrap_or(AstrologyCommand::Overview);
     let display = env::var("WAYLAND_DISPLAY")?;
     let runtime = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .context("XDG_RUNTIME_DIR is required")?;
     let socket = runtime.join("astera").join(format!("{display}.ipc"));
-    let versions = exchange(
-        &socket,
+    run(args, &socket, &mut std::io::stdout())
+}
+
+fn run(args: Args, socket: &Path, output: &mut impl Write) -> Result<()> {
+    let version = negotiate(socket)?;
+    match args.command.unwrap_or(AstrologyCommand::Overview) {
+        AstrologyCommand::Overview => {
+            let (_, snapshot) = get_state(socket, version)?;
+            write!(output, "{}", format_overview(&snapshot))?;
+        }
+        AstrologyCommand::State { raw } => {
+            let (sequence, snapshot) = get_state(socket, version)?;
+            if raw {
+                writeln!(
+                    output,
+                    "{}",
+                    ron::to_string(&Success::State { sequence, snapshot })?
+                )?;
+            } else {
+                writeln!(
+                    output,
+                    "{}",
+                    ron::ser::to_string_pretty(
+                        &Success::State { sequence, snapshot },
+                        ron::ser::PrettyConfig::default(),
+                    )?
+                )?;
+            }
+        }
+        AstrologyCommand::Events => stream_events(socket, version, output)?,
+        command => {
+            let command = typed_command(command)?;
+            let response = request(socket, version, RequestKind::Command(command))?;
+            print_command_response(response, output)?;
+        }
+    }
+    Ok(())
+}
+
+fn typed_command(command: AstrologyCommand) -> Result<IpcCommand> {
+    Ok(match command {
+        AstrologyCommand::Command { ron } => ron::from_str(&ron).context("invalid RON Command")?,
+        AstrologyCommand::FocusWindow { window } => {
+            IpcCommand::FocusWindow(wire::v1::WindowId(window))
+        }
+        AstrologyCommand::FocusDirection { x, y } => {
+            IpcCommand::FocusDirection(wire::v1::Direction { x, y })
+        }
+        AstrologyCommand::FocusOutput { output } => {
+            IpcCommand::FocusOutput(parse_output(output.as_deref())?)
+        }
+        AstrologyCommand::FocusWorkspace { workspace } => IpcCommand::FocusWorkspace {
+            workspace: parse_workspace(workspace)?,
+        },
+        AstrologyCommand::MoveWindow {
+            window,
+            workspace,
+            activate,
+        } => IpcCommand::MoveWindow {
+            window: wire::v1::WindowId(window),
+            target: parse_workspace(workspace)?,
+            activate,
+        },
+        AstrologyCommand::SetWindowMode { window, mode } => IpcCommand::SetWindowMode {
+            window: wire::v1::WindowId(window),
+            mode: mode.into(),
+        },
+        AstrologyCommand::PanCamera { workspace, dx, dy } => IpcCommand::PanCamera {
+            workspace: wire::v1::WorkspaceId(workspace),
+            dx,
+            dy,
+        },
+        AstrologyCommand::Overview | AstrologyCommand::State { .. } | AstrologyCommand::Events => {
+            bail!("command does not map to a mutation")
+        }
+    })
+}
+
+fn parse_output(value: Option<&str>) -> Result<wire::v1::OutputSelector> {
+    match value {
+        None | Some("active") => Ok(wire::v1::OutputSelector::Active),
+        Some(value) => match value.parse::<u32>() {
+            Ok(id) => Ok(wire::v1::OutputSelector::Id(wire::v1::OutputId(id))),
+            Err(_) if !value.is_empty() => Ok(wire::v1::OutputSelector::Key(value.to_owned())),
+            Err(_) => bail!("output selector cannot be empty"),
+        },
+    }
+}
+
+fn parse_workspace(args: WorkspaceArgs) -> Result<wire::v1::WorkspaceSelector> {
+    if let Some(id) = args.selector.id {
+        return Ok(wire::v1::WorkspaceSelector::Id(wire::v1::WorkspaceId(id)));
+    }
+    if let Some(name) = args.selector.name {
+        return Ok(wire::v1::WorkspaceSelector::Name(name));
+    }
+    let index = args
+        .selector
+        .index
+        .context("workspace selector is required")?;
+    if index == 0 {
+        bail!("workspace index is one-based and must be greater than zero");
+    }
+    Ok(wire::v1::WorkspaceSelector::LocalIndex {
+        output: parse_output(args.output.as_deref())?,
+        index,
+    })
+}
+
+fn negotiate(path: &Path) -> Result<u16> {
+    let response = request_line(
+        path,
         &encode_frame(BOOTSTRAP_VERSION, &wire::v0::Request::Versions)?,
     )?;
     let wire::v0::Response::Versions { minimum, current } =
-        decode_frame::<wire::v0::Response>(&versions, BOOTSTRAP_VERSION)?
+        decode_frame::<wire::v0::Response>(&response, BOOTSTRAP_VERSION)?
     else {
         bail!("server rejected version negotiation")
     };
@@ -54,27 +249,115 @@ fn main() -> Result<()> {
             "no common IPC version (server {minimum}..={current}, client {MIN_VERSION}..={CURRENT_VERSION})"
         );
     }
-    let request = Request {
-        kind: RequestKind::Command(IpcCommand::GetState),
-    };
-    let payload = exchange(&socket, &encode_frame(maximum_common, &request)?)?;
-    match decode_frame::<Response>(&payload, maximum_common)? {
-        Response::Success(Success::State { snapshot, .. }) => {
-            print!("{}", format_overview(&snapshot))
-        }
-        Response::Success(_) => bail!("unexpected IPC success response"),
-        Response::Error(error) => bail!("{:?}: {}", error.code, error.message),
-    }
-    Ok(())
+    Ok(maximum_common)
 }
 
-fn exchange(path: &std::path::Path, frame: &str) -> Result<String> {
+fn request(path: &Path, version: u16, kind: RequestKind) -> Result<Response> {
+    let frame = request_line(path, &encode_frame(version, &Request { kind })?)?;
+    Ok(decode_frame(&frame, version)?)
+}
+
+fn request_line(path: &Path, frame: &str) -> Result<String> {
     let mut stream = UnixStream::connect(path)?;
     stream.write_all(frame.as_bytes())?;
-    stream.shutdown(Shutdown::Write)?;
-    let mut payload = String::new();
-    stream.read_to_string(&mut payload)?;
-    Ok(payload)
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response)?;
+    if response.is_empty() {
+        bail!("IPC server closed without a response");
+    }
+    Ok(response)
+}
+
+fn get_state(path: &Path, version: u16) -> Result<(u64, DesktopSnapshot)> {
+    match request(path, version, RequestKind::Command(IpcCommand::GetState))? {
+        Response::Success(Success::State { sequence, snapshot }) => Ok((sequence, snapshot)),
+        Response::Success(_) => bail!("unexpected IPC success response"),
+        Response::Error(error) => command_error(error),
+    }
+}
+
+fn print_command_response(response: Response, output: &mut impl Write) -> Result<()> {
+    match response {
+        Response::Success(Success::Handled { sequence }) => {
+            writeln!(output, "handled at sequence {sequence}")?;
+            Ok(())
+        }
+        Response::Success(Success::State { sequence, snapshot }) => {
+            writeln!(
+                output,
+                "{}",
+                ron::to_string(&Success::State { sequence, snapshot })?
+            )?;
+            Ok(())
+        }
+        Response::Success(Success::EventStream { .. }) => {
+            bail!("unexpected event-stream response")
+        }
+        Response::Error(error) => command_error(error),
+    }
+}
+
+fn command_error<T>(error: wire::v1::Error) -> Result<T> {
+    bail!(
+        "{:?}: {} (sequence {})",
+        error.code,
+        error.message,
+        error.sequence
+    )
+}
+
+fn stream_events(path: &Path, version: u16, output: &mut impl Write) -> Result<()> {
+    let mut stream = UnixStream::connect(path)?;
+    stream.write_all(
+        encode_frame(
+            version,
+            &Request {
+                kind: RequestKind::EventStream,
+            },
+        )?
+        .as_bytes(),
+    )?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        bail!("event stream closed before its snapshot");
+    }
+    let mut expected_sequence = match decode_frame::<Response>(&line, version)? {
+        Response::Success(Success::EventStream { sequence, snapshot }) => {
+            writeln!(
+                output,
+                "{}",
+                ron::to_string(&Success::State { sequence, snapshot })?
+            )?;
+            output.flush()?;
+            sequence.checked_add(1)
+        }
+        Response::Success(_) => bail!("unexpected IPC success response"),
+        Response::Error(error) => return command_error(error),
+    };
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            bail!("event stream disconnected");
+        }
+        let event = decode_frame::<wire::v1::EventEnvelope>(&line, version)?;
+        let Some(expected) = expected_sequence else {
+            bail!(
+                "event stream sequence overflow: expected no event after {}, received {}",
+                u64::MAX,
+                event.sequence
+            );
+        };
+        if event.sequence != expected {
+            bail!(
+                "event stream sequence gap: expected {expected}, received {}",
+                event.sequence
+            );
+        }
+        expected_sequence = event.sequence.checked_add(1);
+        writeln!(output, "{}", ron::to_string(&event)?)?;
+        output.flush()?;
+    }
 }
 
 fn format_overview(snapshot: &DesktopSnapshot) -> String {
@@ -131,16 +414,24 @@ fn format_workspace(workspace: &wire::v1::WorkspaceSnapshot) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixListener,
+        thread,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use astera_ipc::wire::v1::{
-        OutputId, OutputTransform, Rect, Scale120, Size, WindowId, WorkspaceId,
+        Event, EventEnvelope, OutputId, OutputSelector, OutputTransform, Rect, Scale120, Size,
+        WindowId, WorkspaceId, WorkspaceSelector,
     };
     use astera_ipc::{ConfigSnapshot, DesktopSnapshot, OutputSnapshot, WorkspaceSnapshot};
 
-    use super::format_overview;
+    use super::*;
 
-    #[test]
-    fn overview_marks_active_output_and_background_workspace() {
-        let snapshot = DesktopSnapshot {
+    fn snapshot() -> DesktopSnapshot {
+        DesktopSnapshot {
             active_output: Some(OutputId(2)),
             primary_output: Some(OutputId(2)),
             focused_window: Some(WindowId(9)),
@@ -184,10 +475,173 @@ mod tests {
             cameras: vec![],
             windows: vec![],
             config: ConfigSnapshot::default(),
-        };
+        }
+    }
 
-        let overview = format_overview(&snapshot);
+    fn run_event_stream_fixture(
+        snapshot_sequence: u64,
+        event_sequences: &[u64],
+    ) -> (anyhow::Error, String) {
+        let directory = std::env::temp_dir().join(format!(
+            "astrology-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("ipc");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server_snapshot = snapshot();
+        let event_sequences = event_sequences.to_vec();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert!(matches!(
+                decode_frame::<Request>(&request, CURRENT_VERSION)
+                    .unwrap()
+                    .kind,
+                RequestKind::EventStream
+            ));
+            stream
+                .write_all(
+                    encode_frame(
+                        CURRENT_VERSION,
+                        &Response::Success(Success::EventStream {
+                            sequence: snapshot_sequence,
+                            snapshot: server_snapshot,
+                        }),
+                    )
+                    .unwrap()
+                    .as_bytes(),
+                )
+                .unwrap();
+            for sequence in event_sequences {
+                stream
+                    .write_all(
+                        encode_frame(
+                            CURRENT_VERSION,
+                            &EventEnvelope {
+                                sequence,
+                                event: Event::Unsupported {
+                                    name: "future".into(),
+                                },
+                            },
+                        )
+                        .unwrap()
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
+        });
+        let mut output = Vec::new();
+        let error = stream_events(&path, CURRENT_VERSION, &mut output).unwrap_err();
+        server.join().unwrap();
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+        (error, String::from_utf8(output).unwrap())
+    }
+
+    #[test]
+    fn overview_marks_active_output_and_background_workspace() {
+        let overview = format_overview(&snapshot());
         assert!(overview.contains("DP-1 *: workspace 3, 2 total, 2560x1440 logical, 1.50x"));
         assert!(overview.contains("4: background"));
+    }
+
+    #[test]
+    fn typed_parser_supports_active_output_and_local_workspace() {
+        let args = Args::try_parse_from([
+            "astrology",
+            "move-window",
+            "42",
+            "--index",
+            "3",
+            "--output",
+            "DP-1",
+            "--activate",
+        ])
+        .unwrap();
+        let command = typed_command(args.command.unwrap()).unwrap();
+        assert_eq!(
+            command,
+            IpcCommand::MoveWindow {
+                window: WindowId(42),
+                target: WorkspaceSelector::LocalIndex {
+                    output: OutputSelector::Key("DP-1".into()),
+                    index: 3,
+                },
+                activate: true,
+            }
+        );
+
+        let args = Args::try_parse_from(["astrology", "focus-output"]).unwrap();
+        assert_eq!(
+            typed_command(args.command.unwrap()).unwrap(),
+            IpcCommand::FocusOutput(OutputSelector::Active)
+        );
+    }
+
+    #[test]
+    fn generic_command_parses_every_wire_command_shape() {
+        let encoded = ron::to_string(&IpcCommand::SetWorkspaceName {
+            workspace: WorkspaceId(7),
+            name: Some("work".into()),
+        })
+        .unwrap();
+        let args = Args::try_parse_from(["astrology", "command", &encoded]).unwrap();
+        assert_eq!(
+            typed_command(args.command.unwrap()).unwrap(),
+            IpcCommand::SetWorkspaceName {
+                workspace: WorkspaceId(7),
+                name: Some("work".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn event_stream_prints_snapshot_then_envelopes_and_errors_on_eof() {
+        let expected_snapshot = snapshot();
+        let (error, output) = run_event_stream_fixture(8, &[9]);
+        assert!(error.to_string().contains("disconnected"));
+        let mut lines = output.lines();
+        assert!(matches!(
+            ron::from_str::<Success>(lines.next().unwrap()).unwrap(),
+            Success::State {
+                sequence: 8,
+                snapshot
+            } if snapshot == expected_snapshot
+        ));
+        assert!(matches!(
+            ron::from_str::<EventEnvelope>(lines.next().unwrap()).unwrap(),
+            EventEnvelope { sequence: 9, .. }
+        ));
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn event_stream_rejects_a_gap_after_the_snapshot() {
+        let (error, output) = run_event_stream_fixture(8, &[10]);
+        assert!(
+            error
+                .to_string()
+                .contains("sequence gap: expected 9, received 10")
+        );
+        assert_eq!(output.lines().count(), 1);
+    }
+
+    #[test]
+    fn event_stream_rejects_a_gap_between_events() {
+        let (error, output) = run_event_stream_fixture(8, &[9, 11]);
+        assert!(
+            error
+                .to_string()
+                .contains("sequence gap: expected 10, received 11")
+        );
+        assert_eq!(output.lines().count(), 2);
     }
 }
