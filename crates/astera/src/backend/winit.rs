@@ -68,6 +68,10 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
                 .insert_client(stream, Arc::new(ClientState::default()))?;
         }
         display.dispatch_clients(&mut state)?;
+        // Initial xdg configure and other protocol replies must not depend on render damage.
+        // Waiting until submit() creates a cycle: the client cannot attach its first buffer until
+        // it receives configure, while the compositor sees no surface damage until that attach.
+        display.flush_clients()?;
         ipc.dispatch(&mut state);
         state.poll_config();
         if state.should_quit() {

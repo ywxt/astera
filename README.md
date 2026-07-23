@@ -171,10 +171,19 @@ For a human-readable workspace overview and output status, run:
 
 ```sh
 WAYLAND_DISPLAY=astera-1 cargo run -p astera --bin astrology -- overview
+
+# Equivalent when this shell still points at the parent compositor.
+cargo run -p astera --bin astrology -- --display astera-1 overview
+
+# Or bypass display-name resolution entirely.
+cargo run -p astera --bin astrology -- \
+  --socket "$XDG_RUNTIME_DIR/astera/astera-1.ipc" overview
 ```
 
 The active output is marked with `*`; detached workspaces are shown as
-`background`.
+`background`. With neither option, `astrology` uses the current shell's
+`WAYLAND_DISPLAY`. A host terminal often still points at the parent compositor,
+so use `--display` or `--socket` with the display name Astera prints at startup.
 
 `astrology` also exposes the complete IPC surface:
 

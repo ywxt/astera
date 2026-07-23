@@ -19,6 +19,14 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
     about = "Inspect and control a running Astera compositor"
 )]
 struct Args {
+    /// Astera Wayland display name. Defaults to WAYLAND_DISPLAY.
+    #[arg(long, global = true, value_name = "NAME")]
+    display: Option<String>,
+
+    /// Connect to an explicit Astera IPC socket instead of deriving it from the display name.
+    #[arg(long, global = true, value_name = "PATH", conflicts_with = "display")]
+    socket: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Option<AstrologyCommand>,
 }
@@ -118,16 +126,18 @@ impl From<WindowModeArg> for wire::v1::WindowMode {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let display = env::var("WAYLAND_DISPLAY")?;
-    let runtime = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .context("XDG_RUNTIME_DIR is required")?;
-    let socket = runtime.join("astera").join(format!("{display}.ipc"));
+    let socket = resolve_socket(&args)?;
     run(args, &socket, &mut std::io::stdout())
 }
 
 fn run(args: Args, socket: &Path, output: &mut impl Write) -> Result<()> {
-    let version = negotiate(socket)?;
+    let version = negotiate(socket).with_context(|| {
+        format!(
+            "could not negotiate with Astera IPC socket {}; pass --display <NAME> (for example \
+             --display astera-1) or --socket <PATH>",
+            socket.display()
+        )
+    })?;
     match args.command.unwrap_or(AstrologyCommand::Overview) {
         AstrologyCommand::Overview => {
             let (_, snapshot) = get_state(socket, version)?;
@@ -160,6 +170,31 @@ fn run(args: Args, socket: &Path, output: &mut impl Write) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_socket(args: &Args) -> Result<PathBuf> {
+    resolve_socket_from(
+        args,
+        env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        env::var("WAYLAND_DISPLAY").ok(),
+    )
+}
+
+fn resolve_socket_from(
+    args: &Args,
+    runtime: Option<PathBuf>,
+    environment_display: Option<String>,
+) -> Result<PathBuf> {
+    if let Some(socket) = &args.socket {
+        return Ok(socket.clone());
+    }
+    let display = match args.display.clone() {
+        Some(display) => display,
+        None => environment_display
+            .context("WAYLAND_DISPLAY is not set; pass --display <NAME> or --socket <PATH>")?,
+    };
+    let runtime = runtime.context("XDG_RUNTIME_DIR is required")?;
+    Ok(runtime.join("astera").join(format!("{display}.ipc")))
 }
 
 fn typed_command(command: AstrologyCommand) -> Result<IpcCommand> {
@@ -583,6 +618,39 @@ mod tests {
         assert_eq!(
             typed_command(args.command.unwrap()).unwrap(),
             IpcCommand::FocusOutput(OutputSelector::Active)
+        );
+    }
+
+    #[test]
+    fn explicit_display_and_socket_select_the_ipc_endpoint() {
+        let args =
+            Args::try_parse_from(["astrology", "--display", "astera-7", "overview"]).unwrap();
+        assert_eq!(
+            resolve_socket_from(&args, Some(PathBuf::from("/run/user/1000")), None).unwrap(),
+            PathBuf::from("/run/user/1000/astera/astera-7.ipc")
+        );
+
+        let args =
+            Args::try_parse_from(["astrology", "--socket", "/tmp/astera-test.ipc", "overview"])
+                .unwrap();
+        assert_eq!(
+            resolve_socket_from(&args, None, None).unwrap(),
+            PathBuf::from("/tmp/astera-test.ipc")
+        );
+
+        let args = Args::try_parse_from(["astrology", "overview"]).unwrap();
+        let error =
+            resolve_socket_from(&args, Some(PathBuf::from("/run/user/1000")), None).unwrap_err();
+        assert!(error.to_string().contains("--display"));
+        assert!(
+            Args::try_parse_from([
+                "astrology",
+                "--display",
+                "astera-1",
+                "--socket",
+                "/tmp/astera.ipc",
+            ])
+            .is_err()
         );
     }
 
