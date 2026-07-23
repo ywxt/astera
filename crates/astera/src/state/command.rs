@@ -27,7 +27,7 @@ impl Astera {
         let returns_state = matches!(&command, Command::GetState);
         match &command {
             Command::GetState => tracing::debug!("IPC state snapshot requested"),
-            command => tracing::info!(?command, "command started"),
+            command => tracing::info!(kind = command_kind(command), "IPC command started"),
         }
         // Protocol configure is emitted only after the core transaction commits successfully.
         let mode_change = match &command {
@@ -430,6 +430,23 @@ impl Astera {
             .focus_direction(workspace, direction)
             .map_err(map_desktop_error)?;
         Ok(())
+    }
+}
+
+fn command_kind(command: &Command) -> &'static str {
+    match command {
+        Command::GetState => "get-state",
+        Command::FocusWindow(_) => "focus-window",
+        Command::FocusDirection(_) => "focus-direction",
+        Command::FocusOutput(_) => "focus-output",
+        Command::ConfigureOutput { .. } => "configure-output",
+        Command::FocusWorkspace { .. } => "focus-workspace",
+        Command::MoveWorkspace { .. } => "move-workspace",
+        Command::SetWorkspaceName { .. } => "set-workspace-name",
+        Command::MoveWindow { .. } => "move-window",
+        Command::SetWindowMode { .. } => "set-window-mode",
+        Command::SetCameraPolicy { .. } => "set-camera-policy",
+        Command::PanCamera { .. } => "pan-camera",
     }
 }
 

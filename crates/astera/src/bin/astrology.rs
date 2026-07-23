@@ -37,7 +37,7 @@ fn main() -> Result<()> {
     let runtime = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .context("XDG_RUNTIME_DIR is required")?;
-    let socket = runtime.join(format!("{display}.ipc"));
+    let socket = runtime.join("astera").join(format!("{display}.ipc"));
     let versions = exchange(
         &socket,
         &encode_frame(BOOTSTRAP_VERSION, &wire::v0::Request::Versions)?,

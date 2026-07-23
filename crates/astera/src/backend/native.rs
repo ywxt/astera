@@ -635,7 +635,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         }
         runtime.state.process_key_repeats();
         runtime.state.remove_dead_windows();
-        runtime.state.publish_public_state();
+        runtime.ipc.finish_tick(&mut runtime.state);
         runtime.render_all();
         runtime.display.flush_clients()?;
     }

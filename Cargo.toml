@@ -21,6 +21,7 @@ astera-config = { path = "crates/astera-config" }
 astera-ipc = { path = "crates/astera-ipc" }
 clap = { version = "4.6", features = ["derive"] }
 ron = "0.12"
+rustix = { version = "1", features = ["net", "process"] }
 serde = { version = "1", features = ["derive"] }
 smol = "2"
 thiserror = "2"

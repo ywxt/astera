@@ -44,7 +44,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         let (renderer, _) = backend.bind()?;
         state.enable_dmabuf(renderer.dmabuf_formats());
     }
-    let ipc = IpcServer::bind(&socket_name)?;
+    let mut ipc = IpcServer::bind(&socket_name)?;
     let started = Instant::now();
     let mut tracked_size = backend.window_size();
     let mut damage_tracker = OutputDamageTracker::new(tracked_size, 1.0, Transform::Flipped180);
@@ -79,7 +79,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
 
         let size = backend.window_size();
         state.update_output_size(i64::from(size.w), i64::from(size.h));
-        state.publish_public_state();
+        ipc.finish_tick(&mut state);
         if size != tracked_size {
             tracked_size = size;
             damage_tracker = OutputDamageTracker::new(size, 1.0, Transform::Flipped180);

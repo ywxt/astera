@@ -117,10 +117,11 @@ terminal with the printed value, for example:
 WAYLAND_DISPLAY=astera-1 weston-terminal
 ```
 
-The compositor also creates `<runtime-dir>/<wayland-display>.ipc`. Every frame is
-one newline-terminated `<version> <RON>` record and every request uses a separate
-connection. Clients first send the frozen v0 `Versions` bootstrap request, choose
-an overlap with the returned bounds, then open a v1 command connection. The
+The compositor also creates `<runtime-dir>/astera/<wayland-display>.ipc`. Every frame is
+one newline-terminated `<version> <RON>` record. A command connection processes
+multiple requests strictly in order and may be upgraded permanently to an event
+stream. Clients first send the frozen v0 `Versions` bootstrap request, choose an
+overlap with the returned bounds, then open a v1 connection. The
 current and minimum command protocol versions are both 1. Protocol v1 exposes
 output focus, workspace focus/move/name operations, window transfer, mode and
 camera commands, plus per-output physical/logical size, scale and transform

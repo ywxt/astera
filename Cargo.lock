@@ -142,6 +142,7 @@ dependencies = [
  "astera-ipc",
  "clap",
  "ron",
+ "rustix 1.1.4",
  "smithay",
  "smithay-drm-extras",
  "smol",
