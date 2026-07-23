@@ -1,4 +1,8 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use ::winit::platform::pump_events::PumpStatus;
 use anyhow::{Context, Result, anyhow};
@@ -27,6 +31,46 @@ use crate::{
     state::{Astera, ClientState, send_frames_surface_tree},
 };
 
+const NESTED_REFRESH_HZ: u32 = 60;
+
+/// Paces the polling winit backend without coupling compositor progress to host redraw events.
+///
+/// Smithay intentionally pumps winit with a zero timeout. Without an explicit deadline the outer
+/// loop busy-spins even when no surface is changing. Missing a deadline resets from `now` rather
+/// than trying to catch up, which prevents a slow frame from causing a burst of unpaced frames.
+struct FramePacer {
+    interval: Duration,
+    deadline: Instant,
+}
+
+impl FramePacer {
+    fn new(refresh_hz: u32) -> Self {
+        let interval = Duration::from_secs_f64(1.0 / f64::from(refresh_hz));
+        Self {
+            interval,
+            deadline: Instant::now() + interval,
+        }
+    }
+
+    fn delay_at(&mut self, now: Instant) -> Duration {
+        if now >= self.deadline {
+            self.deadline = now + self.interval;
+            Duration::ZERO
+        } else {
+            let delay = self.deadline - now;
+            self.deadline += self.interval;
+            delay
+        }
+    }
+
+    fn wait(&mut self) {
+        let delay = self.delay_at(Instant::now());
+        if !delay.is_zero() {
+            thread::sleep(delay);
+        }
+    }
+}
+
 pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     let mut display: Display<Astera> = Display::new()?;
     let mut state = Astera::new(&display.handle(), config);
@@ -48,6 +92,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     let started = Instant::now();
     let mut tracked_size = backend.window_size();
     let mut damage_tracker = OutputDamageTracker::new(tracked_size, 1.0, Transform::Flipped180);
+    let mut frame_pacer = FramePacer::new(NESTED_REFRESH_HZ);
 
     tracing::info!(wayland_display = %socket_name, "nested compositor is ready");
     println!("WAYLAND_DISPLAY={socket_name}");
@@ -151,5 +196,28 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         if let Some(damage) = submitted_damage {
             backend.submit(Some(&damage))?;
         }
+        frame_pacer.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_pacer_waits_until_deadline_and_drops_missed_frames() {
+        let interval = Duration::from_millis(16);
+        let start = Instant::now();
+        let mut pacer = FramePacer {
+            interval,
+            deadline: start + interval,
+        };
+
+        assert_eq!(pacer.delay_at(start), interval);
+        assert_eq!(pacer.deadline, start + interval * 2);
+
+        let late = start + interval * 4;
+        assert_eq!(pacer.delay_at(late), Duration::ZERO);
+        assert_eq!(pacer.deadline, late + interval);
     }
 }
