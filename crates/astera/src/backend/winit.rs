@@ -60,6 +60,8 @@ struct WinitLoop {
     shutdown_deadline: Option<Instant>,
     frame_retry_deadline: Option<Instant>,
     frame_retry_delay: Duration,
+    host_configured: bool,
+    has_presented: bool,
 }
 
 impl WinitLoop {
@@ -119,16 +121,25 @@ impl WinitLoop {
                     self.state.process_input(event);
                     scene_changed = true;
                 }
-                RuntimeEvent::Winit(WinitEvent::Resized { .. }) => {
-                    // Recreate the tracker below, which forces a complete repaint.
-                    scene_changed = true;
+                RuntimeEvent::Winit(WinitEvent::Resized { size, .. }) => {
+                    // A Wayland-hosted winit EGL surface is not valid before its
+                    // first non-zero configure. Rendering earlier causes
+                    // EGL_BAD_SURFACE during buffer-age queries.
+                    self.host_configured = size.w > 0 && size.h > 0;
+                    self.has_presented = false;
+                    self.present_ready = false;
+                    scene_changed |= self.host_configured;
                 }
                 RuntimeEvent::Winit(WinitEvent::Redraw) => {
                     // Treat Redraw as the host presentation grant. This also
                     // forces the first frame after an unreported occlusion to be
                     // complete; Smithay 0.7 does not forward Occluded itself.
-                    self.reset_damage_tracker();
-                    self.present_ready = true;
+                    if self.host_configured {
+                        self.reset_damage_tracker();
+                        self.present_ready = true;
+                    } else {
+                        tracing::debug!("ignoring redraw before host window configure");
+                    }
                 }
                 RuntimeEvent::Winit(WinitEvent::CloseRequested) => self.exiting = true,
                 RuntimeEvent::Winit(WinitEvent::Focus(focused)) => {
@@ -182,7 +193,11 @@ impl WinitLoop {
             tracing::warn!(%error, "could not flush Wayland clients");
         }
 
-        if scene_changed && !self.present_ready && self.shutdown_deadline.is_none() {
+        if self.host_configured
+            && scene_changed
+            && !self.present_ready
+            && self.shutdown_deadline.is_none()
+        {
             // request_redraw is coalesced by winit itself. We intentionally do
             // not retain a local latch: a host that suppressed a redraw while
             // hidden must be able to accept a later request after restoration.
@@ -195,6 +210,7 @@ impl WinitLoop {
                 // clients. The next state change retries from a full frame.
                 tracing::warn!(%error, "nested frame submission failed");
                 self.reset_damage_tracker();
+                self.has_presented = false;
                 self.frame_retry_deadline = Some(Instant::now() + self.frame_retry_delay);
                 self.frame_retry_delay = (self.frame_retry_delay * 2).min(FRAME_RETRY_MAX);
             } else {
@@ -224,7 +240,14 @@ impl WinitLoop {
     }
 
     fn render_and_present(&mut self) -> Result<()> {
-        let buffer_age = self.backend.buffer_age().unwrap_or(0);
+        // EGL buffer age is only defined after this surface has completed a
+        // swap. Querying it on the first frame produces EGL_BAD_SURFACE on
+        // some Wayland/Mesa combinations.
+        let buffer_age = if self.has_presented {
+            self.backend.buffer_age().unwrap_or(0)
+        } else {
+            0
+        };
         let roots = self.state.render_roots();
         let mut frame_callbacks = Vec::new();
         let damage = {
@@ -280,6 +303,7 @@ impl WinitLoop {
         // A frame callback without visual damage still needs a real host presentation
         // opportunity. Swap even when the damage tracker returns None.
         self.backend.submit(damage.as_deref())?;
+        self.has_presented = true;
         let frame_time = self.started.elapsed().as_millis() as u32;
         complete_frame_callbacks(&frame_callbacks, frame_time);
         self.display.flush_clients()?;
@@ -390,8 +414,9 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         shutdown_deadline: None,
         frame_retry_deadline: None,
         frame_retry_delay: FRAME_RETRY_INITIAL,
+        host_configured: false,
+        has_presented: false,
     };
-    runtime.backend.window().request_redraw();
 
     tracing::info!(wayland_display = %socket_name, "nested compositor is ready");
     println!("WAYLAND_DISPLAY={socket_name}");
