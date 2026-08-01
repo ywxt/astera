@@ -21,7 +21,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install compositor build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libegl1-mesa-dev xvfb
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libegl1-mesa-dev xvfb xauth
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test workspace (rerun failures for diagnostics)

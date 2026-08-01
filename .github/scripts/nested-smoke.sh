@@ -32,6 +32,20 @@ for _ in $(seq 1 100); do
             grep -q '^Outputs$' <<<"$overview"
             grep -q '^Workspaces$' <<<"$overview"
             kill -0 "$compositor_pid"
+            XDG_RUNTIME_DIR="$runtime_dir" WAYLAND_DISPLAY="$display_name" \
+                target/debug/astrology command 'Quit' >/dev/null
+            for _ in $(seq 1 100); do
+                if ! kill -0 "$compositor_pid" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.05
+            done
+            if kill -0 "$compositor_pid" 2>/dev/null; then
+                echo "nested compositor did not exit after Quit" >&2
+                exit 1
+            fi
+            wait "$compositor_pid"
+            compositor_pid=""
             exit 0
         fi
     fi

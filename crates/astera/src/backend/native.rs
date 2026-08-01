@@ -49,7 +49,7 @@ use crate::{
     backend::{
         native_policy::{ConnectorSnapshot, ModeCandidate, SnapshotSource, scan_outputs},
         render::surface_tree_snapshot,
-        runtime::{OutputPhase, RenderRequest, RepaintReasons, RepaintScheduler},
+        runtime::{RenderRequest, RepaintReasons, RepaintScheduler},
         sources::{OneShotReadableFdSource, ReadableFdSource, WaylandSocketSource},
     },
     ipc_server::IpcServer,
@@ -61,6 +61,8 @@ const MAX_NATIVE_FRAMES_PER_BATCH: usize = 4;
 const MAX_QUEUED_NATIVE_EVENTS: usize = 4096;
 const DEFAULT_RETRACE: Duration = Duration::from_millis(16);
 const FENCE_RECHECK_INITIAL: Duration = Duration::from_millis(1);
+const FENCE_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 struct NativeLoop {
     handle: LoopHandle<'static, NativeLoop>,
@@ -79,6 +81,7 @@ struct NativeLoop {
     wayland_ready_queued: bool,
     ipc_ready_queued: bool,
     config_changed_queued: bool,
+    shutdown_deadline: Option<Instant>,
 }
 
 enum NativeEvent {
@@ -145,10 +148,9 @@ struct NativeSurface {
     output: OutputId,
     drm: NativeOutput,
     pending: Option<PendingNativeFrame>,
-    applied_size: Size,
-    modes: Vec<smithay::reexports::drm::control::Mode>,
     retrace: Duration,
     waiting_fence: Option<PendingGpuFence>,
+    exported_fence: Option<PendingExportedFence>,
 }
 
 struct PendingNativeFrame {
@@ -164,6 +166,13 @@ struct PendingGpuFence {
     sync: SyncPoint,
     deadline: Instant,
     delay: Duration,
+    expires_at: Instant,
+}
+
+struct PendingExportedFence {
+    frame_id: u64,
+    deadline: Instant,
+    registration: RegistrationToken,
 }
 
 impl NativeLoop {
@@ -175,7 +184,7 @@ impl NativeLoop {
             _ => {}
         }
         if self.events.len() >= MAX_QUEUED_NATIVE_EVENTS {
-            if is_lossy_native_motion(&event) || matches!(event, NativeEvent::WaylandClient(_)) {
+            if is_lossy_native_motion(&event) {
                 tracing::warn!("native source queue is full; dropping a lossy event");
                 return;
             } else {
@@ -237,6 +246,9 @@ impl NativeLoop {
                     for surface in device.outputs.values_mut() {
                         surface.pending = None;
                         surface.waiting_fence = None;
+                        if let Some(fence) = surface.exported_fence.take() {
+                            self.handle.remove(fence.registration);
+                        }
                     }
                 }
                 tracing::info!("native session paused");
@@ -280,7 +292,10 @@ impl NativeLoop {
             NativeEvent::Drm {
                 node,
                 event: DrmEvent::Error(error),
-            } => tracing::error!(?node, ?error, "DRM event error"),
+            } => {
+                tracing::error!(?node, ?error, "DRM event error");
+                self.fail_device_frames(node);
+            }
             NativeEvent::FenceReady {
                 node,
                 crtc,
@@ -321,6 +336,19 @@ impl NativeLoop {
         for output in outputs {
             self.scheduler.request(output, reason);
         }
+    }
+
+    fn begin_shutdown(&mut self) {
+        if self.shutdown_deadline.is_none() {
+            self.shutdown_deadline = Some(Instant::now() + SHUTDOWN_GRACE);
+            self.scheduler.pause();
+            tracing::info!("draining IPC replies before native compositor shutdown");
+        }
+    }
+
+    fn shutdown_complete(&self) -> bool {
+        self.shutdown_deadline
+            .is_some_and(|deadline| !self.ipc.has_pending_output() || Instant::now() >= deadline)
     }
 
     fn device_added(&mut self, node: DrmNode, path: &Path) -> Result<()> {
@@ -477,11 +505,6 @@ impl NativeLoop {
                                             output: id,
                                             drm: drm_output,
                                             pending: None,
-                                            applied_size: Size::new(
-                                                i64::from(width),
-                                                i64::from(height),
-                                            ),
-                                            modes: connector.modes().to_vec(),
                                             retrace: if mode.vrefresh() > 0 {
                                                 Duration::from_secs_f64(
                                                     1000.0 / f64::from(mode.vrefresh()),
@@ -490,6 +513,7 @@ impl NativeLoop {
                                                 DEFAULT_RETRACE
                                             },
                                             waiting_fence: None,
+                                            exported_fence: None,
                                         },
                                     );
                                     self.scheduler.add_output(id);
@@ -559,6 +583,14 @@ impl NativeLoop {
             Ok(None) => return,
             Err(error) => {
                 tracing::warn!(?node, ?crtc, ?error, "could not retire submitted DRM frame");
+                if let Some(frame) = surface.pending.take() {
+                    surface.drm.reset_buffers();
+                    self.scheduler.retry_at(
+                        surface.output,
+                        frame.frame_id,
+                        Instant::now() + surface.retrace,
+                    );
+                }
                 return;
             }
         };
@@ -577,6 +609,39 @@ impl NativeLoop {
         if self.scheduler.presented(surface.output, frame.frame_id) {
             let frame_time = self.started.elapsed().as_millis() as u32;
             complete_frame_callbacks(&frame.callbacks, frame_time);
+        }
+    }
+
+    fn fail_device_frames(&mut self, node: DrmNode) {
+        let Some(device) = self.devices.get_mut(&node) else {
+            return;
+        };
+        for surface in device.outputs.values_mut() {
+            if let Some(frame) = surface.pending.take() {
+                surface.drm.reset_buffers();
+                self.scheduler.retry_at(
+                    surface.output,
+                    frame.frame_id,
+                    Instant::now() + surface.retrace,
+                );
+            }
+            if let Some(fence) = surface.waiting_fence.take() {
+                surface.drm.reset_buffers();
+                self.scheduler.retry_at(
+                    surface.output,
+                    fence.frame_id,
+                    Instant::now() + surface.retrace,
+                );
+            }
+            if let Some(fence) = surface.exported_fence.take() {
+                self.handle.remove(fence.registration);
+                surface.drm.reset_buffers();
+                self.scheduler.retry_at(
+                    surface.output,
+                    fence.frame_id,
+                    Instant::now() + surface.retrace,
+                );
+            }
         }
     }
 
@@ -614,28 +679,59 @@ impl NativeLoop {
         self.devices
             .values()
             .flat_map(|device| device.outputs.values())
-            .filter_map(|surface| surface.waiting_fence.as_ref().map(|fence| fence.deadline))
+            .flat_map(|surface| {
+                [
+                    surface.waiting_fence.as_ref().map(|fence| fence.deadline),
+                    surface.exported_fence.as_ref().map(|fence| fence.deadline),
+                ]
+                .into_iter()
+                .flatten()
+            })
             .min()
     }
 
     fn poll_non_exportable_fences(&mut self, now: Instant) {
         let mut ready = Vec::new();
+        let mut failed = Vec::new();
         for (node, device) in &mut self.devices {
             for (crtc, surface) in &mut device.outputs {
-                let Some(fence) = surface.waiting_fence.as_mut() else {
-                    continue;
-                };
-                if fence.deadline > now {
-                    continue;
+                if let Some(fence) = surface.waiting_fence.as_mut()
+                    && fence.deadline <= now
+                {
+                    if fence.sync.is_reached() {
+                        let fence = surface.waiting_fence.take().unwrap();
+                        ready.push((*node, *crtc, fence.frame_id, fence.callbacks));
+                    } else if fence.expires_at <= now {
+                        let fence = surface.waiting_fence.take().unwrap();
+                        surface.drm.reset_buffers();
+                        failed.push((surface.output, fence.frame_id, surface.retrace, None));
+                    } else {
+                        fence.delay = (fence.delay * 2).min(surface.retrace);
+                        fence.deadline = now + fence.delay;
+                    }
                 }
-                if fence.sync.is_reached() {
-                    let fence = surface.waiting_fence.take().unwrap();
-                    ready.push((*node, *crtc, fence.frame_id, fence.callbacks));
-                } else {
-                    fence.delay = (fence.delay * 2).min(surface.retrace);
-                    fence.deadline = now + fence.delay;
+                if surface
+                    .exported_fence
+                    .as_ref()
+                    .is_some_and(|fence| fence.deadline <= now)
+                {
+                    let fence = surface.exported_fence.take().unwrap();
+                    surface.drm.reset_buffers();
+                    failed.push((
+                        surface.output,
+                        fence.frame_id,
+                        surface.retrace,
+                        Some(fence.registration),
+                    ));
                 }
             }
+        }
+        for (output, frame_id, retrace, registration) in failed {
+            if let Some(registration) = registration {
+                self.handle.remove(registration);
+            }
+            tracing::warn!(?output, frame_id, "GPU fence timed out; retrying frame");
+            self.scheduler.retry_at(output, frame_id, now + retrace);
         }
         for (node, crtc, frame_id, callbacks) in ready {
             self.queue_prepared_frame(node, crtc, frame_id, callbacks);
@@ -660,80 +756,6 @@ impl NativeLoop {
         }
     }
 
-    fn apply_output_configurations(&mut self) {
-        let changes = self
-            .devices
-            .iter()
-            .flat_map(|(node, device)| {
-                device.outputs.iter().filter_map(|(crtc, surface)| {
-                    if !matches!(
-                        self.scheduler.phase(surface.output),
-                        Some(OutputPhase::Idle | OutputPhase::Scheduled)
-                    ) {
-                        return None;
-                    }
-                    let requested = self.state.desktop_output(surface.output)?.physical_size;
-                    (requested != surface.applied_size).then_some((
-                        *node,
-                        *crtc,
-                        surface.output,
-                        surface.applied_size,
-                        requested,
-                    ))
-                })
-            })
-            .collect::<Vec<_>>();
-        for (node, crtc, output, previous, requested) in changes {
-            let Some(mode) = self.devices[&node].outputs[&crtc]
-                .modes
-                .iter()
-                .copied()
-                .find(|mode| {
-                    let (width, height) = mode.size();
-                    i64::from(width) == requested.width && i64::from(height) == requested.height
-                })
-            else {
-                tracing::warn!(?output, ?requested, "requested KMS mode is not advertised");
-                self.state.rollback_output_physical_size(output, previous);
-                continue;
-            };
-            let mut renderer = match self.gpus.single_renderer(&node) {
-                Ok(renderer) => renderer,
-                Err(error) => {
-                    tracing::warn!(?output, %error, "could not acquire renderer for mode switch");
-                    self.state.rollback_output_physical_size(output, previous);
-                    continue;
-                }
-            };
-            let empty = DrmOutputRenderElements::<
-                NativeRenderer<'_>,
-                WaylandSurfaceRenderElement<NativeRenderer<'_>>,
-            >::default();
-            let surface = self
-                .devices
-                .get_mut(&node)
-                .unwrap()
-                .outputs
-                .get_mut(&crtc)
-                .unwrap();
-            match surface.drm.use_mode(mode, &mut renderer, &empty) {
-                Ok(()) => {
-                    surface.applied_size = requested;
-                    surface.retrace = if mode.vrefresh() > 0 {
-                        Duration::from_secs_f64(1000.0 / f64::from(mode.vrefresh()))
-                    } else {
-                        DEFAULT_RETRACE
-                    };
-                    self.scheduler.request(output, RepaintReasons::FULL_REPAINT);
-                }
-                Err(error) => {
-                    tracing::warn!(?output, ?error, "KMS mode switch failed; rolling back");
-                    self.state.rollback_output_physical_size(output, previous);
-                }
-            }
-        }
-    }
-
     fn queue_prepared_frame(
         &mut self,
         node: DrmNode,
@@ -749,6 +771,13 @@ impl NativeLoop {
             return;
         };
         let output = surface.output;
+        if surface
+            .exported_fence
+            .as_ref()
+            .is_some_and(|fence| fence.frame_id == frame_id)
+        {
+            surface.exported_fence = None;
+        }
         if !self.scheduler.submitted(output, frame_id) {
             tracing::debug!(?output, frame_id, "discarding stale prepared DRM frame");
             return;
@@ -861,13 +890,23 @@ impl NativeLoop {
                             });
                         },
                     );
-                    if let Err(error) = registration {
-                        tracing::warn!(%error, "could not register GPU fence; retrying frame");
-                        self.scheduler.retry_at(
-                            output,
-                            request.frame_id,
-                            Instant::now() + surface.retrace,
-                        );
+                    match registration {
+                        Ok(registration) => {
+                            surface.exported_fence = Some(PendingExportedFence {
+                                frame_id: request.frame_id,
+                                deadline: Instant::now() + FENCE_TIMEOUT,
+                                registration,
+                            });
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "could not register GPU fence; retrying frame");
+                            surface.drm.reset_buffers();
+                            self.scheduler.retry_at(
+                                output,
+                                request.frame_id,
+                                Instant::now() + surface.retrace,
+                            );
+                        }
                     }
                 } else {
                     if let Some(sync) = sync.filter(|sync| !sync.is_reached()) {
@@ -880,6 +919,7 @@ impl NativeLoop {
                             sync,
                             deadline: Instant::now() + FENCE_RECHECK_INITIAL,
                             delay: FENCE_RECHECK_INITIAL,
+                            expires_at: Instant::now() + FENCE_TIMEOUT,
                         });
                     } else if !self.scheduler.submitted(output, request.frame_id) {
                         tracing::debug!(
@@ -928,7 +968,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     let handle = event_loop.handle();
     let display = Display::<Astera>::new()?;
     let mut state = Astera::new(&display.handle(), config);
-    state.set_output_configuration_supported(true);
+    state.set_output_configuration_supported(false);
     state.watch_config(config_path);
     state.disconnect_output(astera_core::OutputId(0))?;
     let listener = WaylandSocketSource::bind_auto("astera", 1..32)?;
@@ -1018,6 +1058,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         wayland_ready_queued: false,
         ipc_ready_queued: false,
         config_changed_queued: false,
+        shutdown_deadline: None,
     };
     for (device_id, path) in initial_devices {
         match DrmNode::from_dev_id(device_id) {
@@ -1032,7 +1073,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     tracing::info!(wayland_display = %socket_name, seat = %seat_name, "native session is ready");
     println!("WAYLAND_DISPLAY={socket_name}");
 
-    loop {
+    while !runtime.shutdown_complete() {
         let now = Instant::now();
         let deadline = [
             runtime.ipc.next_timeout(),
@@ -1040,6 +1081,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
             runtime.scheduler.earliest_deadline(),
             runtime.next_software_presentation(),
             runtime.next_fence_check(),
+            runtime.shutdown_deadline,
         ]
         .into_iter()
         .flatten()
@@ -1053,15 +1095,13 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         runtime.process_events()?;
         let now = Instant::now();
         runtime.ipc.expire(now);
-        runtime.apply_output_configurations();
         let timer_due = runtime
             .state
             .next_timer_deadline()
             .is_some_and(|deadline| deadline <= now);
         runtime.state.poll_config();
         if runtime.state.should_quit() {
-            tracing::info!("quit action requested");
-            return Ok(());
+            runtime.begin_shutdown();
         }
         runtime.state.process_key_repeats();
         runtime.state.remove_dead_windows();
@@ -1071,7 +1111,11 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
             runtime.request_all(RepaintReasons::DAMAGE);
         }
         runtime.ipc.finish_tick(&mut runtime.state);
-        runtime.render_all();
+        if runtime.shutdown_deadline.is_none() {
+            runtime.render_all();
+        }
         runtime.display.flush_clients()?;
     }
+    tracing::info!("native compositor is shutting down");
+    Ok(())
 }

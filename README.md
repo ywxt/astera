@@ -22,9 +22,9 @@ primary output. They remember their original output and return when it
 reconnects. If every output disconnects, they remain detached until one returns.
 
 The repository contains the compositor-independent layout engine, configuration
-and IPC contracts, plus a first Smithay nested backend. Native Wayland clients
-can connect through `xdg-shell`; their toplevels are placed by the radial layout
-engine and rendered with GLES in the nested window.
+and IPC contracts, and Smithay winit and DRM/KMS backends. Native Wayland clients
+connect through `xdg-shell`; their toplevels are placed by the radial layout
+engine and rendered with GLES.
 
 ## Build
 
@@ -109,6 +109,14 @@ through udev, assigns a CRTC and preferred mode to every usable connector, and
 renders each output with its own GBM/KMS swapchain. Connector removal preserves
 workspace layout, focus and camera state. Reconnecting the same stable output
 restores its workspaces and last active workspace.
+
+Both backends use one calloop-driven runtime. Wayland clients, IPC, configuration
+inotify, input, session/udev, DRM page flips, exported GPU fences and timer
+deadlines wake the compositor directly; idle compositors do not poll. Repaints
+are coalesced per output, only one native frame may await presentation per
+output, and frame callbacks are completed from the exact submitted snapshot
+after host redraw, DRM vblank, or the next retrace for an unchanged scanout.
+Transient frame failures use bounded deadline backoff rather than a busy retry.
 
 Astera prints the socket name when it starts. Launch a client from another
 terminal with the printed value, for example:
@@ -252,7 +260,8 @@ drags remain clamped to their source output. Floating windows keep an exact
 placement cache per stable output key and a normalized fallback anchor for a new
 output. The nested backend can change per-output physical size, logical size,
 fractional scale and transform atomically with protocol v1 `ConfigureOutput`.
-The native backend currently rejects this command until KMS reconfiguration is
-implemented, instead of publishing metadata that disagrees with scanout.
+The native backend currently rejects this command until KMS reconfiguration can
+be completed atomically with its IPC response, instead of publishing metadata
+that may disagree with scanout.
 
 Astera remains experimental. Animated layout transitions are not implemented yet.

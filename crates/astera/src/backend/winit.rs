@@ -84,7 +84,7 @@ impl WinitLoop {
             // must never be discarded because that can leave compositor state stuck.
             if let Some(index) = self.events.iter().position(is_lossy_motion) {
                 self.events.remove(index);
-            } else if is_lossy_motion(&event) || matches!(event, RuntimeEvent::WaylandClient(_)) {
+            } else if is_lossy_motion(&event) {
                 tracing::warn!("runtime source queue is full; dropping a lossy source event");
                 return;
             } else {

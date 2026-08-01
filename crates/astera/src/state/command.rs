@@ -353,7 +353,7 @@ impl Astera {
         if !self.output_configuration_supported {
             return Err(CommandError::new(
                 ErrorCode::Conflict,
-                "the native backend does not support live KMS output reconfiguration",
+                "this backend does not support live output reconfiguration",
             ));
         }
         let output = self.resolve_output(selector)?;
