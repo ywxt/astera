@@ -11,7 +11,10 @@ use smithay::reexports::wayland_server::Display;
 use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
     globals::registry_queue_init,
-    protocol::{wl_compositor::WlCompositor, wl_registry::WlRegistry, wl_surface::WlSurface},
+    protocol::{
+        wl_callback::WlCallback, wl_compositor::WlCompositor, wl_registry::WlRegistry,
+        wl_surface::WlSurface,
+    },
 };
 use wayland_protocols::wp::{
     fractional_scale::v1::client::{
@@ -47,6 +50,7 @@ impl Dispatch<WlRegistry, wayland_client::globals::GlobalListContents> for TestC
 
 delegate_noop!(TestClient: ignore WlCompositor);
 delegate_noop!(TestClient: ignore WlSurface);
+delegate_noop!(TestClient: ignore WlCallback);
 delegate_noop!(TestClient: ignore XdgToplevel);
 delegate_noop!(TestClient: ignore XdgPopup);
 delegate_noop!(TestClient: ignore XdgPositioner);
@@ -262,6 +266,56 @@ fn uncommitted_toplevel_does_not_map_and_role_destroy_cleans_up() {
     });
     dispatch_until(&mut display, &mut state, |state| state.windows.is_empty());
     surface_destroy_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn frame_callback_snapshot_does_not_relock_surface_tree_state() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        let _frame = surface.frame(&queue, ());
+        surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    let surface = state.windows[0].surface.wl_surface().clone();
+    let (snapshot_tx, snapshot_rx) = mpsc::sync_channel(0);
+    thread::spawn(move || {
+        let count = crate::backend::render::frame_callbacks_for_tree(&surface).len();
+        snapshot_tx.send(count).unwrap();
+    });
+    assert_eq!(
+        snapshot_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        1,
+        "surface traversal must capture the pending callback without recursively locking state"
+    );
+
+    done_tx.send(()).unwrap();
     client.join().unwrap();
 }
 

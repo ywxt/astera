@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     ops::{Deref, DerefMut},
     os::fd::OwnedFd,
     sync::Arc,
@@ -73,8 +73,8 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-            SurfaceData, TraversalAction, with_states, with_surface_tree_downward,
+            CompositorClientState, CompositorHandler, CompositorState, TraversalAction,
+            with_states, with_surface_tree_downward,
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         fractional_scale::{
@@ -1148,59 +1148,6 @@ impl Astera {
 mod command;
 
 mod protocol;
-
-/// Capture the exact callback objects associated with a surface tree.
-///
-/// Keeping the objects (rather than just the root surface) prevents callbacks
-/// committed after the render snapshot from being acknowledged by that frame.
-#[derive(Clone)]
-pub struct FrameCallback {
-    surface: WlSurface,
-    callback: smithay::reexports::wayland_server::protocol::wl_callback::WlCallback,
-}
-
-pub fn frame_callbacks_surface(surface: &WlSurface, states: &SurfaceData) -> Vec<FrameCallback> {
-    // Surface-tree traversal already owns the surface-state lock. Reading the
-    // state through with_states() here would recursively acquire that lock.
-    states
-        .cached_state
-        .get::<SurfaceAttributes>()
-        .current()
-        .frame_callbacks
-        .iter()
-        .cloned()
-        .map(|callback| FrameCallback {
-            surface: surface.clone(),
-            callback,
-        })
-        .collect()
-}
-
-/// Complete exactly the callback objects captured for a successfully submitted frame.
-pub fn complete_frame_callbacks(callbacks: &[FrameCallback], time: u32) {
-    use smithay::reexports::wayland_server::Resource;
-
-    let mut callbacks_by_surface = HashMap::<WlSurface, HashSet<_>>::new();
-    // A callback is a one-shot protocol object. Sending `done` on the captured
-    // handles first makes completion independent of later surface-tree changes.
-    for item in callbacks.iter() {
-        item.callback.done(time);
-        callbacks_by_surface
-            .entry(item.surface.clone())
-            .or_default()
-            .insert(item.callback.id());
-    }
-    for (surface, callback_ids) in callbacks_by_surface {
-        with_states(&surface, |states| {
-            states
-                .cached_state
-                .get::<SurfaceAttributes>()
-                .current()
-                .frame_callbacks
-                .retain(|callback| !callback_ids.contains(&callback.id()));
-        });
-    }
-}
 
 fn extend_surface_tree(surfaces: &mut HashSet<WlSurface>, root: &WlSurface) {
     with_surface_tree_downward(

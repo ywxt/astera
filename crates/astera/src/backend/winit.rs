@@ -24,11 +24,11 @@ use smithay::{
 
 use crate::{
     backend::{
-        render::surface_tree_snapshot,
+        render::{complete_frame_callbacks, surface_tree_snapshot},
         sources::{ReadableFdSource, WaylandSocketSource},
     },
     ipc_server::IpcServer,
-    state::{Astera, ClientState, complete_frame_callbacks},
+    state::{Astera, ClientState},
 };
 
 const MAX_EVENTS_PER_BATCH: usize = 256;
@@ -118,59 +118,7 @@ impl WinitLoop {
             let Some(event) = self.events.pop_front() else {
                 break;
             };
-            match event {
-                RuntimeEvent::Winit(WinitEvent::Input(event)) => {
-                    self.state.process_input(event);
-                }
-                RuntimeEvent::Winit(WinitEvent::Resized { size, .. }) => {
-                    // A Wayland-hosted winit EGL surface is not valid before its
-                    // first non-zero configure. Rendering earlier causes
-                    // EGL_BAD_SURFACE during buffer-age queries.
-                    let was_configured = self.host_configured;
-                    let size_changed = size != self.tracked_size;
-                    tracing::trace!(?size, tracked = ?self.tracked_size, "nested host resized");
-                    self.host_configured = size.w > 0 && size.h > 0;
-                    if size_changed || self.host_configured != was_configured {
-                        self.has_presented = false;
-                        self.present_ready = false;
-                        scene_changed |= self.host_configured;
-                    }
-                }
-                RuntimeEvent::Winit(WinitEvent::Redraw) => {
-                    if self.host_configured && self.scene_dirty {
-                        self.present_ready = true;
-                    } else {
-                        tracing::debug!("ignoring redraw before host window configure");
-                    }
-                }
-                RuntimeEvent::Winit(WinitEvent::CloseRequested) => self.exiting = true,
-                RuntimeEvent::Winit(WinitEvent::Focus(focused)) => {
-                    if focused {
-                        // Smithay 0.7 does not expose winit's Occluded event. Focus
-                        // restoration is therefore a conservative full-repaint signal.
-                        self.reset_damage_tracker();
-                        scene_changed = true;
-                    }
-                }
-                RuntimeEvent::WaylandClient(stream) => {
-                    if let Err(error) = self
-                        .display
-                        .handle()
-                        .insert_client(stream, Arc::new(ClientState::default()))
-                    {
-                        tracing::warn!(%error, "could not insert Wayland client");
-                    } else {
-                        self.dispatch_wayland_clients()?;
-                    }
-                }
-                RuntimeEvent::WaylandReady => {
-                    self.dispatch_wayland_clients()?;
-                }
-                RuntimeEvent::IpcReady => {
-                    self.ipc.dispatch(&mut self.state);
-                }
-                RuntimeEvent::ConfigChanged => self.state.notify_config_changed(),
-            }
+            scene_changed |= self.reduce_event(event)?;
         }
 
         self.ipc.expire(now);
@@ -225,6 +173,52 @@ impl WinitLoop {
             }
         }
         Ok(())
+    }
+
+    fn reduce_event(&mut self, event: RuntimeEvent) -> Result<bool> {
+        match event {
+            RuntimeEvent::Winit(WinitEvent::Input(event)) => {
+                self.state.process_input(event);
+            }
+            RuntimeEvent::Winit(WinitEvent::Resized { size, .. }) => {
+                // The host EGL surface is invalid before its first non-zero
+                // configure, and buffer age resets whenever its size changes.
+                let was_configured = self.host_configured;
+                let size_changed = size != self.tracked_size;
+                self.host_configured = size.w > 0 && size.h > 0;
+                if size_changed || self.host_configured != was_configured {
+                    self.has_presented = false;
+                    self.present_ready = false;
+                    return Ok(self.host_configured);
+                }
+            }
+            RuntimeEvent::Winit(WinitEvent::Redraw) => {
+                self.present_ready |= self.host_configured && self.scene_dirty;
+            }
+            RuntimeEvent::Winit(WinitEvent::CloseRequested) => self.exiting = true,
+            RuntimeEvent::Winit(WinitEvent::Focus(true)) => {
+                // Smithay 0.7 does not expose Occluded; focus restoration is a
+                // conservative full-repaint signal.
+                self.reset_damage_tracker();
+                return Ok(true);
+            }
+            RuntimeEvent::Winit(WinitEvent::Focus(false)) => {}
+            RuntimeEvent::WaylandClient(stream) => {
+                if let Err(error) = self
+                    .display
+                    .handle()
+                    .insert_client(stream, Arc::new(ClientState::default()))
+                {
+                    tracing::warn!(%error, "could not insert Wayland client");
+                } else {
+                    self.dispatch_wayland_clients()?;
+                }
+            }
+            RuntimeEvent::WaylandReady => self.dispatch_wayland_clients()?,
+            RuntimeEvent::IpcReady => self.ipc.dispatch(&mut self.state),
+            RuntimeEvent::ConfigChanged => self.state.notify_config_changed(),
+        }
+        Ok(false)
     }
 
     fn reset_damage_tracker(&mut self) {

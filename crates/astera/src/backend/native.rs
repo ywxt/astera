@@ -48,12 +48,12 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use crate::{
     backend::{
         native_policy::{ConnectorSnapshot, ModeCandidate, SnapshotSource, scan_outputs},
-        render::surface_tree_snapshot,
+        render::{FrameCallback, complete_frame_callbacks, surface_tree_snapshot},
         runtime::{RenderRequest, RepaintReasons, RepaintScheduler},
         sources::{OneShotReadableFdSource, ReadableFdSource, WaylandSocketSource},
     },
     ipc_server::IpcServer,
-    state::{Astera, ClientState, FrameCallback, complete_frame_callbacks},
+    state::{Astera, ClientState},
 };
 
 const MAX_NATIVE_EVENTS_PER_BATCH: usize = 256;
