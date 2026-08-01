@@ -13,8 +13,11 @@ use wayland_client::{
     globals::registry_queue_init,
     protocol::{
         wl_callback::WlCallback, wl_compositor::WlCompositor, wl_registry::WlRegistry,
-        wl_surface::WlSurface,
+        wl_seat::WlSeat, wl_surface::WlSurface,
     },
+};
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1::ExtIdleNotificationV1, ext_idle_notifier_v1::ExtIdleNotifierV1,
 };
 use wayland_protocols::wp::{
     fractional_scale::v1::client::{
@@ -60,6 +63,7 @@ impl Dispatch<WlRegistry, wayland_client::globals::GlobalListContents> for TestC
 delegate_noop!(TestClient: ignore WlCompositor);
 delegate_noop!(TestClient: ignore WlSurface);
 delegate_noop!(TestClient: ignore WlCallback);
+delegate_noop!(TestClient: ignore WlSeat);
 delegate_noop!(TestClient: ignore XdgToplevel);
 delegate_noop!(TestClient: ignore XdgPopup);
 delegate_noop!(TestClient: ignore XdgPositioner);
@@ -72,6 +76,8 @@ delegate_noop!(TestClient: ignore XdgActivationV1);
 delegate_noop!(TestClient: ignore XdgActivationTokenV1);
 delegate_noop!(TestClient: ignore ZxdgDecorationManagerV1);
 delegate_noop!(TestClient: ignore ZxdgToplevelDecorationV1);
+delegate_noop!(TestClient: ignore ExtIdleNotifierV1);
+delegate_noop!(TestClient: ignore ExtIdleNotificationV1);
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
     fn event(
@@ -166,6 +172,11 @@ fn decoration_and_activation_globals_are_advertised() {
         let _activation = globals
             .bind::<XdgActivationV1, _, _>(&queue, 1..=1, ())
             .unwrap();
+        let idle = globals
+            .bind::<ExtIdleNotifierV1, _, _>(&queue, 1..=2, ())
+            .unwrap();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let _idle_notification = idle.get_idle_notification(0, &seat, &queue, ());
         let surface = compositor.create_surface(&queue, ());
         let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
         let toplevel = xdg_surface.get_toplevel(&queue, ());
@@ -192,6 +203,15 @@ fn decoration_and_activation_globals_are_advertised() {
             })
         })
     });
+    dispatch_until(&mut display, &mut state, |state| {
+        !state.idle_notifications.is_empty()
+    });
+    assert!(
+        state
+            .next_timer_deadline()
+            .is_some_and(|deadline| deadline <= state.clock.now())
+    );
+    state.process_idle_timers();
     // Exercise the denial path and one-shot lifetime without manufacturing a fake input serial.
     // An invalid token must still notify the user via urgency, then disappear permanently.
     state.windows[0].mapped = true;

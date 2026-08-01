@@ -1097,13 +1097,14 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         runtime.ipc.expire(now);
         let timer_due = runtime
             .state
-            .next_timer_deadline()
+            .next_visual_timer_deadline()
             .is_some_and(|deadline| deadline <= now);
         runtime.state.poll_config();
         if runtime.state.should_quit() {
             runtime.begin_shutdown();
         }
         runtime.state.process_key_repeats();
+        runtime.state.process_idle_timers();
         runtime.state.remove_dead_windows();
         runtime.poll_non_exportable_fences(now);
         runtime.retire_software_presentations(now);

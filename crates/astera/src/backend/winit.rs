@@ -105,7 +105,7 @@ impl WinitLoop {
         let render_generation = self.state.render_generation();
         let mut scene_changed = self
             .state
-            .next_timer_deadline()
+            .next_visual_timer_deadline()
             .is_some_and(|deadline| deadline <= now);
         if self
             .frame_retry_deadline
@@ -124,6 +124,7 @@ impl WinitLoop {
         self.ipc.expire(now);
         self.state.poll_config();
         self.state.process_key_repeats();
+        self.state.process_idle_timers();
         self.state.remove_dead_windows();
         let size = self.backend.window_size();
         self.state

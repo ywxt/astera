@@ -10,6 +10,7 @@ mod clock;
 mod config_watcher;
 mod event_hub;
 mod geometry;
+mod idle;
 mod key_repeat;
 mod model;
 mod output;
@@ -26,6 +27,7 @@ use event_hub::EventHub;
 use geometry::{
     layer_rank, mode_layer, output_transform, physical_point, point_inside, saturating_i32,
 };
+use idle::{IdleEvent, IdleRuntime};
 use key_repeat::KeyRepeatState;
 use model::{DragState, MappedLayer, MappedWindow, OutputRuntime, ProtocolState};
 
@@ -140,6 +142,9 @@ pub struct Astera {
     pending_dmabufs: Vec<(Dmabuf, ImportNotifier)>,
     dmabuf_enabled: bool,
     serial: u32,
+    idle_runtime: IdleRuntime,
+    idle_notifications: BTreeMap<u64, smithay::reexports::wayland_protocols::ext::idle_notify::v1::server::ext_idle_notification_v1::ExtIdleNotificationV1>,
+    next_idle_notification: u64,
     activation_tracker: ActivationTracker,
 }
 
@@ -164,6 +169,7 @@ impl Astera {
 
     fn new_with_clock(display: &DisplayHandle, config: Config, clock: Arc<dyn Clock>) -> Self {
         let compositor_state = CompositorState::new::<Self>(display);
+        display.create_global::<Self, smithay::reexports::wayland_protocols::ext::idle_notify::v1::server::ext_idle_notifier_v1::ExtIdleNotifierV1, _>(2, ());
         let xdg_shell_state = XdgShellState::new::<Self>(display);
         let xdg_decoration_state = XdgDecorationState::new::<Self>(display);
         let xdg_activation_state = XdgActivationState::new::<Self>(display);
@@ -276,6 +282,9 @@ impl Astera {
             pending_dmabufs: Vec::new(),
             dmabuf_enabled: false,
             serial: 1,
+            idle_runtime: IdleRuntime::default(),
+            idle_notifications: BTreeMap::new(),
+            next_idle_notification: 1,
             activation_tracker: ActivationTracker::default(),
         }
     }
@@ -374,6 +383,18 @@ impl Astera {
     }
 
     pub fn process_input<B: InputBackend>(&mut self, event: InputEvent<B>) {
+        let is_activity = matches!(
+            &event,
+            InputEvent::Keyboard { .. }
+                | InputEvent::PointerMotionAbsolute { .. }
+                | InputEvent::PointerMotion { .. }
+                | InputEvent::PointerButton { .. }
+                | InputEvent::PointerAxis { .. }
+        );
+        if is_activity {
+            let events = self.idle_runtime.activity(0, self.clock.now());
+            self.send_idle_events(events);
+        }
         if !self.desktop.outputs.contains_key(&self.active_output) {
             return;
         }
@@ -834,6 +855,16 @@ impl Astera {
 
     pub fn next_timer_deadline(&self) -> Option<std::time::Instant> {
         [
+            self.next_visual_timer_deadline(),
+            self.idle_runtime.deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    pub fn next_visual_timer_deadline(&self) -> Option<std::time::Instant> {
+        [
             self.key_repeat.deadline(),
             self.config_watcher
                 .as_ref()
@@ -842,6 +873,28 @@ impl Astera {
         .into_iter()
         .flatten()
         .min()
+    }
+
+    pub fn process_idle_timers(&mut self) {
+        let events = self.idle_runtime.process_due(self.clock.now());
+        self.send_idle_events(events);
+    }
+
+    fn send_idle_events(&self, events: Vec<IdleEvent>) {
+        for event in events {
+            match event {
+                IdleEvent::Idled(id) => {
+                    if let Some(resource) = self.idle_notifications.get(&id) {
+                        resource.idled();
+                    }
+                }
+                IdleEvent::Resumed(id) => {
+                    if let Some(resource) = self.idle_notifications.get(&id) {
+                        resource.resumed();
+                    }
+                }
+            }
+        }
     }
 
     fn execute_action(&mut self, action: Action) -> AnyResult<()> {
