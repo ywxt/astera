@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::{Deref, DerefMut},
     os::fd::OwnedFd,
     sync::Arc,
@@ -785,6 +785,18 @@ impl Astera {
         }
     }
 
+    pub fn next_timer_deadline(&self) -> Option<std::time::Instant> {
+        [
+            self.key_repeat.deadline(),
+            self.config_watcher
+                .as_ref()
+                .and_then(ConfigWatcher::deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
     fn execute_action(&mut self, action: Action) -> AnyResult<()> {
         // Resolve focus once so every focused-window action observes the same state snapshot.
         let focused = self
@@ -1124,24 +1136,89 @@ mod command;
 
 mod protocol;
 
-pub fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
+/// Capture the exact callback objects associated with a surface tree.
+///
+/// Keeping the objects (rather than just the root surface) prevents callbacks
+/// committed after the render snapshot from being acknowledged by that frame.
+#[derive(Clone)]
+pub struct FrameCallback {
+    surface: WlSurface,
+    callback: smithay::reexports::wayland_server::protocol::wl_callback::WlCallback,
+}
+
+pub fn frame_callbacks_surface(surface: &WlSurface) -> Vec<FrameCallback> {
+    with_states(surface, |states| {
+        states
+            .cached_state
+            .get::<SurfaceAttributes>()
+            .current()
+            .frame_callbacks
+            .iter()
+            .cloned()
+            .map(|callback| FrameCallback {
+                surface: surface.clone(),
+                callback,
+            })
+            .collect()
+    })
+}
+
+pub fn frame_callbacks_surface_tree(surface: &WlSurface) -> Vec<FrameCallback> {
+    let mut callbacks = Vec::new();
     with_surface_tree_downward(
         surface,
         (),
         |_, _, &()| TraversalAction::DoChildren(()),
-        |_surface, states, &()| {
-            for callback in states
+        |surface, states, &()| {
+            callbacks.extend(
+                states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .current()
+                    .frame_callbacks
+                    .iter()
+                    .cloned()
+                    .map(|callback| FrameCallback {
+                        surface: surface.clone(),
+                        callback,
+                    }),
+            );
+        },
+        |_, _, &()| true,
+    );
+    callbacks
+}
+
+/// Complete exactly the callback objects captured for a successfully submitted frame.
+pub fn complete_frame_callbacks(callbacks: &[FrameCallback], time: u32) {
+    use smithay::reexports::wayland_server::Resource;
+
+    let mut callbacks_by_surface = HashMap::<WlSurface, HashSet<_>>::new();
+    // A callback is a one-shot protocol object. Sending `done` on the captured
+    // handles first makes completion independent of later surface-tree changes.
+    for item in callbacks.iter() {
+        item.callback.done(time);
+        callbacks_by_surface
+            .entry(item.surface.clone())
+            .or_default()
+            .insert(item.callback.id());
+    }
+    for (surface, callback_ids) in callbacks_by_surface {
+        with_states(&surface, |states| {
+            states
                 .cached_state
                 .get::<SurfaceAttributes>()
                 .current()
                 .frame_callbacks
-                .drain(..)
-            {
-                callback.done(time);
-            }
-        },
-        |_, _, &()| true,
-    );
+                .retain(|callback| !callback_ids.contains(&callback.id()));
+        });
+    }
+}
+
+/// Legacy immediate completion used by the native backend until its frame
+/// submission path adopts the same explicit snapshot type.
+pub fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
+    complete_frame_callbacks(&frame_callbacks_surface_tree(surface), time);
 }
 
 fn extend_surface_tree(surfaces: &mut HashSet<WlSurface>, root: &WlSurface) {

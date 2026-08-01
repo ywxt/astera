@@ -145,6 +145,10 @@ impl ConfigWatcher {
         })
     }
 
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.reload_at
+    }
+
     fn event_is_relevant(&self, name: Option<&std::ffi::CStr>) -> bool {
         let Some(name) = name else {
             return true;

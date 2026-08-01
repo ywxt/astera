@@ -638,6 +638,18 @@ impl IpcServer {
         self.io.borrow().next_timeout()
     }
 
+    /// Returns true while a command reply or event still needs to reach a client.
+    ///
+    /// Backends use this during their bounded shutdown phase so a successful
+    /// `Quit` reply is not discarded with the server.
+    pub fn has_pending_output(&self) -> bool {
+        self.io
+            .borrow()
+            .connections
+            .values()
+            .any(Connection::wants_write)
+    }
+
     pub fn expire(&mut self, now: Instant) {
         self.io.borrow_mut().expire(now);
         self.retain_live_subscribers();
@@ -950,19 +962,24 @@ mod tests {
     use std::{
         io::{BufRead, BufReader, Write},
         os::unix::fs::{PermissionsExt, symlink},
-        sync::mpsc,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
         thread,
         time::SystemTime,
     };
 
     fn temporary_socket() -> (PathBuf, PathBuf) {
+        static NEXT_TEMPORARY_SOCKET: AtomicU64 = AtomicU64::new(0);
         let directory = std::env::temp_dir().join(format!(
-            "astera-ipc-{}-{}",
+            "astera-ipc-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_TEMPORARY_SOCKET.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir(&directory).unwrap();
         let socket = directory.join("test.ipc");

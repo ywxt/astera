@@ -33,6 +33,10 @@ pub(super) struct KeyRepeatState {
 }
 
 impl KeyRepeatState {
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        self.held.last().map(|held| held.next_at)
+    }
+
     pub(super) fn intercept(&mut self, keycode: Keycode) {
         // Record this before returning Intercept from Smithay's keyboard filter.
         self.intercepted.insert(keycode);

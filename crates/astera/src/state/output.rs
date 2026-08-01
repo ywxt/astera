@@ -87,6 +87,9 @@ impl Astera {
         // Compute window geometry once. Previously each frame rebuilt and sorted this list twice,
         // then performed another linear surface-to-window lookup for every item.
         let windows = self.mapped_windows_for_output(output).collect::<Vec<_>>();
+        let has_fullscreen = windows
+            .iter()
+            .any(|(_, _, _, mode)| *mode == WindowMode::Fullscreen);
         // Ordering here is both render order and the contract mirrored by scene hit testing.
         let mut roots = Vec::new();
         roots.extend(self.layer_roots(output, Layer::Overlay));
@@ -103,10 +106,11 @@ impl Astera {
             windows
                 .iter()
                 .filter(|(_, _, _, mode)| {
-                    matches!(
-                        mode,
-                        WindowMode::Maximized | WindowMode::Floating | WindowMode::Tiled
-                    )
+                    !has_fullscreen
+                        && matches!(
+                            mode,
+                            WindowMode::Maximized | WindowMode::Floating | WindowMode::Tiled
+                        )
                 })
                 .map(|(surface, location, scale, _)| {
                     (surface.wl_surface().clone(), *location, *scale)
