@@ -61,7 +61,7 @@ where
                 kind,
             ) {
                 Ok(Some(element)) => {
-                    callbacks.extend(frame_callbacks_surface(surface));
+                    callbacks.extend(frame_callbacks_surface(surface, states));
                     elements.push(element);
                 }
                 Ok(None) => {}

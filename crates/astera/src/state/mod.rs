@@ -74,7 +74,7 @@ use smithay::{
         buffer::BufferHandler,
         compositor::{
             CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-            TraversalAction, with_states, with_surface_tree_downward,
+            SurfaceData, TraversalAction, with_states, with_surface_tree_downward,
         },
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         fractional_scale::{
@@ -122,6 +122,10 @@ pub struct Astera {
     config_watcher: Option<ConfigWatcher>,
     event_hub: EventHub,
     public_dirty: bool,
+    // Backends compare this generation across one event batch. Protocol
+    // readiness alone must not schedule a frame: only a mutation which can
+    // change the composed scene advances it.
+    render_generation: u64,
     #[cfg(test)]
     public_snapshot_builds: u64,
     should_quit: bool,
@@ -252,6 +256,7 @@ impl Astera {
             event_hub: EventHub::default(),
             // The first publish establishes the event hub's authoritative baseline.
             public_dirty: true,
+            render_generation: 0,
             #[cfg(test)]
             public_snapshot_builds: 0,
             should_quit: false,
@@ -260,6 +265,14 @@ impl Astera {
             dmabuf_enabled: false,
             serial: 1,
         }
+    }
+
+    pub fn render_generation(&self) -> u64 {
+        self.render_generation
+    }
+
+    pub(super) fn mark_render_dirty(&mut self) {
+        self.render_generation = self.render_generation.wrapping_add(1);
     }
 
     #[allow(dead_code)] // Used by the native backend's hotplug path.
@@ -1146,21 +1159,21 @@ pub struct FrameCallback {
     callback: smithay::reexports::wayland_server::protocol::wl_callback::WlCallback,
 }
 
-pub fn frame_callbacks_surface(surface: &WlSurface) -> Vec<FrameCallback> {
-    with_states(surface, |states| {
-        states
-            .cached_state
-            .get::<SurfaceAttributes>()
-            .current()
-            .frame_callbacks
-            .iter()
-            .cloned()
-            .map(|callback| FrameCallback {
-                surface: surface.clone(),
-                callback,
-            })
-            .collect()
-    })
+pub fn frame_callbacks_surface(surface: &WlSurface, states: &SurfaceData) -> Vec<FrameCallback> {
+    // Surface-tree traversal already owns the surface-state lock. Reading the
+    // state through with_states() here would recursively acquire that lock.
+    states
+        .cached_state
+        .get::<SurfaceAttributes>()
+        .current()
+        .frame_callbacks
+        .iter()
+        .cloned()
+        .map(|callback| FrameCallback {
+            surface: surface.clone(),
+            callback,
+        })
+        .collect()
 }
 
 /// Complete exactly the callback objects captured for a successfully submitted frame.

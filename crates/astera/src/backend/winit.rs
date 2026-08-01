@@ -62,6 +62,7 @@ struct WinitLoop {
     frame_retry_delay: Duration,
     host_configured: bool,
     has_presented: bool,
+    scene_dirty: bool,
 }
 
 impl WinitLoop {
@@ -101,6 +102,7 @@ impl WinitLoop {
 
     fn process_events(&mut self) -> Result<()> {
         let now = Instant::now();
+        let render_generation = self.state.render_generation();
         let mut scene_changed = self
             .state
             .next_timer_deadline()
@@ -119,23 +121,23 @@ impl WinitLoop {
             match event {
                 RuntimeEvent::Winit(WinitEvent::Input(event)) => {
                     self.state.process_input(event);
-                    scene_changed = true;
                 }
                 RuntimeEvent::Winit(WinitEvent::Resized { size, .. }) => {
                     // A Wayland-hosted winit EGL surface is not valid before its
                     // first non-zero configure. Rendering earlier causes
                     // EGL_BAD_SURFACE during buffer-age queries.
+                    let was_configured = self.host_configured;
+                    let size_changed = size != self.tracked_size;
+                    tracing::trace!(?size, tracked = ?self.tracked_size, "nested host resized");
                     self.host_configured = size.w > 0 && size.h > 0;
-                    self.has_presented = false;
-                    self.present_ready = false;
-                    scene_changed |= self.host_configured;
+                    if size_changed || self.host_configured != was_configured {
+                        self.has_presented = false;
+                        self.present_ready = false;
+                        scene_changed |= self.host_configured;
+                    }
                 }
                 RuntimeEvent::Winit(WinitEvent::Redraw) => {
-                    // Treat Redraw as the host presentation grant. This also
-                    // forces the first frame after an unreported occlusion to be
-                    // complete; Smithay 0.7 does not forward Occluded itself.
-                    if self.host_configured {
-                        self.reset_damage_tracker();
+                    if self.host_configured && self.scene_dirty {
                         self.present_ready = true;
                     } else {
                         tracing::debug!("ignoring redraw before host window configure");
@@ -159,16 +161,13 @@ impl WinitLoop {
                         tracing::warn!(%error, "could not insert Wayland client");
                     } else {
                         self.dispatch_wayland_clients()?;
-                        scene_changed = true;
                     }
                 }
                 RuntimeEvent::WaylandReady => {
                     self.dispatch_wayland_clients()?;
-                    scene_changed = true;
                 }
                 RuntimeEvent::IpcReady => {
                     self.ipc.dispatch(&mut self.state);
-                    scene_changed = true;
                 }
                 RuntimeEvent::ConfigChanged => self.state.notify_config_changed(),
             }
@@ -182,11 +181,15 @@ impl WinitLoop {
         self.state
             .update_output_size(i64::from(size.w), i64::from(size.h));
         if size != self.tracked_size {
+            tracing::trace!(?size, tracked = ?self.tracked_size, "nested size observation changed");
             self.tracked_size = size;
             self.reset_damage_tracker();
             scene_changed = true;
         }
         self.ipc.finish_tick(&mut self.state);
+        let generation_changed = self.state.render_generation() != render_generation;
+        scene_changed |= generation_changed;
+        self.scene_dirty |= scene_changed;
         // Protocol replies, especially the initial xdg configure, are independent of visual
         // damage and must leave the compositor in this transaction.
         if let Err(error) = self.display.flush_clients() {
@@ -194,7 +197,7 @@ impl WinitLoop {
         }
 
         if self.host_configured
-            && scene_changed
+            && self.scene_dirty
             && !self.present_ready
             && self.shutdown_deadline.is_none()
         {
@@ -205,6 +208,7 @@ impl WinitLoop {
         }
         if self.present_ready {
             self.present_ready = false;
+            tracing::trace!("starting nested frame");
             if let Err(error) = self.render_and_present() {
                 // A transient EGL/window error must not take down IPC and all
                 // clients. The next state change retries from a full frame.
@@ -214,6 +218,8 @@ impl WinitLoop {
                 self.frame_retry_deadline = Some(Instant::now() + self.frame_retry_delay);
                 self.frame_retry_delay = (self.frame_retry_delay * 2).min(FRAME_RETRY_MAX);
             } else {
+                tracing::trace!("nested frame completed");
+                self.scene_dirty = false;
                 self.frame_retry_deadline = None;
                 self.frame_retry_delay = FRAME_RETRY_INITIAL;
             }
@@ -251,7 +257,9 @@ impl WinitLoop {
         let roots = self.state.render_roots();
         let mut frame_callbacks = Vec::new();
         let damage = {
+            tracing::trace!("binding nested framebuffer");
             let (renderer, mut framebuffer) = self.backend.bind()?;
+            tracing::trace!("nested framebuffer bound");
             self.state.validate_dmabuf_imports(renderer);
             let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = roots
                 .iter()
@@ -288,6 +296,10 @@ impl WinitLoop {
                     elements
                 })
                 .collect();
+            tracing::trace!(
+                elements = elements.len(),
+                "nested render elements collected"
+            );
             self.damage_tracker
                 .render_output(
                     renderer,
@@ -302,7 +314,9 @@ impl WinitLoop {
 
         // A frame callback without visual damage still needs a real host presentation
         // opportunity. Swap even when the damage tracker returns None.
+        tracing::trace!(has_damage = damage.is_some(), "submitting nested frame");
         self.backend.submit(damage.as_deref())?;
+        tracing::trace!("nested frame submitted");
         self.has_presented = true;
         let frame_time = self.started.elapsed().as_millis() as u32;
         complete_frame_callbacks(&frame_callbacks, frame_time);
@@ -359,10 +373,9 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         .into_owned();
     let (mut backend, winit_events) =
         winit::init::<GlesRenderer>().map_err(|error| anyhow!(error.to_string()))?;
-    {
-        let (renderer, _) = backend.bind()?;
-        state.enable_dmabuf(renderer.dmabuf_formats());
-    }
+    // Capability discovery does not require binding the not-yet-configured host
+    // EGL surface; doing so here can produce EGL_BAD_SURFACE on Wayland hosts.
+    state.enable_dmabuf(backend.renderer().dmabuf_formats());
     let ipc = IpcServer::bind(&socket_name)?;
     let tracked_size = backend.window_size();
     let damage_tracker = OutputDamageTracker::new(tracked_size, 1.0, Transform::Flipped180);
@@ -416,6 +429,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         frame_retry_delay: FRAME_RETRY_INITIAL,
         host_configured: false,
         has_presented: false,
+        scene_dirty: false,
     };
 
     tracing::info!(wayland_display = %socket_name, "nested compositor is ready");

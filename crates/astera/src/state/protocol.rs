@@ -56,6 +56,15 @@ impl CompositorHandler for Astera {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
         self.popup_manager.commit(surface);
+        let committed_buffer =
+            with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
+        // Buffer attachment, damage and subsurface state are visual changes even
+        // when the public window metadata remains identical. A role's initial
+        // null-buffer commit is protocol setup, however, and must not consume a
+        // host frame before the surface maps.
+        if committed_buffer {
+            self.mark_render_dirty();
+        }
         // Creating an xdg role is not mapping. The first non-null buffer maps the window and a
         // null-buffer commit unmaps it while preserving the role for a later remap.
         if let Some(index) = self
@@ -63,8 +72,7 @@ impl CompositorHandler for Astera {
             .iter()
             .position(|window| window.surface.wl_surface() == surface)
         {
-            let has_buffer = with_renderer_surface_state(surface, |state| state.buffer().is_some())
-                .unwrap_or(false);
+            let has_buffer = committed_buffer;
             match (self.windows[index].mapped, has_buffer) {
                 (false, true) => self.map_toplevel(index),
                 (true, false) => self.unmap_toplevel(index),
@@ -86,8 +94,7 @@ impl CompositorHandler for Astera {
             {
                 layer_map_for_output(&runtime.wayland).arrange();
             }
-            let has_buffer = with_renderer_surface_state(surface, |state| state.buffer().is_some())
-                .unwrap_or(false);
+            let has_buffer = committed_buffer;
             if let Some(mapped) = self
                 .layers
                 .iter_mut()

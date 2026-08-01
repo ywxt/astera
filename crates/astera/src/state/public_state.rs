@@ -240,6 +240,7 @@ impl Astera {
     /// Mark an externally observable mutation for canonical snapshot diffing at tick end.
     pub(super) fn mark_public_dirty(&mut self) {
         self.public_dirty = true;
+        self.mark_render_dirty();
     }
 
     /// Publish a tick-end snapshot only when externally observable state may have changed.
