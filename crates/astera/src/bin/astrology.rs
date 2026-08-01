@@ -30,7 +30,7 @@ enum TopCommand {
     Overview,
     /// Print the authoritative desktop state.
     State {
-        /// Emit stable JSON instead of the human overview.
+        /// Emit stable JSON instead of the complete human-readable state.
         #[arg(long)]
         json: bool,
     },
@@ -40,23 +40,27 @@ enum TopCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Validate, format, or generate configuration without a running compositor.
+    /// Manage KDL configuration without a running compositor.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Inspect or control outputs.
     Output {
         #[command(subcommand)]
         command: OutputCommand,
     },
+    /// Focus, name, or move workspaces.
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    /// Focus, close, move, or change windows.
     Window {
         #[command(subcommand)]
         command: WindowCommand,
     },
+    /// Move workspace cameras.
     Camera {
         #[command(subcommand)]
         command: CameraCommand,
@@ -65,16 +69,22 @@ enum TopCommand {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Validate a configuration file.
     Check {
+        /// Configuration path; defaults to Astera's standard config path.
         path: Option<PathBuf>,
     },
+    /// Canonically format a configuration file while preserving comments.
     Format {
+        /// Configuration path; defaults to Astera's standard config path.
         path: Option<PathBuf>,
         /// Check formatting without writing.
         #[arg(long)]
         check: bool,
     },
+    /// Print or create a complete example configuration.
     Generate {
+        /// Destination with --write; defaults to Astera's standard config path.
         path: Option<PathBuf>,
         /// Create the file; refuses to overwrite an existing path.
         #[arg(long)]
@@ -84,27 +94,35 @@ enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 enum OutputCommand {
-    Focus { output: Option<String> },
+    /// Focus an output by ID or stable connector key.
+    Focus {
+        /// Output selector; omitted or "active" means the active output.
+        output: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum WorkspaceCommand {
+    /// Focus a workspace by index, name, or `id:N`.
     Focus {
         workspace: String,
         #[arg(long)]
         output: Option<String>,
     },
+    /// Assign a unique name to a workspace.
     Rename {
         workspace: String,
         name: String,
         #[arg(long)]
         output: Option<String>,
     },
+    /// Remove the explicit name from a workspace.
     ClearName {
         workspace: String,
         #[arg(long)]
         output: Option<String>,
     },
+    /// Move a workspace to another output.
     Move {
         workspace: String,
         output: String,
@@ -118,20 +136,17 @@ enum WorkspaceCommand {
 #[derive(Debug, Subcommand)]
 enum WindowCommand {
     /// Focus the nearest window in a cardinal direction.
-    Focus {
-        direction: DirectionArg,
-    },
+    Focus { direction: DirectionArg },
     /// Focus a window by ID.
-    Activate {
-        window: u64,
-    },
-    Close {
-        window: Option<u64>,
-    },
+    Activate { window: u64 },
+    /// Ask a window to close; defaults to the focused window.
+    Close { window: Option<u64> },
+    /// Set a window mode; defaults to the focused window.
     Mode {
         mode: WindowModeArg,
         window: Option<u64>,
     },
+    /// Move a window to another workspace; defaults to the focused window.
     Move {
         workspace: String,
         window: Option<u64>,
@@ -144,6 +159,7 @@ enum WindowCommand {
 
 #[derive(Debug, Subcommand)]
 enum CameraCommand {
+    /// Pan a workspace camera by a logical-pixel delta.
     Pan {
         dx: i64,
         dy: i64,
@@ -250,7 +266,7 @@ fn run(args: Args, output: &mut impl Write) -> Result<(), ExitError> {
                     .map_err(ExitError::ipc)?;
                 writeln!(output).map_err(ExitError::ipc)?;
             } else {
-                write!(output, "{}", format_overview(&snapshot)).map_err(ExitError::ipc)?;
+                write!(output, "{}", format_state(sequence, &snapshot)).map_err(ExitError::ipc)?;
             }
         }
         TopCommand::Events { json } => {
@@ -682,7 +698,7 @@ fn stream_events(path: &Path, version: u16, json: bool, output: &mut impl Write)
                 serde_json::to_writer(&mut *output, &Success::State { sequence, snapshot })?;
                 writeln!(output)?;
             } else {
-                write!(output, "{}", format_overview(&snapshot))?;
+                write!(output, "{}", format_state(sequence, &snapshot))?;
             }
             sequence.checked_add(1)
         }
@@ -759,6 +775,102 @@ fn format_overview(snapshot: &DesktopSnapshot) -> String {
         ));
     }
     text
+}
+
+fn format_state(sequence: u64, snapshot: &DesktopSnapshot) -> String {
+    let mut text = format!(
+        "State\n  sequence: {sequence}\n  active output: {}\n  primary output: {}\n  focused window: {}\n",
+        optional_id(snapshot.active_output.map(|id| id.0)),
+        optional_id(snapshot.primary_output.map(|id| id.0)),
+        optional_id(snapshot.focused_window.map(|id| id.0)),
+    );
+
+    text.push_str("Outputs\n");
+    for output in &snapshot.outputs {
+        text.push_str(&format!(
+            "  {} ({})\n    active workspace: {}\n    workspaces: {:?}\n    physical: {:?}\n    logical: {:?}\n    scale: {:.2}x\n    transform: {:?}\n    viewport: {:?}\n    usable area: {:?}\n",
+            output.id.0,
+            output.stable_key,
+            output.active_workspace.0,
+            output.workspaces.iter().map(|id| id.0).collect::<Vec<_>>(),
+            output.physical_size,
+            output.logical_size,
+            output.native_scale.0 as f64 / 120.0,
+            output.transform,
+            output.viewport,
+            output.usable_area,
+        ));
+    }
+
+    text.push_str("Workspaces\n");
+    for workspace in &snapshot.workspaces {
+        text.push_str(&format!(
+            "  {}{}\n    output: {}\n    local index: {}\n    original output: {}\n    active window: {}\n    tiled: {}\n    floating: {}\n    fullscreen: {}\n",
+            workspace.id.0,
+            workspace
+                .name
+                .as_deref()
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default(),
+            optional_id(workspace.output.map(|id| id.0)),
+            optional_id(workspace.local_index.map(u64::from)),
+            workspace.original_output.as_deref().unwrap_or("none"),
+            optional_id(workspace.active_window.map(|id| id.0)),
+            workspace.tiled_count,
+            workspace.floating_count,
+            optional_id(workspace.fullscreen.map(|id| id.0)),
+        ));
+    }
+
+    text.push_str("Windows\n");
+    for window in &snapshot.windows {
+        text.push_str(&format!(
+            "  {}\n    workspace: {}\n    mode: {:?}\n    app id: {}\n    title: {}\n    placement: {:?}\n    visible geometry: {:?}\n",
+            window.id.0,
+            window.workspace.0,
+            window.mode,
+            window.metadata.app_id.as_deref().unwrap_or("none"),
+            window.metadata.title.as_deref().unwrap_or("none"),
+            window.placement,
+            window.visible_geometry,
+        ));
+    }
+
+    text.push_str("Layers\n");
+    for layer in &snapshot.layers {
+        text.push_str(&format!(
+            "  {} ({})\n    output: {}\n    layer: {:?}\n    anchor: {:?}\n    exclusive zone: {}\n    exclusive contribution: {:?}\n    keyboard: {:?}\n    geometry: {:?}\n",
+            layer.id,
+            layer.namespace,
+            layer.output.0,
+            layer.layer,
+            layer.anchor,
+            layer.exclusive_zone,
+            layer.exclusive_contribution,
+            layer.keyboard_interactivity,
+            layer.geometry,
+        ));
+    }
+
+    text.push_str("Cameras\n");
+    for camera in &snapshot.cameras {
+        text.push_str(&format!(
+            "  workspace {}: center {:?}, policy {:?}\n",
+            camera.workspace.0, camera.center, camera.policy,
+        ));
+    }
+    text.push_str(&format!(
+        "Config\n  source: {}\n  generation: {}\n  failed: {}\n  error: {}\n",
+        snapshot.config.source.as_deref().unwrap_or("built-in"),
+        snapshot.config.generation,
+        snapshot.config.failed,
+        snapshot.config.error.as_deref().unwrap_or("none"),
+    ));
+    text
+}
+
+fn optional_id<T: std::fmt::Display>(id: Option<T>) -> String {
+    id.map(|id| id.to_string()).unwrap_or_else(|| "none".into())
 }
 
 #[cfg(test)]
@@ -894,6 +1006,10 @@ mod tests {
     #[test]
     fn cli_schema_is_valid_and_resource_commands_parse() {
         Args::command().debug_assert();
+        let help = Args::command().render_help().to_string();
+        assert!(help.contains("Inspect or control outputs"));
+        assert!(help.contains("Focus, name, or move workspaces"));
+        assert!(help.contains("Focus, close, move, or change windows"));
         let args =
             Args::try_parse_from(["astrology", "workspace", "focus", "3", "--output", "DP-1"])
                 .unwrap();
@@ -935,6 +1051,13 @@ mod tests {
         let overview = format_overview(&snapshot);
         assert!(overview.contains("DP-1 *: workspace 3"));
         assert!(overview.contains("4: background"));
+        assert!(!overview.contains("sequence:"));
+        let state = format_state(42, &snapshot);
+        assert!(state.contains("sequence: 42"));
+        assert!(state.contains("active output: 2"));
+        assert!(state.contains("physical:"));
+        assert!(state.contains("Config\n"));
+        assert_ne!(overview, state);
         assert_eq!(
             resolve_workspace_id(&snapshot, "code", None).unwrap(),
             WorkspaceId(3)

@@ -215,9 +215,12 @@ socket path to make a mismatched environment immediately visible.
 default:
 
 ```sh
-# Human overview or stable JSON state.
+# Complete human-readable or stable JSON state.
 astrology state
 astrology state --json
+
+# Concise output/workspace summary.
+astrology overview
 
 # Initial snapshot followed by events; --json emits NDJSON.
 astrology events --json
