@@ -14,7 +14,6 @@ astera-ipc.workspace = true
 clap.workspace = true
 ron.workspace = true
 rustix.workspace = true
-smol.workspace = true
 thiserror.workspace = true
 smithay.workspace = true
 smithay-drm-extras.workspace = true

@@ -938,12 +938,37 @@ impl Astera {
 
     pub fn watch_config(&mut self, path: std::path::PathBuf) {
         tracing::info!(path = %path.display(), "configuration watcher enabled");
-        let watcher = ConfigWatcher::new(path);
+        let watcher = match ConfigWatcher::new(path.clone()) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                tracing::error!(path = %path.display(), %error, "could not watch configuration");
+                self.config_failed = true;
+                self.config_error = Some(error.to_string());
+                self.mark_public_dirty();
+                return;
+            }
+        };
         self.config_source = watcher
             .exists()
             .then(|| watcher.path().to_string_lossy().into_owned());
         self.config_watcher = Some(watcher);
         self.mark_public_dirty();
+    }
+
+    pub fn config_watch_fd(&mut self) -> std::io::Result<Option<OwnedFd>> {
+        self.config_watcher
+            .as_mut()
+            .map(ConfigWatcher::duplicate_fd)
+            .transpose()
+    }
+
+    pub fn notify_config_changed(&mut self) {
+        let Some(watcher) = self.config_watcher.as_mut() else {
+            return;
+        };
+        if let Err(error) = watcher.notify(self.clock.now()) {
+            tracing::error!(%error, "configuration watcher read failed");
+        }
     }
 
     pub fn poll_config(&mut self) {

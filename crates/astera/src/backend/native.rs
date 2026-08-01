@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -21,6 +21,7 @@ use smithay::{
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
         },
         egl::context::ContextPriority,
+        input::InputEvent as BackendInputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             Color32F, ImportDma,
@@ -40,24 +41,29 @@ use smithay::{
         drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc, property::Value},
         input::Libinput,
         rustix::fs::OFlags,
-        wayland_server::{Display, ListeningSocket},
+        wayland_server::Display,
     },
     utils::{DeviceFd, Physical, Point},
 };
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
 use crate::{
-    backend::native_policy::{ConnectorSnapshot, ModeCandidate, SnapshotSource, scan_outputs},
+    backend::{
+        native_policy::{ConnectorSnapshot, ModeCandidate, SnapshotSource, scan_outputs},
+        sources::{ReadableFdSource, WaylandSocketSource},
+    },
     ipc_server::IpcServer,
     state::{Astera, ClientState, send_frames_surface_tree},
 };
+
+const MAX_NATIVE_EVENTS_PER_BATCH: usize = 256;
 
 struct NativeLoop {
     handle: LoopHandle<'static, NativeLoop>,
     display: Display<Astera>,
     state: Astera,
     ipc: IpcServer,
-    listener: ListeningSocket,
+    events: VecDeque<NativeEvent>,
     libinput: Libinput,
     _session: LibSeatSession,
     devices: HashMap<DrmNode, NativeDevice>,
@@ -65,6 +71,17 @@ struct NativeLoop {
     next_output_id: u32,
     gpus: GpuManager<GraphicsBackend>,
     started: Instant,
+}
+
+enum NativeEvent {
+    Input(BackendInputEvent<LibinputInputBackend>),
+    Session(SessionEvent),
+    Udev(UdevEvent),
+    Drm { node: DrmNode, event: DrmEvent },
+    WaylandClient(std::os::unix::net::UnixStream),
+    WaylandReady,
+    IpcReady,
+    ConfigChanged,
 }
 
 type GraphicsBackend = GbmGlesBackend<GlesRenderer, DrmDeviceFd>;
@@ -116,6 +133,77 @@ struct NativeSurface {
 }
 
 impl NativeLoop {
+    fn process_events(&mut self) -> Result<()> {
+        for _ in 0..MAX_NATIVE_EVENTS_PER_BATCH {
+            let Some(event) = self.events.pop_front() else {
+                break;
+            };
+            match event {
+                NativeEvent::Input(event) => self.state.process_input(event),
+                NativeEvent::Session(SessionEvent::PauseSession) => {
+                    self.libinput.suspend();
+                    for device in self.devices.values_mut() {
+                        device.output_manager.pause();
+                    }
+                    tracing::info!("native session paused");
+                }
+                NativeEvent::Session(SessionEvent::ActivateSession) => {
+                    if let Err(error) = self.libinput.resume() {
+                        tracing::error!(?error, "could not resume libinput");
+                    }
+                    for device in self.devices.values_mut() {
+                        if let Err(error) = device.output_manager.activate(false) {
+                            tracing::error!(?error, "could not reactivate DRM device");
+                        }
+                    }
+                    tracing::info!("native session activated");
+                }
+                NativeEvent::Udev(UdevEvent::Added { device_id, path }) => {
+                    match DrmNode::from_dev_id(device_id) {
+                        Ok(node) => {
+                            if let Err(error) = self.device_added(node, &path) {
+                                tracing::error!(?device_id, ?path, %error, "could not add DRM device");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::error!(?device_id, %error, "invalid DRM device node")
+                        }
+                    }
+                }
+                NativeEvent::Udev(UdevEvent::Changed { device_id }) => {
+                    if let Ok(node) = DrmNode::from_dev_id(device_id) {
+                        self.device_changed(node);
+                    }
+                }
+                NativeEvent::Udev(UdevEvent::Removed { device_id }) => {
+                    if let Ok(node) = DrmNode::from_dev_id(device_id) {
+                        self.device_removed(node);
+                    }
+                }
+                NativeEvent::Drm {
+                    node,
+                    event: DrmEvent::VBlank(crtc),
+                } => self.frame_submitted(node, crtc),
+                NativeEvent::Drm {
+                    node,
+                    event: DrmEvent::Error(error),
+                } => tracing::error!(?node, ?error, "DRM event error"),
+                NativeEvent::WaylandClient(stream) => {
+                    self.display
+                        .handle()
+                        .insert_client(stream, Arc::new(ClientState::default()))?;
+                    self.display.dispatch_clients(&mut self.state)?;
+                }
+                NativeEvent::WaylandReady => {
+                    self.display.dispatch_clients(&mut self.state)?;
+                }
+                NativeEvent::IpcReady => self.ipc.dispatch(&mut self.state),
+                NativeEvent::ConfigChanged => self.state.notify_config_changed(),
+            }
+        }
+        Ok(())
+    }
+
     fn device_added(&mut self, node: DrmNode, path: &Path) -> Result<()> {
         if self.devices.contains_key(&node) {
             return Ok(());
@@ -143,12 +231,11 @@ impl NativeLoop {
             [Fourcc::Argb8888, Fourcc::Abgr8888],
             render_formats,
         );
-        let registration =
-            self.handle
-                .insert_source(notifier, move |event, _, runtime| match event {
-                    DrmEvent::VBlank(crtc) => runtime.frame_submitted(node, crtc),
-                    DrmEvent::Error(error) => tracing::error!(?node, ?error, "DRM event error"),
-                })?;
+        let registration = self
+            .handle
+            .insert_source(notifier, move |event, _, runtime| {
+                runtime.events.push_back(NativeEvent::Drm { node, event });
+            })?;
         self.devices.insert(
             node,
             NativeDevice {
@@ -512,13 +599,39 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     state.set_output_configuration_supported(true);
     state.watch_config(config_path);
     state.disconnect_output(astera_core::OutputId(0))?;
-    let listener = ListeningSocket::bind_auto("astera", 1..32)?;
+    let listener = WaylandSocketSource::bind_auto("astera", 1..32)?;
     let socket_name = listener
         .socket_name()
         .context("Wayland listening socket has no name")?
         .to_string_lossy()
         .into_owned();
     let ipc = IpcServer::bind(&socket_name)?;
+    event_loop
+        .handle()
+        .insert_source(ipc.event_source(), |(), _, runtime| {
+            runtime.events.push_back(NativeEvent::IpcReady);
+        })
+        .map_err(|error| anyhow!(error.to_string()))?;
+    event_loop
+        .handle()
+        .insert_source(listener, |stream, _, runtime| {
+            runtime.events.push_back(NativeEvent::WaylandClient(stream));
+        })
+        .map_err(|error| anyhow!(error.to_string()))?;
+    event_loop
+        .handle()
+        .insert_source(ReadableFdSource::duplicate(&display)?, |(), _, runtime| {
+            runtime.events.push_back(NativeEvent::WaylandReady);
+        })
+        .map_err(|error| anyhow!(error.to_string()))?;
+    if let Some(config_fd) = state.config_watch_fd()? {
+        event_loop
+            .handle()
+            .insert_source(ReadableFdSource::new(config_fd), |(), _, runtime| {
+                runtime.events.push_back(NativeEvent::ConfigChanged);
+            })
+            .map_err(|error| anyhow!(error.to_string()))?;
+    }
 
     let (session, session_notifier) = LibSeatSession::new()?;
     let seat_name = session.seat();
@@ -540,53 +653,19 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     event_loop
         .handle()
         .insert_source(input, |event, _, runtime| {
-            runtime.state.process_input(event);
+            runtime.events.push_back(NativeEvent::Input(event));
         })
         .map_err(|error| anyhow!(error.to_string()))?;
     event_loop
         .handle()
-        .insert_source(session_notifier, |event, _, runtime| match event {
-            SessionEvent::PauseSession => {
-                runtime.libinput.suspend();
-                for device in runtime.devices.values_mut() {
-                    device.output_manager.pause();
-                }
-                tracing::info!("native session paused");
-            }
-            SessionEvent::ActivateSession => {
-                if let Err(error) = runtime.libinput.resume() {
-                    tracing::error!(?error, "could not resume libinput");
-                }
-                for device in runtime.devices.values_mut() {
-                    if let Err(error) = device.output_manager.activate(false) {
-                        tracing::error!(?error, "could not reactivate DRM device");
-                    }
-                }
-                tracing::info!("native session activated");
-            }
+        .insert_source(session_notifier, |event, _, runtime| {
+            runtime.events.push_back(NativeEvent::Session(event));
         })
         .map_err(|error| anyhow!(error.to_string()))?;
     event_loop
         .handle()
-        .insert_source(udev, |event, _, runtime| match event {
-            UdevEvent::Added { device_id, path } => match DrmNode::from_dev_id(device_id) {
-                Ok(node) => {
-                    if let Err(error) = runtime.device_added(node, &path) {
-                        tracing::error!(?device_id, ?path, %error, "could not add DRM device");
-                    }
-                }
-                Err(error) => tracing::error!(?device_id, %error, "invalid DRM device node"),
-            },
-            UdevEvent::Changed { device_id } => {
-                if let Ok(node) = DrmNode::from_dev_id(device_id) {
-                    runtime.device_changed(node);
-                }
-            }
-            UdevEvent::Removed { device_id } => {
-                if let Ok(node) = DrmNode::from_dev_id(device_id) {
-                    runtime.device_removed(node);
-                }
-            }
+        .insert_source(udev, |event, _, runtime| {
+            runtime.events.push_back(NativeEvent::Udev(event));
         })
         .map_err(|error| anyhow!(error.to_string()))?;
 
@@ -595,7 +674,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         display,
         state,
         ipc,
-        listener,
+        events: VecDeque::new(),
         libinput,
         _session: session,
         devices: HashMap::new(),
@@ -618,15 +697,21 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     println!("WAYLAND_DISPLAY={socket_name}");
 
     loop {
-        event_loop.dispatch(Some(Duration::from_millis(16)), &mut runtime)?;
-        while let Some(stream) = runtime.listener.accept()? {
+        let frame_timeout = Instant::now() + Duration::from_millis(16);
+        let deadline = if runtime.events.is_empty() {
             runtime
-                .display
-                .handle()
-                .insert_client(stream, Arc::new(ClientState::default()))?;
-        }
-        runtime.display.dispatch_clients(&mut runtime.state)?;
-        runtime.ipc.dispatch(&mut runtime.state);
+                .ipc
+                .next_timeout()
+                .map_or(frame_timeout, |ipc| ipc.min(frame_timeout))
+        } else {
+            Instant::now()
+        };
+        event_loop.dispatch(
+            Some(deadline.saturating_duration_since(Instant::now())),
+            &mut runtime,
+        )?;
+        runtime.process_events()?;
+        runtime.ipc.expire(Instant::now());
         runtime.apply_output_configurations();
         runtime.state.poll_config();
         if runtime.state.should_quit() {
