@@ -819,9 +819,6 @@ impl Astera {
         let command = match action {
             // Process actions bypass IPC but still return errors through the same binding path.
             Action::Spawn(argv) => return process::spawn(argv),
-            Action::SpawnShell(script) => {
-                return process::spawn(vec!["/bin/sh".into(), "-c".into(), script]);
-            }
             Action::FocusWorkspace { workspace } => Some(Command::FocusWorkspace {
                 workspace: self.resolve_binding_workspace(workspace)?,
             }),
@@ -914,6 +911,7 @@ impl Astera {
                     .map_err(|_| anyhow!("binding workspace index exceeds protocol range"))?,
             },
             BindingWorkspaceSelector::Name(name) => WorkspaceSelector::Name(name),
+            BindingWorkspaceSelector::Id(id) => WorkspaceSelector::Id(WorkspaceId(id).into()),
         })
     }
 

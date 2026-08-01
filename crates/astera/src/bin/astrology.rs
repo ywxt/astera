@@ -1,100 +1,165 @@
 use std::{
-    env,
+    env, fs,
     io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
+    process::ExitCode,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use astera_config::Config;
 use astera_ipc::{
     BOOTSTRAP_VERSION, CURRENT_VERSION, Command as IpcCommand, DesktopSnapshot, MIN_VERSION,
     Request, RequestKind, Response, Success, decode_frame, encode_frame, wire,
 };
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "astrology",
-    version,
-    about = "Inspect and control a running Astera compositor"
-)]
+#[command(name = "astrology", version, about = "Inspect and control Astera")]
 struct Args {
+    /// Suppress successful mutation messages.
+    #[arg(long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
-    command: Option<AstrologyCommand>,
+    command: Option<TopCommand>,
 }
 
-#[derive(Clone, Debug, Subcommand)]
-enum AstrologyCommand {
-    /// Print outputs, workspaces, focus, and window counts.
+#[derive(Debug, Subcommand)]
+enum TopCommand {
+    /// Print the concise desktop overview.
     Overview,
-    /// Print the complete authoritative desktop snapshot.
+    /// Print the authoritative desktop state.
     State {
-        /// Emit compact RON instead of pretty-printed RON.
+        /// Emit stable JSON instead of the human overview.
         #[arg(long)]
-        raw: bool,
+        json: bool,
     },
-    /// Print an initial snapshot followed by one RON EventEnvelope per line.
-    #[command(alias = "event-stream")]
-    Events,
-    /// Send any v1 Command encoded as RON.
-    Command {
-        /// For example: 'FocusWindow((42))'.
-        ron: String,
+    /// Follow compositor events.
+    Events {
+        /// Emit one JSON object per line.
+        #[arg(long)]
+        json: bool,
     },
-    FocusWindow {
-        window: u64,
+    /// Validate, format, or generate configuration without a running compositor.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
     },
-    FocusDirection {
-        x: f64,
-        y: f64,
+    Output {
+        #[command(subcommand)]
+        command: OutputCommand,
     },
-    FocusOutput {
-        /// Output ID, stable key, or "active"; omitted means the active output.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
+    Window {
+        #[command(subcommand)]
+        command: WindowCommand,
+    },
+    Camera {
+        #[command(subcommand)]
+        command: CameraCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    Check {
+        path: Option<PathBuf>,
+    },
+    Format {
+        path: Option<PathBuf>,
+        /// Check formatting without writing.
+        #[arg(long)]
+        check: bool,
+    },
+    Generate {
+        path: Option<PathBuf>,
+        /// Create the file; refuses to overwrite an existing path.
+        #[arg(long)]
+        write: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OutputCommand {
+    Focus { output: Option<String> },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkspaceCommand {
+    Focus {
+        workspace: String,
+        #[arg(long)]
         output: Option<String>,
     },
-    FocusWorkspace {
-        #[command(flatten)]
-        workspace: WorkspaceArgs,
+    Rename {
+        workspace: String,
+        name: String,
+        #[arg(long)]
+        output: Option<String>,
     },
-    MoveWindow {
-        window: u64,
-        #[command(flatten)]
-        workspace: WorkspaceArgs,
+    ClearName {
+        workspace: String,
+        #[arg(long)]
+        output: Option<String>,
+    },
+    Move {
+        workspace: String,
+        output: String,
+        #[arg(long)]
+        index: Option<u32>,
         #[arg(long)]
         activate: bool,
     },
-    SetWindowMode {
-        window: u64,
-        mode: WindowModeArg,
+}
+
+#[derive(Debug, Subcommand)]
+enum WindowCommand {
+    /// Focus the nearest window in a cardinal direction.
+    Focus {
+        direction: DirectionArg,
     },
-    PanCamera {
-        workspace: u32,
+    /// Focus a window by ID.
+    Activate {
+        window: u64,
+    },
+    Close {
+        window: Option<u64>,
+    },
+    Mode {
+        mode: WindowModeArg,
+        window: Option<u64>,
+    },
+    Move {
+        workspace: String,
+        window: Option<u64>,
+        #[arg(long)]
+        output: Option<String>,
+        #[arg(long)]
+        activate: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CameraCommand {
+    Pan {
         dx: i64,
         dy: i64,
+        #[arg(long)]
+        workspace: Option<String>,
+        #[arg(long, requires = "workspace")]
+        output: Option<String>,
     },
 }
 
-#[derive(Clone, Debug, ClapArgs)]
-struct WorkspaceArgs {
-    #[command(flatten)]
-    selector: WorkspaceSelectorArgs,
-    /// Output ID, stable key, or "active"; only used with --index.
-    #[arg(long, requires = "index")]
-    output: Option<String>,
-}
-
-#[derive(Clone, Debug, ClapArgs)]
-#[group(id = "workspace", required = true, multiple = false)]
-struct WorkspaceSelectorArgs {
-    /// Globally unique workspace ID.
-    #[arg(long)]
-    id: Option<u32>,
-    /// Unique workspace name.
-    #[arg(long)]
-    name: Option<String>,
-    /// One-based workspace index local to an output.
-    #[arg(long)]
-    index: Option<u32>,
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DirectionArg {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -116,134 +181,417 @@ impl From<WindowModeArg> for wire::v1::WindowMode {
     }
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let socket = resolve_socket()?;
-    run(args, &socket, &mut std::io::stdout())
+#[derive(Debug)]
+struct ExitError {
+    code: u8,
+    error: anyhow::Error,
 }
 
-fn run(args: Args, socket: &Path, output: &mut impl Write) -> Result<()> {
-    let version = negotiate(socket).with_context(|| {
-        format!(
-            "could not negotiate with Astera IPC socket {}; WAYLAND_DISPLAY may refer to the \
-             parent compositor—set it to the Astera display printed at startup, for example \
-             `export WAYLAND_DISPLAY=astera-1`",
-            socket.display()
-        )
-    })?;
-    match args.command.unwrap_or(AstrologyCommand::Overview) {
-        AstrologyCommand::Overview => {
-            let (_, snapshot) = get_state(socket, version)?;
-            write!(output, "{}", format_overview(&snapshot))?;
+impl ExitError {
+    fn usage(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            code: 2,
+            error: error.into(),
         }
-        AstrologyCommand::State { raw } => {
-            let (sequence, snapshot) = get_state(socket, version)?;
-            if raw {
-                writeln!(
-                    output,
-                    "{}",
-                    ron::to_string(&Success::State { sequence, snapshot })?
-                )?;
+    }
+    fn ipc(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            code: 3,
+            error: error.into(),
+        }
+    }
+    fn server(error: wire::v1::Error) -> Self {
+        Self {
+            code: 4,
+            error: anyhow!(
+                "{:?}: {} (sequence {})",
+                error.code,
+                error.message,
+                error.sequence
+            ),
+        }
+    }
+    fn stream(error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            code: 5,
+            error: error.into(),
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+    match run(args, &mut std::io::stdout()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {:#}", error.error);
+            ExitCode::from(error.code)
+        }
+    }
+}
+
+fn run(args: Args, output: &mut impl Write) -> Result<(), ExitError> {
+    let command = args.command.unwrap_or(TopCommand::Overview);
+    if let TopCommand::Config { command } = command {
+        return run_config(command, args.quiet, output).map_err(ExitError::usage);
+    }
+
+    let socket = resolve_socket().map_err(ExitError::ipc)?;
+    let version = negotiate(&socket).map_err(ExitError::ipc)?;
+    match command {
+        TopCommand::Overview => {
+            let (_, snapshot) = get_state(&socket, version)?;
+            write!(output, "{}", format_overview(&snapshot)).map_err(ExitError::ipc)?;
+        }
+        TopCommand::State { json } => {
+            let (sequence, snapshot) = get_state(&socket, version)?;
+            if json {
+                serde_json::to_writer_pretty(&mut *output, &Success::State { sequence, snapshot })
+                    .map_err(ExitError::ipc)?;
+                writeln!(output).map_err(ExitError::ipc)?;
             } else {
-                writeln!(
-                    output,
-                    "{}",
-                    ron::ser::to_string_pretty(
-                        &Success::State { sequence, snapshot },
-                        ron::ser::PrettyConfig::default(),
-                    )?
-                )?;
+                write!(output, "{}", format_overview(&snapshot)).map_err(ExitError::ipc)?;
             }
         }
-        AstrologyCommand::Events => stream_events(socket, version, output)?,
-        command => {
-            let command = typed_command(command)?;
-            let response = request(socket, version, RequestKind::Command(command))?;
-            print_command_response(response, output)?;
+        TopCommand::Events { json } => {
+            stream_events(&socket, version, json, output).map_err(ExitError::stream)?;
+        }
+        TopCommand::Output { command } => {
+            let command = match command {
+                OutputCommand::Focus { output } => IpcCommand::FocusOutput(
+                    parse_output(output.as_deref()).map_err(ExitError::usage)?,
+                ),
+            };
+            send_command(&socket, version, command, args.quiet, output)?;
+        }
+        TopCommand::Workspace { command } => {
+            let command = workspace_command(&socket, version, command)?;
+            send_command(&socket, version, command, args.quiet, output)?;
+        }
+        TopCommand::Window { command } => {
+            let command = window_command(&socket, version, command)?;
+            send_command(&socket, version, command, args.quiet, output)?;
+        }
+        TopCommand::Camera { command } => {
+            let command = camera_command(&socket, version, command)?;
+            send_command(&socket, version, command, args.quiet, output)?;
+        }
+        TopCommand::Config { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+fn run_config(command: ConfigCommand, quiet: bool, output: &mut impl Write) -> Result<()> {
+    match command {
+        ConfigCommand::Check { path } => {
+            let path = path.unwrap_or(default_config_path()?);
+            Config::load(&path)
+                .with_context(|| format!("invalid configuration {}", path.display()))?;
+            if !quiet {
+                writeln!(output, "configuration is valid: {}", path.display())?;
+            }
+        }
+        ConfigCommand::Format { path, check } => {
+            let path = path.unwrap_or(default_config_path()?);
+            let source = fs::read_to_string(&path)?;
+            let formatted = Config::format_kdl(&source)?;
+            if check {
+                if formatted != source {
+                    bail!("configuration is not formatted: {}", path.display());
+                }
+                if !quiet {
+                    writeln!(output, "configuration is formatted: {}", path.display())?;
+                }
+            } else {
+                atomic_write(&path, formatted.as_bytes(), true)?;
+                if !quiet {
+                    writeln!(output, "formatted {}", path.display())?;
+                }
+            }
+        }
+        ConfigCommand::Generate { path, write } => {
+            let generated = Config::generated_kdl();
+            if write {
+                let path = path.unwrap_or(default_config_path()?);
+                atomic_write(&path, generated.as_bytes(), false)?;
+                if !quiet {
+                    writeln!(output, "created {}", path.display())?;
+                }
+            } else {
+                write!(output, "{generated}")?;
+            }
         }
     }
     Ok(())
 }
 
+fn atomic_write(path: &Path, contents: &[u8], overwrite: bool) -> Result<()> {
+    if !overwrite && path.exists() {
+        bail!("refusing to overwrite existing {}", path.display());
+    }
+    let parent = path.parent().context("configuration path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".config.kdl.{}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = options.open(&temporary)?;
+        if overwrite && path.exists() {
+            file.set_permissions(fs::metadata(path)?.permissions())?;
+        }
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn workspace_command(
+    path: &Path,
+    version: u16,
+    command: WorkspaceCommand,
+) -> Result<IpcCommand, ExitError> {
+    match command {
+        WorkspaceCommand::Focus { workspace, output } => Ok(IpcCommand::FocusWorkspace {
+            workspace: parse_workspace(&workspace, output.as_deref()).map_err(ExitError::usage)?,
+        }),
+        WorkspaceCommand::Rename {
+            workspace,
+            name,
+            output,
+        } => {
+            let (_, snapshot) = get_state(path, version)?;
+            Ok(IpcCommand::SetWorkspaceName {
+                workspace: resolve_workspace_id(&snapshot, &workspace, output.as_deref())
+                    .map_err(ExitError::usage)?,
+                name: Some(name),
+            })
+        }
+        WorkspaceCommand::ClearName { workspace, output } => {
+            let (_, snapshot) = get_state(path, version)?;
+            Ok(IpcCommand::SetWorkspaceName {
+                workspace: resolve_workspace_id(&snapshot, &workspace, output.as_deref())
+                    .map_err(ExitError::usage)?,
+                name: None,
+            })
+        }
+        WorkspaceCommand::Move {
+            workspace,
+            output,
+            index,
+            activate,
+        } => {
+            let (_, snapshot) = get_state(path, version)?;
+            Ok(IpcCommand::MoveWorkspace {
+                workspace: resolve_workspace_id(&snapshot, &workspace, None)
+                    .map_err(ExitError::usage)?,
+                target_output: parse_output(Some(&output)).map_err(ExitError::usage)?,
+                target_index: index,
+                activate,
+            })
+        }
+    }
+}
+
+fn window_command(
+    path: &Path,
+    version: u16,
+    command: WindowCommand,
+) -> Result<IpcCommand, ExitError> {
+    match command {
+        WindowCommand::Focus { direction } => {
+            Ok(IpcCommand::FocusDirection(direction_value(direction)))
+        }
+        WindowCommand::Activate { window } => {
+            Ok(IpcCommand::FocusWindow(wire::v1::WindowId(window)))
+        }
+        WindowCommand::Close { window } => Ok(IpcCommand::CloseWindow(resolve_window(
+            path, version, window,
+        )?)),
+        WindowCommand::Mode { mode, window } => Ok(IpcCommand::SetWindowMode {
+            window: resolve_window(path, version, window)?,
+            mode: mode.into(),
+        }),
+        WindowCommand::Move {
+            workspace,
+            window,
+            output,
+            activate,
+        } => Ok(IpcCommand::MoveWindow {
+            window: resolve_window(path, version, window)?,
+            target: parse_workspace(&workspace, output.as_deref()).map_err(ExitError::usage)?,
+            activate,
+        }),
+    }
+}
+
+fn camera_command(
+    path: &Path,
+    version: u16,
+    command: CameraCommand,
+) -> Result<IpcCommand, ExitError> {
+    match command {
+        CameraCommand::Pan {
+            dx,
+            dy,
+            workspace,
+            output,
+        } => {
+            let (_, snapshot) = get_state(path, version)?;
+            let workspace = match workspace {
+                Some(selector) => resolve_workspace_id(&snapshot, &selector, output.as_deref())
+                    .map_err(ExitError::usage)?,
+                None => active_workspace(&snapshot)
+                    .ok_or_else(|| ExitError::usage(anyhow!("active output has no workspace")))?,
+            };
+            Ok(IpcCommand::PanCamera { workspace, dx, dy })
+        }
+    }
+}
+
+fn resolve_window(
+    path: &Path,
+    version: u16,
+    window: Option<u64>,
+) -> Result<wire::v1::WindowId, ExitError> {
+    if let Some(window) = window {
+        return Ok(wire::v1::WindowId(window));
+    }
+    let (_, snapshot) = get_state(path, version)?;
+    snapshot
+        .focused_window
+        .ok_or_else(|| ExitError::usage(anyhow!("there is no focused window")))
+}
+
+fn parse_workspace(value: &str, output: Option<&str>) -> Result<wire::v1::WorkspaceSelector> {
+    if let Some(id) = value.strip_prefix("id:") {
+        if output.is_some() {
+            bail!("id workspace selector cannot use --output");
+        }
+        return Ok(wire::v1::WorkspaceSelector::Id(wire::v1::WorkspaceId(
+            id.parse().context("invalid workspace ID")?,
+        )));
+    }
+    if let Ok(index) = value.parse::<u32>() {
+        if index == 0 {
+            bail!("workspace index is one-based");
+        }
+        return Ok(wire::v1::WorkspaceSelector::LocalIndex {
+            output: parse_output(output)?,
+            index,
+        });
+    }
+    if output.is_some() {
+        bail!("named workspace selector cannot use --output");
+    }
+    if value.is_empty() {
+        bail!("workspace selector cannot be empty");
+    }
+    Ok(wire::v1::WorkspaceSelector::Name(value.to_owned()))
+}
+
+fn resolve_workspace_id(
+    snapshot: &DesktopSnapshot,
+    selector: &str,
+    output: Option<&str>,
+) -> Result<wire::v1::WorkspaceId> {
+    let selector = parse_workspace(selector, output)?;
+    match selector {
+        wire::v1::WorkspaceSelector::Id(id) => snapshot
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == id)
+            .then_some(id),
+        wire::v1::WorkspaceSelector::Name(name) => snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.name.as_deref() == Some(&name))
+            .map(|workspace| workspace.id),
+        wire::v1::WorkspaceSelector::LocalIndex { output, index } => {
+            let output = resolve_output_id(snapshot, output)?;
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| {
+                    workspace.output == Some(output) && workspace.local_index == Some(index)
+                })
+                .map(|workspace| workspace.id)
+        }
+    }
+    .context("unknown workspace")
+}
+
+fn parse_output(value: Option<&str>) -> Result<wire::v1::OutputSelector> {
+    match value {
+        None | Some("active") => Ok(wire::v1::OutputSelector::Active),
+        Some("") => bail!("output selector cannot be empty"),
+        Some(value) => Ok(value
+            .parse::<u32>()
+            .map(|id| wire::v1::OutputSelector::Id(wire::v1::OutputId(id)))
+            .unwrap_or_else(|_| wire::v1::OutputSelector::Key(value.to_owned()))),
+    }
+}
+
+fn resolve_output_id(
+    snapshot: &DesktopSnapshot,
+    selector: wire::v1::OutputSelector,
+) -> Result<wire::v1::OutputId> {
+    match selector {
+        wire::v1::OutputSelector::Active => snapshot.active_output,
+        wire::v1::OutputSelector::Id(id) => snapshot
+            .outputs
+            .iter()
+            .any(|output| output.id == id)
+            .then_some(id),
+        wire::v1::OutputSelector::Key(key) => snapshot
+            .outputs
+            .iter()
+            .find(|output| output.stable_key == key)
+            .map(|output| output.id),
+    }
+    .context("unknown output")
+}
+
+fn active_workspace(snapshot: &DesktopSnapshot) -> Option<wire::v1::WorkspaceId> {
+    let output = snapshot.active_output?;
+    snapshot
+        .outputs
+        .iter()
+        .find(|candidate| candidate.id == output)
+        .map(|output| output.active_workspace)
+}
+
+fn direction_value(direction: DirectionArg) -> wire::v1::Direction {
+    match direction {
+        DirectionArg::Left => wire::v1::Direction { x: -1.0, y: 0.0 },
+        DirectionArg::Right => wire::v1::Direction { x: 1.0, y: 0.0 },
+        DirectionArg::Up => wire::v1::Direction { x: 0.0, y: -1.0 },
+        DirectionArg::Down => wire::v1::Direction { x: 0.0, y: 1.0 },
+    }
+}
+
 fn resolve_socket() -> Result<PathBuf> {
-    let display = env::var("WAYLAND_DISPLAY").context(
-        "WAYLAND_DISPLAY is not set; set it to the Astera display printed at startup, for \
-         example `export WAYLAND_DISPLAY=astera-1`",
-    )?;
+    let display = env::var("WAYLAND_DISPLAY")
+        .context("WAYLAND_DISPLAY is not set; use the Astera display printed at startup")?;
     let runtime = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .context("XDG_RUNTIME_DIR is required")?;
     Ok(runtime.join("astera").join(format!("{display}.ipc")))
 }
 
-fn typed_command(command: AstrologyCommand) -> Result<IpcCommand> {
-    Ok(match command {
-        AstrologyCommand::Command { ron } => ron::from_str(&ron).context("invalid RON Command")?,
-        AstrologyCommand::FocusWindow { window } => {
-            IpcCommand::FocusWindow(wire::v1::WindowId(window))
-        }
-        AstrologyCommand::FocusDirection { x, y } => {
-            IpcCommand::FocusDirection(wire::v1::Direction { x, y })
-        }
-        AstrologyCommand::FocusOutput { output } => {
-            IpcCommand::FocusOutput(parse_output(output.as_deref())?)
-        }
-        AstrologyCommand::FocusWorkspace { workspace } => IpcCommand::FocusWorkspace {
-            workspace: parse_workspace(workspace)?,
-        },
-        AstrologyCommand::MoveWindow {
-            window,
-            workspace,
-            activate,
-        } => IpcCommand::MoveWindow {
-            window: wire::v1::WindowId(window),
-            target: parse_workspace(workspace)?,
-            activate,
-        },
-        AstrologyCommand::SetWindowMode { window, mode } => IpcCommand::SetWindowMode {
-            window: wire::v1::WindowId(window),
-            mode: mode.into(),
-        },
-        AstrologyCommand::PanCamera { workspace, dx, dy } => IpcCommand::PanCamera {
-            workspace: wire::v1::WorkspaceId(workspace),
-            dx,
-            dy,
-        },
-        AstrologyCommand::Overview | AstrologyCommand::State { .. } | AstrologyCommand::Events => {
-            bail!("command does not map to a mutation")
-        }
-    })
-}
-
-fn parse_output(value: Option<&str>) -> Result<wire::v1::OutputSelector> {
-    match value {
-        None | Some("active") => Ok(wire::v1::OutputSelector::Active),
-        Some(value) => match value.parse::<u32>() {
-            Ok(id) => Ok(wire::v1::OutputSelector::Id(wire::v1::OutputId(id))),
-            Err(_) if !value.is_empty() => Ok(wire::v1::OutputSelector::Key(value.to_owned())),
-            Err(_) => bail!("output selector cannot be empty"),
-        },
+fn default_config_path() -> Result<PathBuf> {
+    if let Some(directory) = env::var_os("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(directory).join("astera/config.kdl"));
     }
-}
-
-fn parse_workspace(args: WorkspaceArgs) -> Result<wire::v1::WorkspaceSelector> {
-    if let Some(id) = args.selector.id {
-        return Ok(wire::v1::WorkspaceSelector::Id(wire::v1::WorkspaceId(id)));
-    }
-    if let Some(name) = args.selector.name {
-        return Ok(wire::v1::WorkspaceSelector::Name(name));
-    }
-    let index = args
-        .selector
-        .index
-        .context("workspace selector is required")?;
-    if index == 0 {
-        bail!("workspace index is one-based and must be greater than zero");
-    }
-    Ok(wire::v1::WorkspaceSelector::LocalIndex {
-        output: parse_output(args.output.as_deref())?,
-        index,
-    })
+    Ok(
+        PathBuf::from(env::var_os("HOME").context("HOME is not set")?)
+            .join(".config/astera/config.kdl"),
+    )
 }
 
 fn negotiate(path: &Path) -> Result<u16> {
@@ -272,7 +620,8 @@ fn request(path: &Path, version: u16, kind: RequestKind) -> Result<Response> {
 }
 
 fn request_line(path: &Path, frame: &str) -> Result<String> {
-    let mut stream = UnixStream::connect(path)?;
+    let mut stream = UnixStream::connect(path)
+        .with_context(|| format!("could not connect to {}", path.display()))?;
     stream.write_all(frame.as_bytes())?;
     let mut response = String::new();
     BufReader::new(stream).read_line(&mut response)?;
@@ -282,45 +631,36 @@ fn request_line(path: &Path, frame: &str) -> Result<String> {
     Ok(response)
 }
 
-fn get_state(path: &Path, version: u16) -> Result<(u64, DesktopSnapshot)> {
-    match request(path, version, RequestKind::Command(IpcCommand::GetState))? {
+fn get_state(path: &Path, version: u16) -> Result<(u64, DesktopSnapshot), ExitError> {
+    match request(path, version, RequestKind::Command(IpcCommand::GetState))
+        .map_err(ExitError::ipc)?
+    {
         Response::Success(Success::State { sequence, snapshot }) => Ok((sequence, snapshot)),
-        Response::Success(_) => bail!("unexpected IPC success response"),
-        Response::Error(error) => command_error(error),
+        Response::Success(_) => Err(ExitError::ipc(anyhow!("unexpected IPC response"))),
+        Response::Error(error) => Err(ExitError::server(error)),
     }
 }
 
-fn print_command_response(response: Response, output: &mut impl Write) -> Result<()> {
-    match response {
+fn send_command(
+    path: &Path,
+    version: u16,
+    command: IpcCommand,
+    quiet: bool,
+    output: &mut impl Write,
+) -> Result<(), ExitError> {
+    match request(path, version, RequestKind::Command(command)).map_err(ExitError::ipc)? {
         Response::Success(Success::Handled { sequence }) => {
-            writeln!(output, "handled at sequence {sequence}")?;
+            if !quiet {
+                writeln!(output, "ok (sequence {sequence})").map_err(ExitError::ipc)?;
+            }
             Ok(())
         }
-        Response::Success(Success::State { sequence, snapshot }) => {
-            writeln!(
-                output,
-                "{}",
-                ron::to_string(&Success::State { sequence, snapshot })?
-            )?;
-            Ok(())
-        }
-        Response::Success(Success::EventStream { .. }) => {
-            bail!("unexpected event-stream response")
-        }
-        Response::Error(error) => command_error(error),
+        Response::Success(_) => Err(ExitError::ipc(anyhow!("unexpected IPC response"))),
+        Response::Error(error) => Err(ExitError::server(error)),
     }
 }
 
-fn command_error<T>(error: wire::v1::Error) -> Result<T> {
-    bail!(
-        "{:?}: {} (sequence {})",
-        error.code,
-        error.message,
-        error.sequence
-    )
-}
-
-fn stream_events(path: &Path, version: u16, output: &mut impl Write) -> Result<()> {
+fn stream_events(path: &Path, version: u16, json: bool, output: &mut impl Write) -> Result<()> {
     let mut stream = UnixStream::connect(path)?;
     stream.write_all(
         encode_frame(
@@ -336,47 +676,46 @@ fn stream_events(path: &Path, version: u16, output: &mut impl Write) -> Result<(
     if reader.read_line(&mut line)? == 0 {
         bail!("event stream closed before its snapshot");
     }
-    let mut expected_sequence = match decode_frame::<Response>(&line, version)? {
+    let mut expected = match decode_frame::<Response>(&line, version)? {
         Response::Success(Success::EventStream { sequence, snapshot }) => {
-            writeln!(
-                output,
-                "{}",
-                ron::to_string(&Success::State { sequence, snapshot })?
-            )?;
-            output.flush()?;
+            if json {
+                serde_json::to_writer(&mut *output, &Success::State { sequence, snapshot })?;
+                writeln!(output)?;
+            } else {
+                write!(output, "{}", format_overview(&snapshot))?;
+            }
             sequence.checked_add(1)
         }
-        Response::Success(_) => bail!("unexpected IPC success response"),
-        Response::Error(error) => return command_error(error),
+        Response::Success(_) => bail!("unexpected IPC response"),
+        Response::Error(error) => bail!("{:?}: {}", error.code, error.message),
     };
+    output.flush()?;
     loop {
         line.clear();
         if reader.read_line(&mut line)? == 0 {
             bail!("event stream disconnected");
         }
         let event = decode_frame::<wire::v1::EventEnvelope>(&line, version)?;
-        let Some(expected) = expected_sequence else {
+        let sequence = expected.context("event stream sequence overflow")?;
+        if event.sequence != sequence {
             bail!(
-                "event stream sequence overflow: expected no event after {}, received {}",
-                u64::MAX,
-                event.sequence
-            );
-        };
-        if event.sequence != expected {
-            bail!(
-                "event stream sequence gap: expected {expected}, received {}",
+                "event stream sequence gap: expected {sequence}, received {}",
                 event.sequence
             );
         }
-        expected_sequence = event.sequence.checked_add(1);
-        writeln!(output, "{}", ron::to_string(&event)?)?;
+        expected = event.sequence.checked_add(1);
+        if json {
+            serde_json::to_writer(&mut *output, &event)?;
+            writeln!(output)?;
+        } else {
+            writeln!(output, "{} {:?}", event.sequence, event.event)?;
+        }
         output.flush()?;
     }
 }
 
 fn format_overview(snapshot: &DesktopSnapshot) -> String {
-    let mut text = String::new();
-    text.push_str("Outputs\n");
+    let mut text = String::from("Outputs\n");
     for output in &snapshot.outputs {
         let active = if Some(output.id) == snapshot.active_output {
             " *"
@@ -393,37 +732,33 @@ fn format_overview(snapshot: &DesktopSnapshot) -> String {
             output.logical_size.width,
             output.logical_size.height,
             scale,
-            output.transform,
+            output.transform
         ));
     }
     text.push_str("Workspaces\n");
     for workspace in &snapshot.workspaces {
-        text.push_str(&format_workspace(workspace));
+        let location = workspace
+            .output
+            .zip(workspace.local_index)
+            .map(|(id, index)| format!("output {} index {}", id.0, index))
+            .unwrap_or_else(|| "background".into());
+        let label = workspace
+            .name
+            .as_deref()
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "  {}{}: {}, focus {:?}, tiled {}, floating {}, fullscreen {:?}\n",
+            workspace.id.0,
+            label,
+            location,
+            workspace.active_window.map(|id| id.0),
+            workspace.tiled_count,
+            workspace.floating_count,
+            workspace.fullscreen.map(|id| id.0)
+        ));
     }
     text
-}
-
-fn format_workspace(workspace: &wire::v1::WorkspaceSnapshot) -> String {
-    let location = workspace
-        .output
-        .zip(workspace.local_index)
-        .map(|(id, index)| format!("output {} index {}", id.0, index))
-        .unwrap_or_else(|| "background".to_owned());
-    let label = workspace
-        .name
-        .as_deref()
-        .map(|name| format!(" ({name})"))
-        .unwrap_or_default();
-    format!(
-        "  {}{}: {}, focus {:?}, tiled {}, floating {}, fullscreen {:?}\n",
-        workspace.id.0,
-        label,
-        location,
-        workspace.active_window.map(|id| id.0),
-        workspace.tiled_count,
-        workspace.floating_count,
-        workspace.fullscreen.map(|id| id.0),
-    )
 }
 
 #[cfg(test)]
@@ -436,13 +771,13 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use astera_ipc::wire::v1::{
-        Event, EventEnvelope, OutputId, OutputSelector, OutputTransform, Rect, Scale120, Size,
-        WindowId, WorkspaceId, WorkspaceSelector,
-    };
-    use astera_ipc::{ConfigSnapshot, DesktopSnapshot, OutputSnapshot, WorkspaceSnapshot};
-
     use super::*;
+    use astera_ipc::wire::v1::{
+        Event, EventEnvelope, OutputId, OutputTransform, Rect, Scale120, Size, WindowId,
+        WorkspaceId,
+    };
+    use astera_ipc::{ConfigSnapshot, OutputSnapshot, WorkspaceSnapshot};
+    use clap::CommandFactory;
 
     fn snapshot() -> DesktopSnapshot {
         DesktopSnapshot {
@@ -492,10 +827,7 @@ mod tests {
         }
     }
 
-    fn run_event_stream_fixture(
-        snapshot_sequence: u64,
-        event_sequences: &[u64],
-    ) -> (anyhow::Error, String) {
+    fn event_stream_fixture(snapshot_sequence: u64, events: &[u64]) -> (anyhow::Error, String) {
         let directory = std::env::temp_dir().join(format!(
             "astrology-test-{}-{}",
             std::process::id(),
@@ -507,8 +839,7 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let path = directory.join("ipc");
         let listener = UnixListener::bind(&path).unwrap();
-        let server_snapshot = snapshot();
-        let event_sequences = event_sequences.to_vec();
+        let events = events.to_vec();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = String::new();
@@ -527,14 +858,14 @@ mod tests {
                         CURRENT_VERSION,
                         &Response::Success(Success::EventStream {
                             sequence: snapshot_sequence,
-                            snapshot: server_snapshot,
+                            snapshot: snapshot(),
                         }),
                     )
                     .unwrap()
                     .as_bytes(),
                 )
                 .unwrap();
-            for sequence in event_sequences {
+            for sequence in events {
                 stream
                     .write_all(
                         encode_frame(
@@ -553,7 +884,7 @@ mod tests {
             }
         });
         let mut output = Vec::new();
-        let error = stream_events(&path, CURRENT_VERSION, &mut output).unwrap_err();
+        let error = stream_events(&path, CURRENT_VERSION, true, &mut output).unwrap_err();
         server.join().unwrap();
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
@@ -561,101 +892,71 @@ mod tests {
     }
 
     #[test]
-    fn overview_marks_active_output_and_background_workspace() {
-        let overview = format_overview(&snapshot());
-        assert!(overview.contains("DP-1 *: workspace 3, 2 total, 2560x1440 logical, 1.50x"));
+    fn cli_schema_is_valid_and_resource_commands_parse() {
+        Args::command().debug_assert();
+        let args =
+            Args::try_parse_from(["astrology", "workspace", "focus", "3", "--output", "DP-1"])
+                .unwrap();
+        assert!(matches!(args.command, Some(TopCommand::Workspace { .. })));
+        let args = Args::try_parse_from(["astrology", "window", "mode", "fullscreen"]).unwrap();
+        assert!(matches!(args.command, Some(TopCommand::Window { .. })));
+    }
+
+    #[test]
+    fn friendly_workspace_selectors_are_unambiguous() {
+        assert!(matches!(
+            parse_workspace("3", None).unwrap(),
+            wire::v1::WorkspaceSelector::LocalIndex { index: 3, .. }
+        ));
+        assert!(matches!(
+            parse_workspace("code", None).unwrap(),
+            wire::v1::WorkspaceSelector::Name(_)
+        ));
+        assert!(matches!(
+            parse_workspace("id:7", None).unwrap(),
+            wire::v1::WorkspaceSelector::Id(wire::v1::WorkspaceId(7))
+        ));
+        assert!(parse_workspace("code", Some("DP-1")).is_err());
+    }
+
+    #[test]
+    fn config_commands_do_not_require_wayland_display() {
+        let args = Args::try_parse_from(["astrology", "config", "generate"]).unwrap();
+        let mut output = Vec::new();
+        run(args, &mut output).unwrap();
+        let generated = String::from_utf8(output).unwrap();
+        assert!(generated.contains("spawn \"kitty\""));
+        Config::from_kdl(&generated).unwrap();
+    }
+
+    #[test]
+    fn overview_and_snapshot_resolution_cover_background_workspaces() {
+        let snapshot = snapshot();
+        let overview = format_overview(&snapshot);
+        assert!(overview.contains("DP-1 *: workspace 3"));
         assert!(overview.contains("4: background"));
-    }
-
-    #[test]
-    fn typed_parser_supports_active_output_and_local_workspace() {
-        let args = Args::try_parse_from([
-            "astrology",
-            "move-window",
-            "42",
-            "--index",
-            "3",
-            "--output",
-            "DP-1",
-            "--activate",
-        ])
-        .unwrap();
-        let command = typed_command(args.command.unwrap()).unwrap();
         assert_eq!(
-            command,
-            IpcCommand::MoveWindow {
-                window: WindowId(42),
-                target: WorkspaceSelector::LocalIndex {
-                    output: OutputSelector::Key("DP-1".into()),
-                    index: 3,
-                },
-                activate: true,
-            }
+            resolve_workspace_id(&snapshot, "code", None).unwrap(),
+            WorkspaceId(3)
         );
-
-        let args = Args::try_parse_from(["astrology", "focus-output"]).unwrap();
         assert_eq!(
-            typed_command(args.command.unwrap()).unwrap(),
-            IpcCommand::FocusOutput(OutputSelector::Active)
+            resolve_workspace_id(&snapshot, "1", Some("DP-1")).unwrap(),
+            WorkspaceId(3)
         );
     }
 
     #[test]
-    fn generic_command_parses_every_wire_command_shape() {
-        let encoded = ron::to_string(&IpcCommand::SetWorkspaceName {
-            workspace: WorkspaceId(7),
-            name: Some("work".into()),
-        })
-        .unwrap();
-        let args = Args::try_parse_from(["astrology", "command", &encoded]).unwrap();
-        assert_eq!(
-            typed_command(args.command.unwrap()).unwrap(),
-            IpcCommand::SetWorkspaceName {
-                workspace: WorkspaceId(7),
-                name: Some("work".into()),
-            }
-        );
-    }
-
-    #[test]
-    fn event_stream_prints_snapshot_then_envelopes_and_errors_on_eof() {
-        let expected_snapshot = snapshot();
-        let (error, output) = run_event_stream_fixture(8, &[9]);
+    fn event_stream_detects_eof_and_sequence_gaps() {
+        let (error, output) = event_stream_fixture(8, &[9]);
         assert!(error.to_string().contains("disconnected"));
-        let mut lines = output.lines();
-        assert!(matches!(
-            ron::from_str::<Success>(lines.next().unwrap()).unwrap(),
-            Success::State {
-                sequence: 8,
-                snapshot
-            } if snapshot == expected_snapshot
-        ));
-        assert!(matches!(
-            ron::from_str::<EventEnvelope>(lines.next().unwrap()).unwrap(),
-            EventEnvelope { sequence: 9, .. }
-        ));
-        assert_eq!(lines.next(), None);
-    }
+        assert_eq!(output.lines().count(), 2);
 
-    #[test]
-    fn event_stream_rejects_a_gap_after_the_snapshot() {
-        let (error, output) = run_event_stream_fixture(8, &[10]);
-        assert!(
-            error
-                .to_string()
-                .contains("sequence gap: expected 9, received 10")
-        );
+        let (error, output) = event_stream_fixture(8, &[10]);
+        assert!(error.to_string().contains("expected 9, received 10"));
         assert_eq!(output.lines().count(), 1);
-    }
 
-    #[test]
-    fn event_stream_rejects_a_gap_between_events() {
-        let (error, output) = run_event_stream_fixture(8, &[9, 11]);
-        assert!(
-            error
-                .to_string()
-                .contains("sequence gap: expected 10, received 11")
-        );
+        let (error, output) = event_stream_fixture(8, &[9, 11]);
+        assert!(error.to_string().contains("expected 10, received 11"));
         assert_eq!(output.lines().count(), 2);
     }
 }

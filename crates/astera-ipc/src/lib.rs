@@ -388,6 +388,7 @@ pub mod wire {
                 window: WindowId,
                 mode: WindowMode,
             },
+            CloseWindow(WindowId),
             SetCameraPolicy {
                 workspace: WorkspaceId,
                 policy: CameraPolicy,

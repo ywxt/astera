@@ -320,6 +320,16 @@ impl Astera {
             Command::SetWindowMode { window, mode } => {
                 self.set_window_mode_command(window.into(), mode.into())
             }
+            Command::CloseWindow(window) => {
+                let window: WindowId = window.into();
+                let mapped = self
+                    .windows
+                    .iter()
+                    .find(|mapped| mapped.id == window)
+                    .ok_or_else(|| CommandError::new(ErrorCode::NotFound, "unknown window"))?;
+                mapped.surface.send_close();
+                Ok(())
+            }
             Command::SetCameraPolicy { workspace, policy } => {
                 let state = self
                     .desktop
@@ -450,6 +460,7 @@ fn command_kind(command: &Command) -> &'static str {
         Command::SetWorkspaceName { .. } => "set-workspace-name",
         Command::MoveWindow { .. } => "move-window",
         Command::SetWindowMode { .. } => "set-window-mode",
+        Command::CloseWindow(_) => "close-window",
         Command::SetCameraPolicy { .. } => "set-camera-policy",
         Command::PanCamera { .. } => "pan-camera",
     }

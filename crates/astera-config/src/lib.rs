@@ -1,7 +1,7 @@
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fmt::Write as _, fs, path::Path};
 
 use astera_core::{CameraPolicy, Direction, WindowMode};
-use serde::{Deserialize, Deserializer};
+use kdl::{KdlDocument, KdlNode, KdlValue};
 use thiserror::Error;
 use xkbcommon::xkb;
 
@@ -13,8 +13,7 @@ pub struct Config {
     pub bindings: Bindings,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyRepeatConfig {
     pub delay_ms: u64,
     pub rate: u32,
@@ -96,24 +95,20 @@ impl BindingKey {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Binding {
     pub action: Action,
-    #[serde(default)]
     pub repeat: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Action {
     Spawn(Vec<String>),
-    SpawnShell(String),
     FocusWorkspace {
         workspace: WorkspaceSelector,
     },
     MoveWindowToWorkspace {
         workspace: WorkspaceSelector,
-        #[serde(default)]
         activate: bool,
     },
     FocusOutput {
@@ -121,9 +116,7 @@ pub enum Action {
     },
     MoveWorkspaceToOutput {
         output: String,
-        #[serde(default)]
         index: Option<usize>,
-        #[serde(default = "default_true")]
         activate: bool,
     },
     FocusDirection(CardinalDirection),
@@ -138,7 +131,7 @@ pub enum Action {
     Quit,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CardinalDirection {
     Left,
     Right,
@@ -157,10 +150,11 @@ impl CardinalDirection {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorkspaceSelector {
-    Index(usize, #[serde(default)] Option<String>),
+    Index(usize, Option<String>),
     Name(String),
+    Id(u32),
 }
 
 impl Action {
@@ -195,6 +189,12 @@ impl Bindings {
 
     pub fn built_in() -> Self {
         let mut entries = BTreeMap::new();
+        insert_builtin(
+            &mut entries,
+            "Super+Return",
+            Action::Spawn(vec!["kitty".into()]),
+            false,
+        );
         for index in 1..=9 {
             insert_builtin(
                 &mut entries,
@@ -256,84 +256,91 @@ impl Default for Config {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct FileConfig {
-    gap: i64,
-    camera: CameraPolicy,
-    key_repeat: KeyRepeatConfig,
-    bindings: BindingMap,
-}
-
-impl Default for FileConfig {
-    fn default() -> Self {
-        let defaults = Config::default();
-        Self {
-            gap: defaults.gap,
-            camera: defaults.camera,
-            key_repeat: defaults.key_repeat,
-            bindings: BindingMap::default(),
-        }
-    }
-}
-
-#[derive(Default)]
-struct BindingMap(BTreeMap<String, BindingValue>);
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum BindingValue {
-    Detailed(Binding),
-    Shorthand(Action),
-}
-
-impl<'de> Deserialize<'de> for BindingMap {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        BTreeMap::<String, BindingValue>::deserialize(deserializer).map(Self)
-    }
-}
-
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let contents = fs::read_to_string(path)?;
-        Self::from_ron(&contents)
+        Self::from_kdl(&contents)
     }
 
-    pub fn from_ron(contents: &str) -> Result<Self, ConfigError> {
-        // Materialize the optional output argument before serde parses WorkspaceSelector.
-        let normalized = normalize_workspace_selectors(contents);
-        let raw: FileConfig = ron::from_str(&normalized)?;
+    pub fn from_kdl(contents: &str) -> Result<Self, ConfigError> {
+        let document: KdlDocument = contents
+            .parse()
+            .map_err(|error: kdl::KdlError| ConfigError::Parse(format_kdl_error(&error)))?;
+        let defaults = Self::default();
+        let mut gap = defaults.gap;
+        let mut camera = defaults.camera;
+        let mut key_repeat = defaults.key_repeat;
         let mut entries = BTreeMap::new();
-        for (source, value) in raw.bindings.0 {
-            let key = parse_binding_key(&source)?;
-            let binding = match value {
-                BindingValue::Detailed(binding) => binding,
-                BindingValue::Shorthand(action) => Binding {
-                    action,
-                    repeat: false,
-                },
-            };
-            if binding.repeat && !binding.action.can_repeat() {
-                return Err(ConfigError::Invalid(format!(
-                    "binding {source:?} enables repeat for a non-repeatable action"
-                )));
-            }
-            validate_action(&binding.action, &source)?;
-            if entries.insert(key, binding).is_some() {
-                // Aliases must not silently depend on map iteration order to choose a winner.
-                return Err(ConfigError::Invalid(format!(
-                    "binding {source:?} duplicates another normalized binding"
-                )));
+        let mut sections = BTreeMap::<&str, ()>::new();
+
+        for node in document.nodes() {
+            let name = node.name().value();
+            let result = (|| -> Result<(), ConfigError> {
+                match name {
+                    "general" | "input" | "camera" => {
+                        if sections.insert(name, ()).is_some() {
+                            return invalid(format!("duplicate `{name}` section"));
+                        }
+                        require_no_entries(node)?;
+                        let children = node.children().ok_or_else(|| {
+                            invalid_error(format!("`{name}` requires a child block"))
+                        })?;
+                        match name {
+                            "general" => parse_general(children, &mut gap)?,
+                            "input" => parse_input(children, &mut key_repeat)?,
+                            "camera" => camera = parse_camera(children)?,
+                            _ => unreachable!(),
+                        }
+                        Ok(())
+                    }
+                    "bind" => {
+                        let (source, binding) = parse_bind(node)?;
+                        let key = parse_binding_key(&source)?;
+                        if entries.insert(key, binding).is_some() {
+                            return invalid(format!(
+                                "binding {source:?} duplicates another normalized binding"
+                            ));
+                        }
+                        Ok(())
+                    }
+                    _ => unknown("top-level node", name, TOP_LEVEL_NAMES),
+                }
+            })();
+            if let Err(error) = result {
+                return Err(error.with_location(contents, node.span().offset()));
             }
         }
         let config = Self {
-            gap: raw.gap,
-            camera: raw.camera,
-            key_repeat: raw.key_repeat,
+            gap,
+            camera,
+            key_repeat,
             bindings: Bindings { entries },
         };
         config.validate()?;
         Ok(config)
+    }
+
+    pub fn format_kdl(contents: &str) -> Result<String, ConfigError> {
+        Self::from_kdl(contents)?;
+        let mut document: KdlDocument = contents
+            .parse()
+            .map_err(|error: kdl::KdlError| ConfigError::Parse(format_kdl_error(&error)))?;
+        document.autoformat();
+        Ok(document.to_string())
+    }
+
+    pub fn generated_kdl() -> String {
+        let mut output = GENERATED_CONFIG_HEADER.to_owned();
+        for index in 1..=9 {
+            writeln!(
+                output,
+                "bind \"Super+{index}\" {{\n    focus-workspace {index}\n}}\n\
+                 bind \"Super+Shift+{index}\" {{\n    move-window-to-workspace {index}\n}}"
+            )
+            .expect("writing to a String cannot fail");
+        }
+        output.push_str(GENERATED_CONFIG_TRAILER);
+        Self::format_kdl(&output).expect("generated configuration is valid KDL")
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -354,128 +361,452 @@ impl Config {
     }
 }
 
-fn normalize_workspace_selectors(source: &str) -> String {
-    let mut output = String::with_capacity(source.len());
-    let mut cursor = 0;
-    while let Some(start) = find_next_selector(source, cursor) {
-        output.push_str(&source[cursor..start]);
-        let arguments_start = start + "Index(".len();
-        let Some(end) = find_selector_end(source, arguments_start) else {
-            output.push_str(&source[start..]);
-            return output;
-        };
-        let arguments = &source[arguments_start..end];
-        // Convert the concise `Index(1)` spelling into the enum's actual two-field shape.
-        if let Some(comma) = find_unquoted_comma(arguments) {
-            let index = arguments[..comma].trim();
-            let key = arguments[comma + 1..].trim();
-            if key == "None" || key.starts_with("Some(") {
-                output.push_str(&format!("Index({index},{key})"));
-            } else {
-                output.push_str(&format!("Index({index},Some({key}))"));
+const TOP_LEVEL_NAMES: &[&str] = &["general", "input", "camera", "bind"];
+
+fn parse_general(document: &KdlDocument, gap: &mut i64) -> Result<(), ConfigError> {
+    let mut seen = false;
+    for node in document.nodes() {
+        if node.name().value() != "gap" {
+            return unknown("general setting", node.name().value(), &["gap"]);
+        }
+        if seen {
+            return invalid("duplicate `gap` setting");
+        }
+        *gap = one_i64(node, "gap")?;
+        seen = true;
+    }
+    Ok(())
+}
+
+fn parse_input(document: &KdlDocument, input: &mut KeyRepeatConfig) -> Result<(), ConfigError> {
+    let mut delay = false;
+    let mut rate = false;
+    for node in document.nodes() {
+        match node.name().value() {
+            "repeat-delay" if !delay => {
+                input.delay_ms = one_u64(node, "repeat-delay")?;
+                delay = true;
             }
+            "repeat-rate" if !rate => {
+                input.rate = one_u32(node, "repeat-rate")?;
+                rate = true;
+            }
+            "repeat-delay" | "repeat-rate" => {
+                return invalid(format!("duplicate `{}` setting", node.name().value()));
+            }
+            name => return unknown("input setting", name, &["repeat-delay", "repeat-rate"]),
+        }
+    }
+    Ok(())
+}
+
+fn parse_camera(document: &KdlDocument) -> Result<CameraPolicy, ConfigError> {
+    let [node] = document.nodes() else {
+        return invalid("camera requires exactly one policy");
+    };
+    match node.name().value() {
+        "centered" => {
+            require_no_entries(node)?;
+            require_no_children(node)?;
+            Ok(CameraPolicy::Centered)
+        }
+        "keep-visible" => {
+            require_no_children(node)?;
+            require_properties(node, &["margin"])?;
+            let margin = property_i64(node, "margin")?.unwrap_or(32);
+            Ok(CameraPolicy::KeepVisible { margin })
+        }
+        name => unknown("camera policy", name, &["centered", "keep-visible"]),
+    }
+}
+
+fn parse_bind(node: &KdlNode) -> Result<(String, Binding), ConfigError> {
+    require_properties(node, &["repeat"])?;
+    let args = positional(node);
+    let [key] = args.as_slice() else {
+        return invalid("`bind` requires exactly one key string");
+    };
+    let key = key
+        .as_string()
+        .ok_or_else(|| invalid_error("binding key must be a string"))?
+        .to_owned();
+    let repeat = property_bool(node, "repeat")?.unwrap_or(false);
+    let children = node
+        .children()
+        .ok_or_else(|| invalid_error(format!("binding {key:?} requires an action block")))?;
+    let [action_node] = children.nodes() else {
+        return invalid(format!("binding {key:?} must contain exactly one action"));
+    };
+    let action = parse_action(action_node)?;
+    if repeat && !action.can_repeat() {
+        return invalid(format!(
+            "binding {key:?} enables repeat for a non-repeatable action"
+        ));
+    }
+    validate_action(&action, &key)?;
+    Ok((key, Binding { action, repeat }))
+}
+
+fn parse_action(node: &KdlNode) -> Result<Action, ConfigError> {
+    require_no_children(node)?;
+    let name = node.name().value();
+    Ok(match name {
+        "spawn" => {
+            require_properties(node, &[])?;
+            let argv = positional_strings(node)?;
+            Action::Spawn(argv)
+        }
+        "focus-workspace" => {
+            require_properties(node, &["output", "id"])?;
+            Action::FocusWorkspace {
+                workspace: parse_workspace(node)?,
+            }
+        }
+        "move-window-to-workspace" => {
+            require_properties(node, &["output", "id", "activate"])?;
+            Action::MoveWindowToWorkspace {
+                workspace: parse_workspace(node)?,
+                activate: property_bool(node, "activate")?.unwrap_or(false),
+            }
+        }
+        "focus-output" => Action::FocusOutput {
+            output: one_string(node, "focus-output")?,
+        },
+        "move-workspace-to-output" => {
+            require_properties(node, &["index", "activate"])?;
+            Action::MoveWorkspaceToOutput {
+                output: first_string(node, "move-workspace-to-output")?,
+                index: property_usize(node, "index")?,
+                activate: property_bool(node, "activate")?.unwrap_or(true),
+            }
+        }
+        "focus-window" => Action::FocusDirection(parse_cardinal(node)?),
+        "pan-camera" => {
+            require_properties(node, &[])?;
+            let args = positional(node);
+            let [x, y] = args.as_slice() else {
+                return invalid("`pan-camera` requires x and y integers");
+            };
+            Action::PanCamera {
+                x: value_i64(x, "pan-camera x")?,
+                y: value_i64(y, "pan-camera y")?,
+            }
+        }
+        "set-window-mode" => {
+            Action::SetWindowMode(parse_mode(&one_string(node, "set-window-mode")?)?)
+        }
+        "toggle-floating" => empty_action(node, Action::ToggleFloating)?,
+        "toggle-fullscreen" => empty_action(node, Action::ToggleFullscreen)?,
+        "close-window" => empty_action(node, Action::CloseWindow)?,
+        "quit" => empty_action(node, Action::Quit)?,
+        _ => return unknown("action", name, ACTION_NAMES),
+    })
+}
+
+const ACTION_NAMES: &[&str] = &[
+    "spawn",
+    "focus-workspace",
+    "move-window-to-workspace",
+    "focus-output",
+    "move-workspace-to-output",
+    "focus-window",
+    "pan-camera",
+    "set-window-mode",
+    "toggle-floating",
+    "toggle-fullscreen",
+    "close-window",
+    "quit",
+];
+
+fn parse_workspace(node: &KdlNode) -> Result<WorkspaceSelector, ConfigError> {
+    if let Some(id) = property_usize(node, "id")? {
+        if !positional(node).is_empty() || node.get("output").is_some() {
+            return invalid("workspace `id` cannot be combined with an argument or `output`");
+        }
+        return Ok(WorkspaceSelector::Id(
+            u32::try_from(id).map_err(|_| invalid_error("workspace id is out of range"))?,
+        ));
+    }
+    let args = positional(node);
+    let [selector] = args.as_slice() else {
+        return invalid(format!(
+            "`{}` requires one workspace selector",
+            node.name().value()
+        ));
+    };
+    match selector {
+        KdlValue::Integer(index) => Ok(WorkspaceSelector::Index(
+            usize::try_from(*index)
+                .map_err(|_| invalid_error("workspace index is out of range"))?,
+            property_string(node, "output")?,
+        )),
+        KdlValue::String(name) => {
+            if node.get("output").is_some() {
+                return invalid("workspace names cannot be combined with `output`");
+            }
+            Ok(WorkspaceSelector::Name(name.clone()))
+        }
+        _ => invalid("workspace selector must be an integer index or string name"),
+    }
+}
+
+fn parse_cardinal(node: &KdlNode) -> Result<CardinalDirection, ConfigError> {
+    match one_string(node, "focus-window")?.as_str() {
+        "left" => Ok(CardinalDirection::Left),
+        "right" => Ok(CardinalDirection::Right),
+        "up" => Ok(CardinalDirection::Up),
+        "down" => Ok(CardinalDirection::Down),
+        value => invalid(format!(
+            "unknown direction {value:?}; expected left, right, up, or down"
+        )),
+    }
+}
+
+fn parse_mode(value: &str) -> Result<WindowMode, ConfigError> {
+    match value {
+        "tiled" => Ok(WindowMode::Tiled),
+        "floating" => Ok(WindowMode::Floating),
+        "maximized" => Ok(WindowMode::Maximized),
+        "fullscreen" => Ok(WindowMode::Fullscreen),
+        _ => invalid(format!("unknown window mode {value:?}")),
+    }
+}
+
+fn positional(node: &KdlNode) -> Vec<&KdlValue> {
+    node.entries()
+        .iter()
+        .filter(|entry| entry.name().is_none())
+        .map(|entry| entry.value())
+        .collect()
+}
+
+fn positional_strings(node: &KdlNode) -> Result<Vec<String>, ConfigError> {
+    positional(node)
+        .into_iter()
+        .map(|value| {
+            value.as_string().map(str::to_owned).ok_or_else(|| {
+                invalid_error(format!(
+                    "`{}` arguments must be strings",
+                    node.name().value()
+                ))
+            })
+        })
+        .collect()
+}
+
+fn require_properties(node: &KdlNode, allowed: &[&str]) -> Result<(), ConfigError> {
+    let mut seen = BTreeMap::new();
+    for entry in node.entries().iter().filter(|entry| entry.name().is_some()) {
+        let name = entry.name().unwrap().value();
+        if !allowed.contains(&name) {
+            return unknown("property", name, allowed);
+        }
+        if seen.insert(name, ()).is_some() {
+            return invalid(format!("duplicate `{name}` property"));
+        }
+    }
+    Ok(())
+}
+
+fn require_no_entries(node: &KdlNode) -> Result<(), ConfigError> {
+    if node.entries().is_empty() {
+        Ok(())
+    } else {
+        invalid(format!(
+            "`{}` does not accept values or properties",
+            node.name().value()
+        ))
+    }
+}
+
+fn require_no_children(node: &KdlNode) -> Result<(), ConfigError> {
+    if node.children().is_none() {
+        Ok(())
+    } else {
+        invalid(format!(
+            "`{}` does not accept a child block",
+            node.name().value()
+        ))
+    }
+}
+
+fn empty_action(node: &KdlNode, action: Action) -> Result<Action, ConfigError> {
+    require_no_entries(node)?;
+    Ok(action)
+}
+
+fn one_string(node: &KdlNode, label: &str) -> Result<String, ConfigError> {
+    require_properties(node, &[])?;
+    first_string(node, label).and_then(|value| {
+        if positional(node).len() == 1 {
+            Ok(value)
         } else {
-            output.push_str(&format!("Index({},None)", arguments.trim()));
+            invalid(format!("`{label}` requires exactly one string"))
         }
-        cursor = end + 1;
-    }
-    output.push_str(&source[cursor..]);
-    output
+    })
 }
 
-fn find_next_selector(source: &str, start: usize) -> Option<usize> {
-    let bytes = source.as_bytes();
-    let mut index = start;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'"' => {
-                // Selector-like text inside a string literal must remain untouched.
-                index += 1;
-                while index < bytes.len() {
-                    match bytes[index] {
-                        b'\\' => index = (index + 2).min(bytes.len()),
-                        b'"' => {
-                            index += 1;
-                            break;
-                        }
-                        _ => index += 1,
-                    }
-                }
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'/') => {
-                // RON accepts Rust-style comments; skip selector-like text inside them.
-                index += 2;
-                while index < bytes.len() && bytes[index] != b'\n' {
-                    index += 1;
-                }
-            }
-            b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                index += 2;
-                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
-                {
-                    index += 1;
-                }
-                index = (index + 2).min(bytes.len());
-            }
-            b'I' if source[index..].starts_with("Index(") => return Some(index),
-            _ => index += 1,
-        }
-    }
-    None
+fn first_string(node: &KdlNode, label: &str) -> Result<String, ConfigError> {
+    positional(node)
+        .first()
+        .and_then(|value| value.as_string())
+        .map(str::to_owned)
+        .ok_or_else(|| invalid_error(format!("`{label}` requires a string")))
 }
 
-fn find_selector_end(source: &str, start: usize) -> Option<usize> {
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut depth = 0_u32;
-    for (offset, character) in source[start..].char_indices() {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                quoted = false;
-            }
-        } else if character == '"' {
-            quoted = true;
-        } else if character == '(' {
-            depth += 1;
-        } else if character == ')' {
-            if depth == 0 {
-                return Some(start + offset);
-            }
-            depth -= 1;
-        }
-    }
-    None
+fn one_i64(node: &KdlNode, label: &str) -> Result<i64, ConfigError> {
+    require_properties(node, &[])?;
+    require_no_children(node)?;
+    let args = positional(node);
+    let [value] = args.as_slice() else {
+        return invalid(format!("`{label}` requires one integer"));
+    };
+    value_i64(value, label)
 }
 
-fn find_unquoted_comma(source: &str) -> Option<usize> {
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut depth = 0_u32;
-    for (offset, character) in source.char_indices() {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                quoted = false;
-            }
-        } else if character == '"' {
-            quoted = true;
-        } else if character == '(' {
-            depth += 1;
-        } else if character == ')' {
-            depth = depth.saturating_sub(1);
-        } else if character == ',' && depth == 0 {
-            return Some(offset);
+fn one_u64(node: &KdlNode, label: &str) -> Result<u64, ConfigError> {
+    u64::try_from(one_i64(node, label)?)
+        .map_err(|_| invalid_error(format!("`{label}` must be non-negative")))
+}
+fn one_u32(node: &KdlNode, label: &str) -> Result<u32, ConfigError> {
+    u32::try_from(one_i64(node, label)?)
+        .map_err(|_| invalid_error(format!("`{label}` is out of range")))
+}
+fn value_i64(value: &KdlValue, label: &str) -> Result<i64, ConfigError> {
+    value
+        .as_integer()
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| invalid_error(format!("`{label}` must be an integer")))
+}
+
+fn property_string(node: &KdlNode, name: &str) -> Result<Option<String>, ConfigError> {
+    node.get(name)
+        .map(|value| {
+            value
+                .as_string()
+                .map(str::to_owned)
+                .ok_or_else(|| invalid_error(format!("`{name}` must be a string")))
+        })
+        .transpose()
+}
+fn property_i64(node: &KdlNode, name: &str) -> Result<Option<i64>, ConfigError> {
+    node.get(name)
+        .map(|value| value_i64(value, name))
+        .transpose()
+}
+fn property_usize(node: &KdlNode, name: &str) -> Result<Option<usize>, ConfigError> {
+    node.get(name)
+        .map(|value| {
+            value
+                .as_integer()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| invalid_error(format!("`{name}` must be a non-negative integer")))
+        })
+        .transpose()
+}
+fn property_bool(node: &KdlNode, name: &str) -> Result<Option<bool>, ConfigError> {
+    node.get(name)
+        .map(|value| {
+            value
+                .as_bool()
+                .or_else(|| match value.as_string() {
+                    Some("true") => Some(true),
+                    Some("false") => Some(false),
+                    _ => None,
+                })
+                .ok_or_else(|| invalid_error(format!("`{name}` must be true or false")))
+        })
+        .transpose()
+}
+
+fn format_kdl_error(error: &kdl::KdlError) -> String {
+    error
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let offset = diagnostic.span.offset();
+            let prefix = &error.input[..offset.min(error.input.len())];
+            let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+            let column = prefix.rsplit('\n').next().map(str::len).unwrap_or(0) + 1;
+            format!("{} at {line}:{column}", diagnostic)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn invalid<T>(message: impl Into<String>) -> Result<T, ConfigError> {
+    Err(invalid_error(message))
+}
+fn invalid_error(message: impl Into<String>) -> ConfigError {
+    ConfigError::Invalid(message.into())
+}
+
+fn unknown<T>(kind: &str, name: &str, candidates: &[&str]) -> Result<T, ConfigError> {
+    let suggestion = candidates
+        .iter()
+        .min_by_key(|candidate| edit_distance(name, candidate));
+    let suffix = suggestion
+        .filter(|candidate| edit_distance(name, candidate) <= 3)
+        .map(|candidate| format!("; did you mean `{candidate}`?"))
+        .unwrap_or_default();
+    invalid(format!("unknown {kind} `{name}`{suffix}"))
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let mut row: Vec<usize> = (0..=right.len()).collect();
+    for (i, a) in left.bytes().enumerate() {
+        let mut previous = row[0];
+        row[0] = i + 1;
+        for (j, b) in right.bytes().enumerate() {
+            let old = row[j + 1];
+            row[j + 1] = (row[j + 1] + 1)
+                .min(row[j] + 1)
+                .min(previous + usize::from(a != b));
+            previous = old;
         }
     }
-    None
+    row[right.len()]
 }
+
+const GENERATED_CONFIG_HEADER: &str = r#"// Astera configuration. A file replaces all built-in bindings.
+general {
+    gap 8
+}
+
+input {
+    repeat-delay 300
+    repeat-rate 25
+}
+
+camera {
+    keep-visible margin=32
+}
+
+bind "Super+Return" {
+    spawn "kitty"
+}
+"#;
+
+const GENERATED_CONFIG_TRAILER: &str = r#"
+bind "Super+Space" {
+    toggle-floating
+}
+bind "Super+F" {
+    toggle-fullscreen
+}
+bind "Super+Left" repeat=#true {
+    pan-camera -160 0
+}
+bind "Super+Right" repeat=#true {
+    pan-camera 160 0
+}
+bind "Super+Up" repeat=#true {
+    pan-camera 0 -160
+}
+bind "Super+Down" repeat=#true {
+    pan-camera 0 160
+}
+"#;
 
 fn parse_binding_key(source: &str) -> Result<BindingKey, ConfigError> {
     let mut modifiers = 0_u8;
@@ -546,10 +877,6 @@ fn parse_binding_key(source: &str) -> Result<BindingKey, ConfigError> {
     })
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn validate_action(action: &Action, source: &str) -> Result<(), ConfigError> {
     let workspace = match action {
         Action::FocusWorkspace { workspace } | Action::MoveWindowToWorkspace { workspace, .. } => {
@@ -573,9 +900,6 @@ fn validate_action(action: &Action, source: &str) -> Result<(), ConfigError> {
         Action::Spawn(argv) if argv.is_empty() || argv[0].is_empty() => Err(ConfigError::Invalid(
             format!("binding {source:?} has an empty Spawn argv"),
         )),
-        Action::SpawnShell(script) if script.trim().is_empty() => Err(ConfigError::Invalid(
-            format!("binding {source:?} has an empty SpawnShell script"),
-        )),
         Action::MoveWorkspaceToOutput { index: Some(0), .. } => Err(ConfigError::Invalid(format!(
             "binding {source:?} uses target index zero"
         ))),
@@ -587,10 +911,27 @@ fn validate_action(action: &Action, source: &str) -> Result<(), ConfigError> {
 pub enum ConfigError {
     #[error("could not read configuration: {0}")]
     Io(#[from] std::io::Error),
-    #[error("could not parse RON configuration: {0}")]
-    Parse(#[from] ron::error::SpannedError),
+    #[error("could not parse KDL configuration: {0}")]
+    Parse(String),
     #[error("invalid configuration: {0}")]
     Invalid(String),
+}
+
+impl ConfigError {
+    fn with_location(self, source: &str, offset: usize) -> Self {
+        let Self::Invalid(message) = self else {
+            return self;
+        };
+        let offset = offset.min(source.len());
+        let prefix = &source[..offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix.rsplit('\n').next().map(str::len).unwrap_or(0) + 1;
+        let source_line = source.lines().nth(line - 1).unwrap_or("");
+        Self::Invalid(format!(
+            "{message}\n  --> {line}:{column}\n   |\n{line:>3} | {source_line}\n   | {}^",
+            " ".repeat(column.saturating_sub(1))
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -600,62 +941,65 @@ mod tests {
     #[test]
     fn missing_file_uses_built_in_bindings_but_file_does_not() {
         assert!(!Config::default().bindings.is_empty());
-        assert!(Config::from_ron("()").unwrap().bindings.is_empty());
+        assert!(Config::from_kdl("").unwrap().bindings.is_empty());
     }
 
     #[test]
-    fn parses_shorthand_detailed_and_physical_bindings() {
-        let config = Config::from_ron(
-            r#"(
-                bindings: {
-                    "Super+Return": Spawn(["foot"]),
-                    "Super+Right": (action: PanCamera(x: 10, y: 0), repeat: true),
-                    "Super+code:0x7b": CloseWindow,
-                    "Super+1": FocusWorkspace(workspace: Index(1)),
-                    "Super+2": FocusWorkspace(workspace: Index(2, "DP-1")),
-                    "Super+3": SpawnShell("echo Index(3)"),
-                },
-            )"#,
+    fn parses_sections_actions_and_physical_bindings() {
+        let config = Config::from_kdl(
+            r#"
+                general { gap 12 }
+                input { repeat-delay 400; repeat-rate 30 }
+                camera { keep-visible margin=40 }
+                bind "Super+Return" { spawn "kitty" }
+                bind "Super+Right" repeat=#true { pan-camera 10 0 }
+                bind "Super+code:0x7b" { close-window }
+                bind "Super+1" { focus-workspace 1 }
+                bind "Super+2" { focus-workspace 2 output="DP-1" }
+                bind "Super+3" { spawn "sh" "-c" "echo hello" }
+            "#,
         )
         .unwrap();
         assert_eq!(config.bindings.len(), 6);
+        assert_eq!(config.gap, 12);
+        assert_eq!(config.key_repeat.delay_ms, 400);
     }
 
     #[test]
-    fn selector_normalization_accepts_explicit_option_shape() {
-        let config = Config::from_ron(
-            r#"(bindings: {
-                "Super+1": FocusWorkspace(workspace: Index(2, Some("DP-1"))),
-                "Super+2": FocusWorkspace(workspace: Index(3, None)),
-            })"#,
-        )
-        .unwrap();
-        assert_eq!(config.bindings.len(), 2);
+    fn formatter_preserves_comments_and_generated_config_is_valid() {
+        let source = "// keep me\ngeneral { gap 8 }\n";
+        let formatted = Config::format_kdl(source).unwrap();
+        assert!(formatted.contains("// keep me"));
+        let generated_source = Config::generated_kdl();
+        assert_eq!(
+            Config::format_kdl(&generated_source).unwrap(),
+            generated_source
+        );
+        let generated = Config::from_kdl(&generated_source).unwrap();
+        assert_eq!(generated.bindings.len(), Config::default().bindings.len());
     }
 
     #[test]
-    fn rejects_normalized_duplicates_and_unsafe_repeat() {
+    fn rejects_duplicates_unsafe_repeat_and_unknown_names() {
         assert!(
-            Config::from_ron(
-                r#"(bindings: {"Super+Return": CloseWindow, "super+return": CloseWindow})"#
+            Config::from_kdl(
+                r#"bind "Super+Q" { close-window }
+                   bind "super+q" { close-window }"#
             )
             .is_err()
         );
+        assert!(Config::from_kdl(r#"bind "Super+Return" repeat=#true { spawn "kitty" }"#).is_err());
+        assert!(Config::from_kdl(r#"bind "Super+1" { focus-workpace 1 }"#).is_err());
+        let error = Config::from_kdl(r#"bind "Super+1" { focus-workpace 1 }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did you mean `focus-workspace`"));
+        assert!(error.contains("--> 1:1"));
         assert!(
-            Config::from_ron(r#"(bindings: {"Super+Q": CloseWindow, "super+q": CloseWindow})"#)
-                .is_err()
+            Config::from_kdl(r#"bind "Super+1" { focus-workspace 1 activate=#true }"#).is_err()
         );
         assert!(
-            Config::from_ron(
-                r#"(bindings: {"Super+Return": (action: Spawn(["foot"]), repeat: true)})"#
-            )
-            .is_err()
-        );
-        assert!(
-            Config::from_ron(
-                r#"(bindings: {"Super+1": FocusWorkspace(workspace: Index(4294967296))})"#
-            )
-            .is_err()
+            Config::from_kdl(r#"bind "Super+1" { focus-workspace id=7 output="DP-1" }"#).is_err()
         );
     }
 }

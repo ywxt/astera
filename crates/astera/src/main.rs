@@ -31,10 +31,10 @@ fn main() -> Result<()> {
 
 fn default_config_path() -> Result<std::path::PathBuf> {
     if let Some(directory) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Ok(std::path::PathBuf::from(directory).join("astera/config.ron"));
+        return Ok(std::path::PathBuf::from(directory).join("astera/config.kdl"));
     }
     let home = std::env::var_os("HOME").context("HOME is not set")?;
-    Ok(std::path::PathBuf::from(home).join(".config/astera/config.ron"))
+    Ok(std::path::PathBuf::from(home).join(".config/astera/config.kdl"))
 }
 
 fn init_tracing() {

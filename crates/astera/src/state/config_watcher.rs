@@ -211,7 +211,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::write(&path, "(bindings: {})").unwrap();
+        std::fs::write(&path, "").unwrap();
         let mut watcher = ConfigWatcher::new(path.clone()).unwrap();
         std::fs::remove_file(&path).unwrap();
         let now = Instant::now();
@@ -224,9 +224,9 @@ mod tests {
     #[test]
     fn atomic_rename_and_unrelated_files_are_filtered() {
         let directory = temporary_directory();
-        let path = directory.join("config.ron");
+        let path = directory.join("config.kdl");
         let other = directory.join("other");
-        std::fs::write(&path, "(bindings: {})").unwrap();
+        std::fs::write(&path, "").unwrap();
         let mut watcher = ConfigWatcher::new(path.clone()).unwrap();
         watcher.duplicate_fd().unwrap();
         std::fs::write(&other, "unrelated").unwrap();
@@ -234,7 +234,7 @@ mod tests {
         assert!(watcher.reload_at.is_none());
 
         let replacement = directory.join("replacement");
-        std::fs::write(&replacement, "(bindings: {})").unwrap();
+        std::fs::write(&replacement, "").unwrap();
         std::fs::rename(&replacement, &path).unwrap();
         let now = Instant::now();
         notify_until_changed(&mut watcher, now);
@@ -247,11 +247,11 @@ mod tests {
     #[test]
     fn first_parent_creation_rearms_watch_to_closer_directory() {
         let directory = temporary_directory();
-        let path = directory.join("new").join("config.ron");
+        let path = directory.join("new").join("config.kdl");
         let mut watcher = ConfigWatcher::new(path.clone()).unwrap();
         watcher.duplicate_fd().unwrap();
         std::fs::create_dir(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "(bindings: {})").unwrap();
+        std::fs::write(&path, "").unwrap();
         let now = Instant::now();
         notify_until_changed(&mut watcher, now);
         assert_eq!(watcher.watched_directory, path.parent().unwrap());
@@ -267,19 +267,19 @@ mod tests {
         let config_directory = directory.join("config");
         let old_directory = directory.join("old");
         std::fs::create_dir(&config_directory).unwrap();
-        let path = config_directory.join("config.ron");
-        std::fs::write(&path, "(bindings: {})").unwrap();
+        let path = config_directory.join("config.kdl");
+        std::fs::write(&path, "").unwrap();
         let mut watcher = ConfigWatcher::new(path.clone()).unwrap();
         watcher.duplicate_fd().unwrap();
 
         std::fs::rename(&config_directory, &old_directory).unwrap();
         std::fs::create_dir(&config_directory).unwrap();
-        std::fs::write(&path, "(bindings: {})").unwrap();
+        std::fs::write(&path, "").unwrap();
         let now = Instant::now();
         notify_until_changed(&mut watcher, now);
         let _ = watcher.poll(now + RELOAD_DEBOUNCE).unwrap();
 
-        std::fs::write(&path, "(gap: 9, bindings: {})").unwrap();
+        std::fs::write(&path, "general { gap 9 }").unwrap();
         let later = now + RELOAD_DEBOUNCE + Duration::from_millis(1);
         notify_until_changed(&mut watcher, later);
         assert_eq!(
@@ -288,7 +288,7 @@ mod tests {
         );
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(config_directory).unwrap();
-        std::fs::remove_file(old_directory.join("config.ron")).unwrap();
+        std::fs::remove_file(old_directory.join("config.kdl")).unwrap();
         std::fs::remove_dir(old_directory).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }

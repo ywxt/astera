@@ -64,8 +64,8 @@ cargo run -p astera -- --backend=native
 
 ## Configuration
 
-Astera loads `$XDG_CONFIG_HOME/astera/config.ron`, falling back to
-`$HOME/.config/astera/config.ron`. Pass `--config PATH` to require a specific
+Astera loads `$XDG_CONFIG_HOME/astera/config.kdl`, falling back to
+`$HOME/.config/astera/config.kdl`. Pass `--config PATH` to require a specific
 file. Without a file, Astera uses its built-in bindings; once a valid file
 exists, its `bindings` map completely replaces the built-ins. Deleting the file
 restores them.
@@ -74,28 +74,52 @@ The file is watched while Astera runs. Changes are applied after a short
 debounce; an invalid edit leaves the last valid configuration active. Gap,
 camera policy, keyboard repeat settings and bindings reload as one transaction.
 
-```ron
-(
-    gap: 8,
-    camera: KeepVisible(margin: 32),
-    key_repeat: (delay_ms: 300, rate: 25),
-    bindings: {
-        "Super+Return": Spawn(["foot"]),
-        "Super+P": SpawnShell("grim -g \"$(slurp)\" | wl-copy"),
-        "Super+1": FocusWorkspace(workspace: Index(1)),
-        "Super+2": FocusWorkspace(workspace: Index(2, "DP-1")),
-        "Super+Shift+2": MoveWindowToWorkspace(workspace: Index(2)),
-        "Super+H": FocusDirection(Left),
-        "Super+F": ToggleFullscreen,
-        "Super+Ctrl+F": SetWindowMode(Fullscreen),
-        "Super+Right": (
-            action: PanCamera(x: 160, y: 0),
-            repeat: true,
-        ),
-        "Super+code:0x7b": CloseWindow,
-    },
-)
+```kdl
+general {
+    gap 8
+}
+input {
+    repeat-delay 300
+    repeat-rate 25
+}
+camera {
+    keep-visible margin=32
+}
+
+bind "Super+Return" {
+    spawn "kitty"
+}
+bind "Super+1" {
+    focus-workspace 1
+}
+bind "Super+2" {
+    focus-workspace 2 output="DP-1"
+}
+bind "Super+Shift+2" {
+    move-window-to-workspace 2
+}
+bind "Super+H" {
+    focus-window "left"
+}
+bind "Super+F" {
+    toggle-fullscreen
+}
+bind "Super+Ctrl+F" {
+    set-window-mode "fullscreen"
+}
+bind "Super+Right" repeat=#true {
+    pan-camera 160 0
+}
+bind "Super+code:0x7b" {
+    close-window
+}
 ```
+
+`spawn` takes an executable followed by literal arguments; it never invokes a
+shell implicitly. Use `spawn "sh" "-c" "…"` when shell syntax is intentional.
+`astrology config check`, `config format`, and `config generate` work without a
+running compositor. The latter prints a complete built-in-style configuration;
+add `--write` to create the default file without overwriting an existing one.
 
 Bindings use case-insensitive XKB keysyms or Linux evdev codes written as
 `code:123`/`code:0x7b`. Modifiers are exactly `Ctrl`, `Alt`, `Shift` and `Super`;
@@ -187,33 +211,40 @@ terminal often still points at the parent compositor, so set it to the display
 name Astera prints at startup. Connection errors include the complete IPC
 socket path to make a mismatched environment immediately visible.
 
-`astrology` also exposes the complete IPC surface:
+`astrology` groups operations by resource and prints human-readable output by
+default:
 
 ```sh
-# Pretty or compact authoritative state.
+# Human overview or stable JSON state.
 astrology state
-astrology state --raw
+astrology state --json
 
-# Initial snapshot followed by one RON EventEnvelope per line. The command exits
-# non-zero if the stream disconnects and does not reconnect automatically.
-astrology events
+# Initial snapshot followed by events; --json emits NDJSON.
+astrology events --json
 
-# Typed commands; omitted output selectors mean the active output.
-astrology focus-output
-astrology focus-workspace --index 3
-astrology move-window 42 --name code --activate
-astrology set-window-mode 42 fullscreen
-astrology pan-camera 3 160 0
+# Omitted output and window arguments mean the active/focused object.
+astrology output focus
+astrology workspace focus 3
+astrology workspace focus 3 --output DP-1
+astrology workspace rename id:7 code
+astrology window focus left
+astrology window mode fullscreen
+astrology window move code --activate
+astrology camera pan 160 0
 
-# Any v1 Command remains available without waiting for a dedicated CLI wrapper.
-astrology command 'SetWorkspaceName(workspace:(7),name:Some("work"))'
+# Configuration operations are offline and need no WAYLAND_DISPLAY.
+astrology config check
+astrology config format --check
+astrology config generate
+astrology config generate --write
 ```
 
 Output selectors accept a numeric ID, stable connector key, or `active`.
-Workspace selectors use exactly one of `--id`, `--name`, or `--index`; an index
-may include `--output`, and otherwise resolves on the active output. Successful
-mutation commands print the public sequence watermark. Server errors include
-their code, message, and sequence.
+Workspace selectors are positional: `3` is an output-local one-based index,
+`code` is a unique name, and `id:7` is a global ID. Only an index may include
+`--output`; otherwise it resolves on the active output. Successful mutations
+print the public sequence watermark. Exit code 2 denotes CLI/config errors, 3
+IPC connection or framing failures, 4 server rejection, and 5 stream loss.
 
 When no configuration file exists, built-in bindings use the Super modifier:
 
