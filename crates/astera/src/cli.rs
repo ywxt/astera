@@ -42,11 +42,11 @@ mod tests {
             "astera",
             "--backend=native",
             "--config",
-            "/tmp/astera.ron",
+            "/tmp/astera.kdl",
         ])
         .unwrap();
         assert_eq!(options.effective_backend(), BackendKind::Native);
-        assert_eq!(options.config, Some(PathBuf::from("/tmp/astera.ron")));
+        assert_eq!(options.config, Some(PathBuf::from("/tmp/astera.kdl")));
 
         let nested = LaunchOptions::try_parse_from(["astera", "--nested"]).unwrap();
         assert_eq!(nested.effective_backend(), BackendKind::Winit);

@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn deletion_restores_built_in_configuration_after_debounce() {
         let path = std::env::temp_dir().join(format!(
-            "astera-config-watcher-{}-{}.ron",
+            "astera-config-watcher-{}-{}.kdl",
             std::process::id(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)

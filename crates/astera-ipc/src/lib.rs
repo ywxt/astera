@@ -13,11 +13,11 @@ pub struct Frame<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum FramingError {
-    #[error("IPC frame must be `<version> <RON>\\n`")]
+    #[error("IPC frame must be `<version> <JSON>\\n`")]
     InvalidFrame,
     #[error("IPC frame version {actual} does not match expected version {expected}")]
     VersionMismatch { expected: u16, actual: u16 },
-    #[error("invalid RON payload: {0}")]
+    #[error("invalid JSON payload: {0}")]
     InvalidPayload(String),
 }
 
@@ -38,7 +38,8 @@ pub fn parse_frame(frame: &str) -> Result<Frame<'_>, FramingError> {
 }
 
 pub fn decode_payload<T: DeserializeOwned>(frame: Frame<'_>) -> Result<T, FramingError> {
-    ron::from_str(frame.payload).map_err(|error| FramingError::InvalidPayload(error.to_string()))
+    serde_json::from_str(frame.payload)
+        .map_err(|error| FramingError::InvalidPayload(error.to_string()))
 }
 
 pub fn decode_frame<T: DeserializeOwned>(
@@ -55,8 +56,8 @@ pub fn decode_frame<T: DeserializeOwned>(
     decode_payload(frame)
 }
 
-pub fn encode_frame<T: Serialize>(version: u16, value: &T) -> Result<String, ron::Error> {
-    Ok(format!("{version} {}\n", ron::to_string(value)?))
+pub fn encode_frame<T: Serialize>(version: u16, value: &T) -> Result<String, serde_json::Error> {
+    Ok(format!("{version} {}\n", serde_json::to_string(value)?))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -854,7 +855,7 @@ mod tests {
     fn bootstrap_v0_is_frozen_and_reports_version_bounds() {
         assert_eq!(
             encode_frame(BOOTSTRAP_VERSION, &wire::v0::Request::Versions).unwrap(),
-            "0 Versions\n"
+            "0 \"Versions\"\n"
         );
         assert_eq!(
             encode_frame(
@@ -865,7 +866,7 @@ mod tests {
                 },
             )
             .unwrap(),
-            "0 Versions(minimum:1,current:1)\n"
+            "0 {\"Versions\":{\"minimum\":1,\"current\":1}}\n"
         );
         assert_eq!(
             encode_frame(
@@ -875,7 +876,7 @@ mod tests {
                 },
             )
             .unwrap(),
-            "0 InvalidFrame(message:\"bad frame\")\n"
+            "0 {\"InvalidFrame\":{\"message\":\"bad frame\"}}\n"
         );
         assert_eq!(
             encode_frame(
@@ -885,7 +886,7 @@ mod tests {
                 },
             )
             .unwrap(),
-            "0 InvalidRequest(message:\"bad request\")\n"
+            "0 {\"InvalidRequest\":{\"message\":\"bad request\"}}\n"
         );
         let response = wire::v0::Response::UnsupportedVersion {
             requested: 9,
@@ -895,14 +896,14 @@ mod tests {
         let encoded = encode_frame(BOOTSTRAP_VERSION, &response).unwrap();
         assert_eq!(
             encoded,
-            "0 UnsupportedVersion(requested:9,minimum:1,current:1)\n"
+            "0 {\"UnsupportedVersion\":{\"requested\":9,\"minimum\":1,\"current\":1}}\n"
         );
         assert_eq!(
             decode_frame::<wire::v0::Response>(&encoded, 0).unwrap(),
             response
         );
         assert_eq!(
-            decode_request("9 (kind:EventStream)\n"),
+            decode_request("9 {\"kind\":\"EventStream\"}\n"),
             Err(RequestDecodeError::UnsupportedVersion {
                 requested: 9,
                 minimum: 1,
@@ -915,7 +916,7 @@ mod tests {
     fn v1_textual_fixtures_are_stable() {
         assert_eq!(
             encode_frame(1, &request()).unwrap(),
-            "1 (kind:Command(FocusWorkspace(workspace:LocalIndex(output:Key(\"DP-1\"),index:3))))\n"
+            "1 {\"kind\":{\"Command\":{\"FocusWorkspace\":{\"workspace\":{\"LocalIndex\":{\"output\":{\"Key\":\"DP-1\"},\"index\":3}}}}}}\n"
         );
         assert_eq!(
             encode_frame(
@@ -925,7 +926,7 @@ mod tests {
                 },
             )
             .unwrap(),
-            "1 (kind:EventStream)\n"
+            "1 {\"kind\":\"EventStream\"}\n"
         );
         assert_eq!(
             encode_frame(
@@ -933,7 +934,7 @@ mod tests {
                 &wire::v1::Response::Success(wire::v1::Success::Handled { sequence: 42 }),
             )
             .unwrap(),
-            "1 Success(Handled(sequence:42))\n"
+            "1 {\"Success\":{\"Handled\":{\"sequence\":42}}}\n"
         );
         assert_eq!(
             encode_frame(
@@ -945,7 +946,7 @@ mod tests {
                 }),
             )
             .unwrap(),
-            "1 Error((code:NotFound,message:\"missing\",sequence:42))\n"
+            "1 {\"Error\":{\"code\":\"NotFound\",\"message\":\"missing\",\"sequence\":42}}\n"
         );
         assert_eq!(
             encode_frame(
@@ -958,7 +959,7 @@ mod tests {
                 },
             )
             .unwrap(),
-            "1 (sequence:43,event:WindowClosed(window:(7)))\n"
+            "1 {\"sequence\":43,\"event\":{\"WindowClosed\":{\"window\":7}}}\n"
         );
     }
 

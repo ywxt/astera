@@ -152,7 +152,7 @@ WAYLAND_DISPLAY=astera-1 weston-terminal
 The compositor also creates `<runtime-dir>/astera/<wayland-display>.ipc`. The
 parent directory is mode `0700`, the socket is mode `0600`, and Linux peer
 credentials must report the compositor user's UID. Every frame is one
-newline-terminated `<version> <RON>` record; inbound records are limited to
+newline-terminated `<version> <JSON>` record; inbound records are limited to
 64 KiB and each write has a two-second timeout.
 
 IPC has two connection modes:

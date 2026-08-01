@@ -925,7 +925,7 @@ mod tests {
         let mut output = Vec::new();
         run(args, &mut output).unwrap();
         let generated = String::from_utf8(output).unwrap();
-        assert!(generated.contains("spawn \"kitty\""));
+        assert!(generated.contains("spawn kitty"));
         Config::from_kdl(&generated).unwrap();
     }
 

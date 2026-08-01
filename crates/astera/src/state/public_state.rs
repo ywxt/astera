@@ -387,7 +387,7 @@ mod tests {
     fn snapshot_contains_runtime_output_workspace_and_config_status() {
         let display = Display::<Astera>::new().unwrap();
         let mut state = Astera::new(&display.handle(), astera_config::Config::default());
-        state.config_source = Some("/tmp/astera.ron".into());
+        state.config_source = Some("/tmp/astera.kdl".into());
         let snapshot = state.public_snapshot();
         assert_eq!(snapshot.outputs.len(), 1);
         assert_eq!(
@@ -400,7 +400,7 @@ mod tests {
         );
         assert_eq!(snapshot.workspaces.len(), 1);
         assert_eq!(snapshot.cameras[0].workspace, snapshot.workspaces[0].id);
-        assert_eq!(snapshot.config.source.as_deref(), Some("/tmp/astera.ron"));
+        assert_eq!(snapshot.config.source.as_deref(), Some("/tmp/astera.kdl"));
         assert_eq!(snapshot.config.generation, 0);
         assert!(!snapshot.config.failed);
         assert_eq!(snapshot.config.error, None);
