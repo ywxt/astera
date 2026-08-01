@@ -234,6 +234,11 @@ impl Astera {
             metadata,
             placement,
             visible_geometry,
+            urgent: self
+                .windows
+                .iter()
+                .find(|mapped| mapped.id == window)
+                .is_some_and(|mapped| mapped.urgent),
         }
     }
 

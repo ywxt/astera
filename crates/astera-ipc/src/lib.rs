@@ -536,6 +536,8 @@ pub mod wire {
             pub metadata: WindowMetadata,
             pub placement: WindowPlacement,
             pub visible_geometry: Option<Rect>,
+            #[serde(default)]
+            pub urgent: bool,
         }
 
         #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -673,6 +675,7 @@ pub mod wire {
                                 world_geometry: window.geometry.into(),
                             },
                             visible_geometry: None,
+                            urgent: false,
                         }));
                         windows.extend(workspace.floating.values().map(|window| WindowSnapshot {
                             id: window.window.into(),
@@ -683,6 +686,7 @@ pub mod wire {
                                 viewport_geometry: window.viewport.rect.into(),
                             },
                             visible_geometry: None,
+                            urgent: false,
                         }));
                         if let Some(full) = &workspace.fullscreen {
                             let restore = match &full.restore {
@@ -720,6 +724,7 @@ pub mod wire {
                                 metadata: WindowMetadata::default(),
                                 placement: WindowPlacement::Fullscreen { restore },
                                 visible_geometry: None,
+                                urgent: false,
                             });
                         }
                         let location = desktop

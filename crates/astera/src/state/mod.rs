@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 
+mod activation;
 mod clock;
 mod config_watcher;
 mod event_hub;
@@ -18,6 +19,7 @@ mod scene;
 #[cfg(test)]
 mod snapshot;
 
+use activation::ActivationTracker;
 use clock::{Clock, SystemClock};
 use config_watcher::ConfigWatcher;
 use event_hub::EventHub;
@@ -53,7 +55,7 @@ use smithay::{
     },
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
     delegate_layer_shell, delegate_output, delegate_seat, delegate_shm, delegate_viewporter,
-    delegate_xdg_shell,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -65,7 +67,7 @@ use smithay::{
     },
     output::{Mode, Output as SmithayOutput, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::{
-        Client, DisplayHandle,
+        Client, DisplayHandle, Resource,
         backend::{ClientData, ClientId, DisconnectReason},
         protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
     },
@@ -93,9 +95,14 @@ use smithay::{
         },
         shell::xdg::{
             PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+            XdgToplevelSurfaceData,
+            decoration::{XdgDecorationHandler, XdgDecorationState},
         },
         shm::{ShmHandler, ShmState},
         viewporter::ViewporterState,
+        xdg_activation::{
+            XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+        },
     },
 };
 
@@ -133,6 +140,7 @@ pub struct Astera {
     pending_dmabufs: Vec<(Dmabuf, ImportNotifier)>,
     dmabuf_enabled: bool,
     serial: u32,
+    activation_tracker: ActivationTracker,
 }
 
 impl Deref for Astera {
@@ -157,6 +165,8 @@ impl Astera {
     fn new_with_clock(display: &DisplayHandle, config: Config, clock: Arc<dyn Clock>) -> Self {
         let compositor_state = CompositorState::new::<Self>(display);
         let xdg_shell_state = XdgShellState::new::<Self>(display);
+        let xdg_decoration_state = XdgDecorationState::new::<Self>(display);
+        let xdg_activation_state = XdgActivationState::new::<Self>(display);
         let layer_shell_state = WlrLayerShellState::new::<Self>(display);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(display);
         let viewporter_state = ViewporterState::new::<Self>(display);
@@ -215,6 +225,8 @@ impl Astera {
                 display: display.clone(),
                 compositor_state,
                 xdg_shell_state,
+                _xdg_decoration_state: xdg_decoration_state,
+                xdg_activation_state,
                 layer_shell_state,
                 _fractional_scale_state: fractional_scale_state,
                 _viewporter_state: viewporter_state,
@@ -264,6 +276,7 @@ impl Astera {
             pending_dmabufs: Vec::new(),
             dmabuf_enabled: false,
             serial: 1,
+            activation_tracker: ActivationTracker::default(),
         }
     }
 
@@ -370,7 +383,11 @@ impl Astera {
                 let key_code = event.key_code();
                 let keyboard = self.keyboard.clone();
                 let serial = self.next_serial();
-                keyboard.input::<(), _>(
+                let recipient = keyboard
+                    .current_focus()
+                    .and_then(|surface| surface.client())
+                    .map(|client| client.id());
+                let intercepted = keyboard.input::<(), _>(
                     self,
                     key_code,
                     event.state(),
@@ -399,6 +416,13 @@ impl Astera {
                         }
                     },
                 );
+                if pressed
+                    && intercepted.is_none()
+                    && let Some(recipient) = recipient
+                {
+                    self.activation_tracker
+                        .remember(serial, recipient, self.clock.now());
+                }
             }
             InputEvent::PointerMotionAbsolute { event } => {
                 let size = self.desktop.outputs[&self.active_output]
@@ -581,8 +605,18 @@ impl Astera {
         // pointer. Refresh pointer focus before delivering the button to avoid targeting the
         // surface that occupied this coordinate before the transition.
         let focus = self.surface_under(self.pointer_location);
+        let recipient = focus
+            .as_ref()
+            .and_then(|(surface, _, _)| surface.client())
+            .map(|client| client.id());
         let pointer = self.pointer.clone();
         let serial = self.next_serial();
+        if state == BackendButtonState::Pressed
+            && let Some(recipient) = recipient
+        {
+            self.activation_tracker
+                .remember(serial, recipient, self.clock.now());
+        }
         pointer.motion(
             self,
             focus.map(|(surface, origin, _)| (surface, origin)),

@@ -27,6 +27,15 @@ use wayland_protocols::xdg::shell::client::{
     xdg_popup::XdgPopup, xdg_positioner::XdgPositioner, xdg_surface::XdgSurface,
     xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
 };
+use wayland_protocols::xdg::{
+    activation::v1::client::{
+        xdg_activation_token_v1::XdgActivationTokenV1, xdg_activation_v1::XdgActivationV1,
+    },
+    decoration::zv1::client::{
+        zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+        zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+    },
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::ZwlrLayerShellV1, zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
 };
@@ -59,6 +68,10 @@ delegate_noop!(TestClient: ignore WpViewport);
 delegate_noop!(TestClient: ignore WpFractionalScaleManagerV1);
 delegate_noop!(TestClient: ignore WpFractionalScaleV1);
 delegate_noop!(TestClient: ignore ZwlrLayerShellV1);
+delegate_noop!(TestClient: ignore XdgActivationV1);
+delegate_noop!(TestClient: ignore XdgActivationTokenV1);
+delegate_noop!(TestClient: ignore ZxdgDecorationManagerV1);
+delegate_noop!(TestClient: ignore ZxdgToplevelDecorationV1);
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
     fn event(
@@ -125,6 +138,73 @@ fn dispatch_until(
         thread::yield_now();
     }
     panic!("Wayland harness condition did not become true");
+}
+
+#[test]
+fn decoration_and_activation_globals_are_advertised() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+
+    let (requested_tx, requested_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, event_queue) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = event_queue.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let decorations = globals
+            .bind::<ZxdgDecorationManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let _activation = globals
+            .bind::<XdgActivationV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+        let decoration = decorations.get_toplevel_decoration(&toplevel, &queue, ());
+        decoration.set_mode(
+            wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::Mode::ServerSide,
+        );
+        surface.commit();
+        connection.flush().unwrap();
+        requested_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        requested_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        state.windows.first().is_some_and(|window| {
+            window.surface.with_pending_state(|pending| {
+                pending.decoration_mode
+                    == Some(
+                        smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode::ClientSide,
+                    )
+            })
+        })
+    });
+    // Exercise the denial path and one-shot lifetime without manufacturing a fake input serial.
+    // An invalid token must still notify the user via urgency, then disappear permanently.
+    state.windows[0].mapped = true;
+    let target = state.windows[0].surface.wl_surface().clone();
+    let (token, data) = {
+        let (token, data) = state.xdg_activation_state.create_external_token(None);
+        (token.clone(), data.clone())
+    };
+    state.request_activation(token.clone(), data, target);
+    assert!(state.windows[0].urgent);
+    assert!(state.xdg_activation_state.data_for_token(&token).is_none());
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
 }
 
 #[test]

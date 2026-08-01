@@ -4,6 +4,122 @@ impl BufferHandler for Astera {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
 }
 
+impl XdgDecorationHandler for Astera {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        self.configure_client_side_decoration(&toplevel);
+    }
+
+    fn request_mode(
+        &mut self,
+        toplevel: ToplevelSurface,
+        _mode: smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode,
+    ) {
+        self.configure_client_side_decoration(&toplevel);
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        self.configure_client_side_decoration(&toplevel);
+    }
+}
+
+impl XdgActivationHandler for Astera {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+
+    fn token_created(&mut self, _token: XdgActivationToken, _data: XdgActivationTokenData) -> bool {
+        const MAX_PENDING_TOKENS: usize = 1024;
+        const TOKEN_LIFETIME: std::time::Duration = std::time::Duration::from_secs(10);
+
+        // A client may commit tokens and never activate them. Prune before admitting new entries
+        // and cap the remainder so this protocol cannot become an unbounded memory sink.
+        let now = self.clock.now();
+        self.xdg_activation_state.retain_tokens(|_, data| {
+            now.saturating_duration_since(data.timestamp) <= TOKEN_LIFETIME
+        });
+        self.xdg_activation_state.tokens().count() < MAX_PENDING_TOKENS
+    }
+
+    fn request_activation(
+        &mut self,
+        token: XdgActivationToken,
+        token_data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        // Tokens are one-shot even when rejected, preventing replay after policy conditions change.
+        self.xdg_activation_state.remove_token(&token);
+        let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| window.mapped && window.surface.wl_surface() == &surface)
+        else {
+            return;
+        };
+
+        let seat = self.seat.clone();
+        let clock = self.clock.clone();
+        let authorized = self
+            .activation_tracker
+            .authorize(&token_data, &seat, clock.as_ref());
+        let active_fullscreen_surface = self
+            .desktop
+            .workspace_for_output(self.active_output)
+            .and_then(|workspace| workspace.fullscreen.as_ref())
+            .and_then(|full| self.windows.iter().find(|window| window.id == full.window))
+            .map(|window| window.surface.wl_surface());
+        let fullscreen_blocks = active_fullscreen_surface
+            .is_some_and(|fullscreen| !same_application(fullscreen, &surface));
+
+        if !authorized || fullscreen_blocks {
+            self.windows[index].urgent = true;
+            tracing::debug!(window = ?self.windows[index].id, authorized, fullscreen_blocks, "activation denied; window marked urgent");
+            self.mark_public_dirty();
+            return;
+        }
+
+        let window = self.windows[index].id;
+        if let Ok(workspace) = self.desktop.focus_window(window) {
+            if let Ok(location) = self.desktop.workspace_location(workspace)
+                && let Some(output) = location.output
+            {
+                self.active_output = output;
+            }
+            self.windows[index].urgent = false;
+            self.sync_keyboard_focus();
+            self.mark_public_dirty();
+            tracing::debug!(?window, ?workspace, "activation accepted");
+        }
+    }
+}
+
+fn same_application(first: &WlSurface, second: &WlSurface) -> bool {
+    fn app_id(surface: &WlSurface) -> Option<String> {
+        with_states(surface, |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|data| data.lock().ok()?.app_id.clone())
+        })
+    }
+
+    match (app_id(first), app_id(second)) {
+        (Some(first), Some(second)) => first == second,
+        // app_id is client-provided and optional. Client identity is the conservative fallback:
+        // separate unidentified connections are treated as different applications.
+        _ => first.client().map(|client| client.id()) == second.client().map(|client| client.id()),
+    }
+}
+
+impl Astera {
+    fn configure_client_side_decoration(&self, toplevel: &ToplevelSurface) {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
+
+        // Astera currently has no SSD renderer, so never advertise a mode it cannot draw.
+        toplevel.with_pending_state(|state| state.decoration_mode = Some(Mode::ClientSide));
+        toplevel.send_pending_configure();
+    }
+}
+
 impl DmabufHandler for Astera {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
         &mut self.dmabuf_state
@@ -209,6 +325,7 @@ impl XdgShellHandler for Astera {
             id,
             surface,
             mapped: false,
+            urgent: false,
         });
         tracing::debug!(window = ?id, "toplevel role created");
     }
@@ -428,6 +545,8 @@ impl ServerDndGrabHandler for Astera {
 }
 
 delegate_xdg_shell!(Astera);
+delegate_xdg_decoration!(Astera);
+delegate_xdg_activation!(Astera);
 delegate_layer_shell!(Astera);
 delegate_fractional_scale!(Astera);
 delegate_viewporter!(Astera);

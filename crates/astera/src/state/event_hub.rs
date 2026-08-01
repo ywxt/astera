@@ -283,6 +283,7 @@ fn window_ordinary_changed(old: &WindowSnapshot, new: &WindowSnapshot) -> bool {
         || old.workspace != new.workspace
         || old.mode != new.mode
         || old.metadata != new.metadata
+        || old.urgent != new.urgent
 }
 
 #[cfg(test)]
@@ -385,6 +386,7 @@ mod tests {
             metadata: WindowMetadata::default(),
             placement,
             visible_geometry,
+            urgent: false,
         }
     }
 
@@ -419,6 +421,26 @@ mod tests {
                 world_geometry: Rect::new(5, 5, 20, 20),
             },
         };
+        let events = hub.publish(snapshot);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].event, Event::WindowChanged { .. }));
+    }
+
+    #[test]
+    fn urgency_change_emits_window_changed() {
+        let mut snapshot = DesktopSnapshot {
+            windows: vec![window(
+                WindowPlacement::Tiled {
+                    world_geometry: Rect::new(0, 0, 20, 20),
+                },
+                Some(Rect::new(0, 0, 20, 20)),
+            )],
+            ..DesktopSnapshot::default()
+        };
+        let mut hub = EventHub::default();
+        hub.publish(snapshot.clone());
+        snapshot.windows[0].urgent = true;
+
         let events = hub.publish(snapshot);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0].event, Event::WindowChanged { .. }));

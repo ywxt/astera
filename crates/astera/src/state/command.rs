@@ -203,8 +203,11 @@ impl Astera {
                 .map(|mapped| mapped.surface.wl_surface().clone())
         });
         let target = layer_target.or(window_target);
-        for mapped in &self.windows {
+        for mapped in &mut self.windows {
             let activated = Some(mapped.surface.wl_surface()) == target.as_ref();
+            if activated {
+                mapped.urgent = false;
+            }
             mapped.surface.with_pending_state(|state| {
                 if activated {
                     state.states.set(xdg_toplevel::State::Activated);

@@ -16,10 +16,11 @@ use smithay::{
         selection::data_device::DataDeviceState,
         shell::{
             wlr_layer::{Layer, WlrLayerShellState},
-            xdg::{ToplevelSurface, XdgShellState},
+            xdg::{ToplevelSurface, XdgShellState, decoration::XdgDecorationState},
         },
         shm::ShmState,
         viewporter::ViewporterState,
+        xdg_activation::XdgActivationState,
     },
 };
 
@@ -32,6 +33,8 @@ pub struct ProtocolState {
     pub(super) display: DisplayHandle,
     pub(super) compositor_state: CompositorState,
     pub(super) xdg_shell_state: XdgShellState,
+    pub(super) _xdg_decoration_state: XdgDecorationState,
+    pub(super) xdg_activation_state: XdgActivationState,
     pub(super) layer_shell_state: WlrLayerShellState,
     pub(super) _fractional_scale_state: FractionalScaleManagerState,
     pub(super) _viewporter_state: ViewporterState,
@@ -52,6 +55,8 @@ pub(super) struct MappedWindow {
     pub(super) surface: ToplevelSurface,
     /// Role existence and mapping are distinct: only a committed non-null buffer is mapped.
     pub(super) mapped: bool,
+    /// Set when an activation was denied; cleared once the window legitimately receives focus.
+    pub(super) urgent: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
