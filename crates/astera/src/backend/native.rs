@@ -25,7 +25,7 @@ use smithay::{
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             Color32F, ImportDma,
-            element::{Kind, surface::WaylandSurfaceRenderElement},
+            element::{Kind, RenderElementStates, surface::WaylandSurfaceRenderElement},
             gles::GlesRenderer,
             multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
             sync::SyncPoint,
@@ -97,6 +97,7 @@ enum NativeEvent {
         crtc: crtc::Handle,
         frame_id: u64,
         callbacks: Vec<FrameCallback>,
+        scanout: PreparedScanout,
     },
     WaylandClient(std::os::unix::net::UnixStream),
     WaylandReady,
@@ -167,6 +168,16 @@ struct PendingGpuFence {
     deadline: Instant,
     delay: Duration,
     expires_at: Instant,
+    scanout: PreparedScanout,
+}
+
+struct PreparedScanout {
+    roots: Vec<(
+        smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        Point<i32, Physical>,
+        f64,
+    )>,
+    states: RenderElementStates,
 }
 
 struct PendingExportedFence {
@@ -301,7 +312,8 @@ impl NativeLoop {
                 crtc,
                 frame_id,
                 callbacks,
-            } => self.queue_prepared_frame(node, crtc, frame_id, callbacks),
+                scanout,
+            } => self.queue_prepared_frame(node, crtc, frame_id, callbacks, scanout),
             NativeEvent::WaylandClient(stream) => {
                 self.display
                     .handle()
@@ -700,7 +712,7 @@ impl NativeLoop {
                 {
                     if fence.sync.is_reached() {
                         let fence = surface.waiting_fence.take().unwrap();
-                        ready.push((*node, *crtc, fence.frame_id, fence.callbacks));
+                        ready.push((*node, *crtc, fence.frame_id, fence.callbacks, fence.scanout));
                     } else if fence.expires_at <= now {
                         let fence = surface.waiting_fence.take().unwrap();
                         surface.drm.reset_buffers();
@@ -733,8 +745,8 @@ impl NativeLoop {
             tracing::warn!(?output, frame_id, "GPU fence timed out; retrying frame");
             self.scheduler.retry_at(output, frame_id, now + retrace);
         }
-        for (node, crtc, frame_id, callbacks) in ready {
-            self.queue_prepared_frame(node, crtc, frame_id, callbacks);
+        for (node, crtc, frame_id, callbacks, scanout) in ready {
+            self.queue_prepared_frame(node, crtc, frame_id, callbacks, scanout);
         }
     }
 
@@ -762,6 +774,7 @@ impl NativeLoop {
         crtc: crtc::Handle,
         frame_id: u64,
         callbacks: Vec<FrameCallback>,
+        scanout: PreparedScanout,
     ) {
         let Some(surface) = self
             .devices
@@ -788,6 +801,8 @@ impl NativeLoop {
                 .retry_at(output, frame_id, Instant::now() + surface.retrace);
             return;
         }
+        self.state
+            .update_primary_scanout_output(output, &scanout.roots, &scanout.states);
         surface.pending = Some(PendingNativeFrame {
             frame_id,
             callbacks,
@@ -859,6 +874,8 @@ impl NativeLoop {
         ) {
             Ok(frame) if frame.is_empty => {
                 if self.scheduler.submitted(output, request.frame_id) {
+                    self.state
+                        .update_primary_scanout_output(output, &roots, &frame.states);
                     surface.pending = Some(PendingNativeFrame {
                         frame_id: request.frame_id,
                         callbacks,
@@ -875,8 +892,13 @@ impl NativeLoop {
                         PrimaryPlaneElement::Element(_) => None,
                     })
                     .flatten();
+                let scanout = PreparedScanout {
+                    roots,
+                    states: frame.states,
+                };
                 if let Some(fence_fd) = sync.as_ref().and_then(|sync| sync.export()) {
                     let mut callbacks = Some(callbacks);
+                    let mut scanout = Some(scanout);
                     let registration = self.handle.insert_source(
                         OneShotReadableFdSource::new(fence_fd),
                         move |(), _, runtime| {
@@ -885,6 +907,9 @@ impl NativeLoop {
                                 crtc,
                                 frame_id: request.frame_id,
                                 callbacks: callbacks
+                                    .take()
+                                    .expect("one-shot GPU fence fired more than once"),
+                                scanout: scanout
                                     .take()
                                     .expect("one-shot GPU fence fired more than once"),
                             });
@@ -920,6 +945,7 @@ impl NativeLoop {
                             deadline: Instant::now() + FENCE_RECHECK_INITIAL,
                             delay: FENCE_RECHECK_INITIAL,
                             expires_at: Instant::now() + FENCE_TIMEOUT,
+                            scanout,
                         });
                     } else if !self.scheduler.submitted(output, request.frame_id) {
                         tracing::debug!(
@@ -935,6 +961,11 @@ impl NativeLoop {
                             Instant::now() + surface.retrace,
                         );
                     } else {
+                        self.state.update_primary_scanout_output(
+                            output,
+                            &scanout.roots,
+                            &scanout.states,
+                        );
                         surface.pending = Some(PendingNativeFrame {
                             frame_id: request.frame_id,
                             callbacks,

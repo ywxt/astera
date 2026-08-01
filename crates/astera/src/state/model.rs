@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use astera_core::{OutputId, Point, WindowId, WindowMode};
 use smithay::{
@@ -12,6 +12,7 @@ use smithay::{
         compositor::CompositorState,
         dmabuf::DmabufState,
         fractional_scale::FractionalScaleManagerState,
+        idle_inhibit::IdleInhibitManagerState,
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::{
@@ -38,6 +39,7 @@ pub struct ProtocolState {
     pub(super) layer_shell_state: WlrLayerShellState,
     pub(super) _fractional_scale_state: FractionalScaleManagerState,
     pub(super) _viewporter_state: ViewporterState,
+    pub(super) _idle_inhibit_state: IdleInhibitManagerState,
     pub(super) _output_manager_state: OutputManagerState,
     pub(super) shm_state: ShmState,
     pub(super) seat_state: SeatState<Astera>,
@@ -47,6 +49,7 @@ pub struct ProtocolState {
     pub(super) seat: Seat<Astera>,
     pub(super) keyboard: KeyboardHandle<Astera>,
     pub(super) pointer: PointerHandle<Astera>,
+    pub(super) idle_inhibitors: HashMap<WlSurface, usize>,
 }
 
 #[derive(Clone)]
@@ -87,6 +90,8 @@ pub(super) struct OutputRuntime {
     pub(super) global: GlobalId,
     /// Surfaces that received wl_surface.enter for this output during the last refresh.
     pub(super) entered_surfaces: HashSet<WlSurface>,
+    /// Surfaces confirmed visible by the most recent accepted render report.
+    pub(super) presented_surfaces: HashSet<WlSurface>,
     /// Logical position in the compositor's output topology.
     pub(super) location: Point,
 }

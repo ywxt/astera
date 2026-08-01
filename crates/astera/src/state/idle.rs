@@ -7,12 +7,35 @@ use smithay::reexports::{
         Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, backend::ClientId,
     },
 };
+use smithay::utils::IsAlive;
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
 };
 
 use super::Astera;
+
+impl Astera {
+    pub(super) fn refresh_idle_inhibition(&mut self) {
+        use smithay::{
+            desktop::utils::surface_primary_scanout_output, wayland::compositor::with_states,
+        };
+
+        self.idle_inhibitors.retain(|surface, _| surface.alive());
+        let inhibited = self.idle_inhibitors.keys().any(|surface| {
+            let belongs_to_current_scene = self.output_runtime.values().any(|runtime| {
+                runtime.entered_surfaces.contains(surface)
+                    && runtime.presented_surfaces.contains(surface)
+            });
+            belongs_to_current_scene
+                && with_states(surface, |states| {
+                    surface_primary_scanout_output(surface, states).is_some()
+                })
+        });
+        let events = self.idle_runtime.set_inhibited(inhibited, self.clock.now());
+        self.send_idle_events(events);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum IdleEvent {
@@ -166,10 +189,6 @@ impl IdleRuntime {
         events
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "wired by the idle-inhibit sub-batch")
-    )]
     pub(super) fn set_inhibited(&mut self, inhibited: bool, now: Instant) -> Vec<IdleEvent> {
         if self.inhibited == inhibited {
             return Vec::new();

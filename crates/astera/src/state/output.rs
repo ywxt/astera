@@ -1,6 +1,61 @@
 use super::*;
 
 impl Astera {
+    pub fn update_primary_scanout_output(
+        &mut self,
+        output: OutputId,
+        roots: &[(WlSurface, SmithayPoint<i32, Physical>, f64)],
+        states: &smithay::backend::renderer::element::RenderElementStates,
+    ) {
+        use smithay::{
+            backend::renderer::element::default_primary_scanout_output_compare,
+            desktop::utils::{
+                surface_primary_scanout_output, update_surface_primary_scanout_output,
+            },
+        };
+
+        let Some(wayland_output) = self
+            .output_runtime
+            .get(&output)
+            .map(|runtime| runtime.wayland.clone())
+        else {
+            return;
+        };
+        let mut presented = HashSet::new();
+        let mut update_tree = |root: &WlSurface| {
+            with_surface_tree_downward(
+                root,
+                (),
+                |_, _, _| TraversalAction::DoChildren(()),
+                |surface, surface_states, _| {
+                    update_surface_primary_scanout_output(
+                        surface,
+                        &wayland_output,
+                        surface_states,
+                        states,
+                        default_primary_scanout_output_compare,
+                    );
+                    if surface_primary_scanout_output(surface, surface_states).as_ref()
+                        == Some(&wayland_output)
+                    {
+                        presented.insert(surface.clone());
+                    }
+                },
+                |_, _, _| true,
+            );
+        };
+        for (root, _, _) in roots {
+            update_tree(root);
+            for (popup, _) in PopupManager::popups_for_surface(root) {
+                update_tree(popup.wl_surface());
+            }
+        }
+        if let Some(runtime) = self.output_runtime.get_mut(&output) {
+            runtime.presented_surfaces = presented;
+        }
+        self.refresh_idle_inhibition();
+    }
+
     pub fn enable_dmabuf(&mut self, formats: impl IntoIterator<Item = Format>) {
         if self.dmabuf_enabled {
             return;
@@ -285,7 +340,28 @@ impl Astera {
                     });
                 });
             }
+            let departed = runtime
+                .presented_surfaces
+                .difference(&visible)
+                .cloned()
+                .collect::<Vec<_>>();
+            let empty = smithay::backend::renderer::element::RenderElementStates::default();
+            for surface in departed {
+                with_states(&surface, |states| {
+                    smithay::desktop::utils::update_surface_primary_scanout_output(
+                        &surface,
+                        &runtime.wayland,
+                        states,
+                        &empty,
+                        smithay::backend::renderer::element::default_primary_scanout_output_compare,
+                    );
+                });
+            }
             runtime.entered_surfaces = visible;
+            runtime
+                .presented_surfaces
+                .retain(|surface| runtime.entered_surfaces.contains(surface));
         }
+        self.refresh_idle_inhibition();
     }
 }

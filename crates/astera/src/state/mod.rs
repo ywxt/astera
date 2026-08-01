@@ -56,8 +56,8 @@ use smithay::{
         },
     },
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
-    delegate_layer_shell, delegate_output, delegate_seat, delegate_shm, delegate_viewporter,
-    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_idle_inhibit, delegate_layer_shell, delegate_output, delegate_seat, delegate_shm,
+    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -84,6 +84,7 @@ use smithay::{
         fractional_scale::{
             FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
         },
+        idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
         output::{OutputHandler, OutputManagerState},
         selection::{
             SelectionHandler,
@@ -176,6 +177,7 @@ impl Astera {
         let layer_shell_state = WlrLayerShellState::new::<Self>(display);
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(display);
         let viewporter_state = ViewporterState::new::<Self>(display);
+        let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(display);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(display);
         let wayland_output = SmithayOutput::new(
             "ASTERA-NESTED-1".into(),
@@ -236,6 +238,7 @@ impl Astera {
                 layer_shell_state,
                 _fractional_scale_state: fractional_scale_state,
                 _viewporter_state: viewporter_state,
+                _idle_inhibit_state: idle_inhibit_state,
                 _output_manager_state: output_manager_state,
                 shm_state,
                 seat_state,
@@ -245,6 +248,7 @@ impl Astera {
                 seat,
                 keyboard,
                 pointer,
+                idle_inhibitors: std::collections::HashMap::new(),
             },
             output_runtime: BTreeMap::from([(
                 active_output,
@@ -252,6 +256,7 @@ impl Astera {
                     wayland: wayland_output,
                     global: output_global,
                     entered_surfaces: HashSet::new(),
+                    presented_surfaces: HashSet::new(),
                     location: Point::ORIGIN,
                 },
             )]),
@@ -331,6 +336,7 @@ impl Astera {
                 wayland,
                 global,
                 entered_surfaces: HashSet::new(),
+                presented_surfaces: HashSet::new(),
                 location: Point::ORIGIN,
             },
         );
@@ -364,6 +370,18 @@ impl Astera {
             .output_runtime
             .remove(&output)
             .expect("desktop output has a Wayland runtime");
+        let empty = smithay::backend::renderer::element::RenderElementStates::default();
+        for surface in &runtime.presented_surfaces {
+            with_states(surface, |states| {
+                smithay::desktop::utils::update_surface_primary_scanout_output(
+                    surface,
+                    &runtime.wayland,
+                    states,
+                    &empty,
+                    smithay::backend::renderer::element::default_primary_scanout_output_compare,
+                );
+            });
+        }
         for surface in runtime.entered_surfaces {
             runtime.wayland.leave(&surface);
         }

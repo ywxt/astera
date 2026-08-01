@@ -251,7 +251,7 @@ impl WinitLoop {
         };
         let roots = self.state.render_roots();
         let mut frame_callbacks = Vec::new();
-        let damage = {
+        let (damage, render_states) = {
             tracing::trace!("binding nested framebuffer");
             let (renderer, mut framebuffer) = self.backend.bind()?;
             tracing::trace!("nested framebuffer bound");
@@ -295,22 +295,22 @@ impl WinitLoop {
                 elements = elements.len(),
                 "nested render elements collected"
             );
-            self.damage_tracker
-                .render_output(
-                    renderer,
-                    &mut framebuffer,
-                    buffer_age,
-                    &elements,
-                    Color32F::new(0.025, 0.035, 0.06, 1.0),
-                )?
-                .damage
-                .cloned()
+            let result = self.damage_tracker.render_output(
+                renderer,
+                &mut framebuffer,
+                buffer_age,
+                &elements,
+                Color32F::new(0.025, 0.035, 0.06, 1.0),
+            )?;
+            (result.damage.cloned(), result.states)
         };
 
         // A frame callback without visual damage still needs a real host presentation
         // opportunity. Swap even when the damage tracker returns None.
         tracing::trace!(has_damage = damage.is_some(), "submitting nested frame");
         self.backend.submit(damage.as_deref())?;
+        self.state
+            .update_primary_scanout_output(astera_core::OutputId(0), &roots, &render_states);
         tracing::trace!("nested frame submitted");
         self.has_presented = true;
         let frame_time = self.started.elapsed().as_millis() as u32;

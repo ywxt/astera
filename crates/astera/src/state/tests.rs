@@ -24,6 +24,10 @@ use wayland_protocols::wp::{
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
         wp_fractional_scale_v1::WpFractionalScaleV1,
     },
+    idle_inhibit::zv1::client::{
+        zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+        zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+    },
     viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
 };
 use wayland_protocols::xdg::shell::client::{
@@ -78,6 +82,8 @@ delegate_noop!(TestClient: ignore ZxdgDecorationManagerV1);
 delegate_noop!(TestClient: ignore ZxdgToplevelDecorationV1);
 delegate_noop!(TestClient: ignore ExtIdleNotifierV1);
 delegate_noop!(TestClient: ignore ExtIdleNotificationV1);
+delegate_noop!(TestClient: ignore ZwpIdleInhibitManagerV1);
+delegate_noop!(TestClient: ignore ZwpIdleInhibitorV1);
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
     fn event(
@@ -175,9 +181,14 @@ fn decoration_and_activation_globals_are_advertised() {
         let idle = globals
             .bind::<ExtIdleNotifierV1, _, _>(&queue, 1..=2, ())
             .unwrap();
+        let idle_inhibit = globals
+            .bind::<ZwpIdleInhibitManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
         let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
         let _idle_notification = idle.get_idle_notification(0, &seat, &queue, ());
         let surface = compositor.create_surface(&queue, ());
+        let _first_inhibitor = idle_inhibit.create_inhibitor(&surface, &queue, ());
+        let _second_inhibitor = idle_inhibit.create_inhibitor(&surface, &queue, ());
         let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
         let toplevel = xdg_surface.get_toplevel(&queue, ());
         let decoration = decorations.get_toplevel_decoration(&toplevel, &queue, ());
@@ -206,6 +217,10 @@ fn decoration_and_activation_globals_are_advertised() {
     dispatch_until(&mut display, &mut state, |state| {
         !state.idle_notifications.is_empty()
     });
+    dispatch_until(&mut display, &mut state, |state| {
+        state.idle_inhibitors.values().copied().sum::<usize>() == 2
+    });
+    assert_eq!(state.idle_inhibitors.values().copied().sum::<usize>(), 2);
     assert!(
         state
             .next_timer_deadline()

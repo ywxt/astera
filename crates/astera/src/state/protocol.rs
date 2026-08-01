@@ -4,6 +4,24 @@ impl BufferHandler for Astera {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
 }
 
+impl IdleInhibitHandler for Astera {
+    fn inhibit(&mut self, surface: WlSurface) {
+        let count = self.idle_inhibitors.entry(surface).or_default();
+        *count = count.saturating_add(1);
+        self.refresh_idle_inhibition();
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        if let Some(count) = self.idle_inhibitors.get_mut(&surface) {
+            *count -= 1;
+            if *count == 0 {
+                self.idle_inhibitors.remove(&surface);
+            }
+        }
+        self.refresh_idle_inhibition();
+    }
+}
+
 impl XdgDecorationHandler for Astera {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         self.configure_client_side_decoration(&toplevel);
@@ -547,6 +565,7 @@ impl ServerDndGrabHandler for Astera {
 delegate_xdg_shell!(Astera);
 delegate_xdg_decoration!(Astera);
 delegate_xdg_activation!(Astera);
+delegate_idle_inhibit!(Astera);
 delegate_layer_shell!(Astera);
 delegate_fractional_scale!(Astera);
 delegate_viewporter!(Astera);
