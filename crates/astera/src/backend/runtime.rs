@@ -283,6 +283,30 @@ impl RepaintScheduler {
         true
     }
 
+    /// Finish a failed render attempt and retry it at a backend-selected deadline.
+    ///
+    /// Native DRM uses this for empty frames (roughly one retrace later) and for
+    /// transient KMS errors, avoiding both callback starvation and a busy retry loop.
+    pub fn retry_at(&mut self, output: OutputId, frame_id: u64, deadline: Instant) -> bool {
+        let Some(state) = self.outputs.get_mut(&output) else {
+            return false;
+        };
+        if !matches!(
+            state.phase,
+            OutputPhase::Rendering | OutputPhase::AwaitingPresentation
+        ) || state.active_frame_id != Some(frame_id)
+        {
+            return false;
+        }
+        state
+            .dirty_after_present
+            .insert(RepaintReasons::FULL_REPAINT);
+        state.dirty_immediate = false;
+        state.deadline = Some(deadline);
+        self.schedule_follow_up(output);
+        true
+    }
+
     pub fn pause(&mut self) {
         self.paused = true;
         self.ready.clear();
@@ -611,6 +635,22 @@ mod tests {
         assert!(scheduler.failed(FIRST, frame.frame_id));
         let retry = scheduler.begin_ready(now, 1)[0];
         assert!(retry.reasons.contains(RepaintReasons::FULL_REPAINT));
+    }
+
+    #[test]
+    fn backend_can_defer_a_failed_frame_without_busy_retrying() {
+        let now = Instant::now();
+        let retry = now + std::time::Duration::from_millis(16);
+        let mut scheduler = RepaintScheduler::default();
+        scheduler.add_output(FIRST);
+        scheduler.request(FIRST, RepaintReasons::FRAME_CALLBACK);
+        let frame = scheduler.begin_ready(now, 1)[0];
+
+        assert!(scheduler.retry_at(FIRST, frame.frame_id, retry));
+        assert!(!scheduler.has_ready_at(now));
+        assert_eq!(scheduler.earliest_deadline(), Some(retry));
+        let request = scheduler.begin_ready(retry, 1)[0];
+        assert!(request.reasons.contains(RepaintReasons::FULL_REPAINT));
     }
 
     #[test]

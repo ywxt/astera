@@ -25,12 +25,10 @@ use smithay::{
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             Color32F, ImportDma,
-            element::{
-                Kind,
-                surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
-            },
+            element::{Kind, surface::WaylandSurfaceRenderElement},
             gles::GlesRenderer,
             multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
+            sync::SyncPoint,
         },
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent},
@@ -50,13 +48,19 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use crate::{
     backend::{
         native_policy::{ConnectorSnapshot, ModeCandidate, SnapshotSource, scan_outputs},
-        sources::{ReadableFdSource, WaylandSocketSource},
+        render::surface_tree_snapshot,
+        runtime::{OutputPhase, RenderRequest, RepaintReasons, RepaintScheduler},
+        sources::{OneShotReadableFdSource, ReadableFdSource, WaylandSocketSource},
     },
     ipc_server::IpcServer,
-    state::{Astera, ClientState, send_frames_surface_tree},
+    state::{Astera, ClientState, FrameCallback, complete_frame_callbacks},
 };
 
 const MAX_NATIVE_EVENTS_PER_BATCH: usize = 256;
+const MAX_NATIVE_FRAMES_PER_BATCH: usize = 4;
+const MAX_QUEUED_NATIVE_EVENTS: usize = 4096;
+const DEFAULT_RETRACE: Duration = Duration::from_millis(16);
+const FENCE_RECHECK_INITIAL: Duration = Duration::from_millis(1);
 
 struct NativeLoop {
     handle: LoopHandle<'static, NativeLoop>,
@@ -71,13 +75,26 @@ struct NativeLoop {
     next_output_id: u32,
     gpus: GpuManager<GraphicsBackend>,
     started: Instant,
+    scheduler: RepaintScheduler,
+    wayland_ready_queued: bool,
+    ipc_ready_queued: bool,
+    config_changed_queued: bool,
 }
 
 enum NativeEvent {
     Input(BackendInputEvent<LibinputInputBackend>),
     Session(SessionEvent),
     Udev(UdevEvent),
-    Drm { node: DrmNode, event: DrmEvent },
+    Drm {
+        node: DrmNode,
+        event: DrmEvent,
+    },
+    FenceReady {
+        node: DrmNode,
+        crtc: crtc::Handle,
+        frame_id: u64,
+        callbacks: Vec<FrameCallback>,
+    },
     WaylandClient(std::os::unix::net::UnixStream),
     WaylandReady,
     IpcReady,
@@ -87,11 +104,11 @@ enum NativeEvent {
 type GraphicsBackend = GbmGlesBackend<GlesRenderer, DrmDeviceFd>;
 type NativeRenderer<'a> = MultiRenderer<'a, 'a, GraphicsBackend, GraphicsBackend>;
 type NativeOutput =
-    DrmOutput<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
+    DrmOutput<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, u64, DrmDeviceFd>;
 type NativeOutputManager = DrmOutputManager<
     GbmAllocator<DrmDeviceFd>,
     GbmFramebufferExporter<DrmDeviceFd>,
-    (),
+    u64,
     DrmDeviceFd,
 >;
 
@@ -127,81 +144,183 @@ struct NativeDevice {
 struct NativeSurface {
     output: OutputId,
     drm: NativeOutput,
-    pending: bool,
+    pending: Option<PendingNativeFrame>,
     applied_size: Size,
     modes: Vec<smithay::reexports::drm::control::Mode>,
+    retrace: Duration,
+    waiting_fence: Option<PendingGpuFence>,
+}
+
+struct PendingNativeFrame {
+    frame_id: u64,
+    callbacks: Vec<FrameCallback>,
+    queued: bool,
+    deadline: Option<Instant>,
+}
+
+struct PendingGpuFence {
+    frame_id: u64,
+    callbacks: Vec<FrameCallback>,
+    sync: SyncPoint,
+    deadline: Instant,
+    delay: Duration,
 }
 
 impl NativeLoop {
+    fn enqueue(&mut self, event: NativeEvent) {
+        match event {
+            NativeEvent::WaylandReady if self.wayland_ready_queued => return,
+            NativeEvent::IpcReady if self.ipc_ready_queued => return,
+            NativeEvent::ConfigChanged if self.config_changed_queued => return,
+            _ => {}
+        }
+        if self.events.len() >= MAX_QUEUED_NATIVE_EVENTS {
+            if is_lossy_native_motion(&event) || matches!(event, NativeEvent::WaylandClient(_)) {
+                tracing::warn!("native source queue is full; dropping a lossy event");
+                return;
+            } else {
+                // calloop's upstream libinput/udev sources cannot be paused from
+                // inside their callback. Preserve lifecycle ordering and the hard
+                // memory bound by reducing one normal-sized batch before enqueue.
+                let mut scene_changed = false;
+                for _ in 0..MAX_NATIVE_EVENTS_PER_BATCH {
+                    let Some(queued) = self.events.pop_front() else {
+                        break;
+                    };
+                    match self.process_event(queued) {
+                        Ok(changed) => scene_changed |= changed,
+                        Err(error) => {
+                            tracing::warn!(%error, "native overflow reduction failed")
+                        }
+                    }
+                }
+                if scene_changed {
+                    self.request_all(RepaintReasons::DAMAGE);
+                }
+            }
+        }
+        match event {
+            NativeEvent::WaylandReady => self.wayland_ready_queued = true,
+            NativeEvent::IpcReady => self.ipc_ready_queued = true,
+            NativeEvent::ConfigChanged => self.config_changed_queued = true,
+            _ => {}
+        }
+        self.events.push_back(event);
+    }
+
     fn process_events(&mut self) -> Result<()> {
+        let mut scene_changed = false;
         for _ in 0..MAX_NATIVE_EVENTS_PER_BATCH {
             let Some(event) = self.events.pop_front() else {
                 break;
             };
-            match event {
-                NativeEvent::Input(event) => self.state.process_input(event),
-                NativeEvent::Session(SessionEvent::PauseSession) => {
-                    self.libinput.suspend();
-                    for device in self.devices.values_mut() {
-                        device.output_manager.pause();
-                    }
-                    tracing::info!("native session paused");
-                }
-                NativeEvent::Session(SessionEvent::ActivateSession) => {
-                    if let Err(error) = self.libinput.resume() {
-                        tracing::error!(?error, "could not resume libinput");
-                    }
-                    for device in self.devices.values_mut() {
-                        if let Err(error) = device.output_manager.activate(false) {
-                            tracing::error!(?error, "could not reactivate DRM device");
-                        }
-                    }
-                    tracing::info!("native session activated");
-                }
-                NativeEvent::Udev(UdevEvent::Added { device_id, path }) => {
-                    match DrmNode::from_dev_id(device_id) {
-                        Ok(node) => {
-                            if let Err(error) = self.device_added(node, &path) {
-                                tracing::error!(?device_id, ?path, %error, "could not add DRM device");
-                            }
-                        }
-                        Err(error) => {
-                            tracing::error!(?device_id, %error, "invalid DRM device node")
-                        }
-                    }
-                }
-                NativeEvent::Udev(UdevEvent::Changed { device_id }) => {
-                    if let Ok(node) = DrmNode::from_dev_id(device_id) {
-                        self.device_changed(node);
-                    }
-                }
-                NativeEvent::Udev(UdevEvent::Removed { device_id }) => {
-                    if let Ok(node) = DrmNode::from_dev_id(device_id) {
-                        self.device_removed(node);
-                    }
-                }
-                NativeEvent::Drm {
-                    node,
-                    event: DrmEvent::VBlank(crtc),
-                } => self.frame_submitted(node, crtc),
-                NativeEvent::Drm {
-                    node,
-                    event: DrmEvent::Error(error),
-                } => tracing::error!(?node, ?error, "DRM event error"),
-                NativeEvent::WaylandClient(stream) => {
-                    self.display
-                        .handle()
-                        .insert_client(stream, Arc::new(ClientState::default()))?;
-                    self.display.dispatch_clients(&mut self.state)?;
-                }
-                NativeEvent::WaylandReady => {
-                    self.display.dispatch_clients(&mut self.state)?;
-                }
-                NativeEvent::IpcReady => self.ipc.dispatch(&mut self.state),
-                NativeEvent::ConfigChanged => self.state.notify_config_changed(),
-            }
+            scene_changed |= self.process_event(event)?;
+        }
+        if scene_changed {
+            self.request_all(RepaintReasons::DAMAGE);
         }
         Ok(())
+    }
+
+    fn process_event(&mut self, event: NativeEvent) -> Result<bool> {
+        let mut scene_changed = false;
+        match event {
+            NativeEvent::Input(event) => {
+                self.state.process_input(event);
+                scene_changed = true;
+            }
+            NativeEvent::Session(SessionEvent::PauseSession) => {
+                self.libinput.suspend();
+                self.scheduler.pause();
+                for device in self.devices.values_mut() {
+                    device.output_manager.pause();
+                    for surface in device.outputs.values_mut() {
+                        surface.pending = None;
+                        surface.waiting_fence = None;
+                    }
+                }
+                tracing::info!("native session paused");
+            }
+            NativeEvent::Session(SessionEvent::ActivateSession) => {
+                if let Err(error) = self.libinput.resume() {
+                    tracing::error!(?error, "could not resume libinput");
+                }
+                for device in self.devices.values_mut() {
+                    if let Err(error) = device.output_manager.activate(false) {
+                        tracing::error!(?error, "could not reactivate DRM device");
+                    }
+                }
+                self.scheduler.resume();
+                tracing::info!("native session activated");
+            }
+            NativeEvent::Udev(UdevEvent::Added { device_id, path }) => {
+                match DrmNode::from_dev_id(device_id) {
+                    Ok(node) => {
+                        if let Err(error) = self.device_added(node, &path) {
+                            tracing::error!(?device_id, ?path, %error, "could not add DRM device");
+                        }
+                    }
+                    Err(error) => tracing::error!(?device_id, %error, "invalid DRM device node"),
+                }
+            }
+            NativeEvent::Udev(UdevEvent::Changed { device_id }) => {
+                if let Ok(node) = DrmNode::from_dev_id(device_id) {
+                    self.device_changed(node);
+                }
+            }
+            NativeEvent::Udev(UdevEvent::Removed { device_id }) => {
+                if let Ok(node) = DrmNode::from_dev_id(device_id) {
+                    self.device_removed(node);
+                }
+            }
+            NativeEvent::Drm {
+                node,
+                event: DrmEvent::VBlank(crtc),
+            } => self.frame_submitted(node, crtc),
+            NativeEvent::Drm {
+                node,
+                event: DrmEvent::Error(error),
+            } => tracing::error!(?node, ?error, "DRM event error"),
+            NativeEvent::FenceReady {
+                node,
+                crtc,
+                frame_id,
+                callbacks,
+            } => self.queue_prepared_frame(node, crtc, frame_id, callbacks),
+            NativeEvent::WaylandClient(stream) => {
+                self.display
+                    .handle()
+                    .insert_client(stream, Arc::new(ClientState::default()))?;
+                self.display.dispatch_clients(&mut self.state)?;
+                scene_changed = true;
+            }
+            NativeEvent::WaylandReady => {
+                self.wayland_ready_queued = false;
+                self.display.dispatch_clients(&mut self.state)?;
+                scene_changed = true;
+            }
+            NativeEvent::IpcReady => {
+                self.ipc_ready_queued = false;
+                self.ipc.dispatch(&mut self.state);
+                scene_changed = true;
+            }
+            NativeEvent::ConfigChanged => {
+                self.config_changed_queued = false;
+                self.state.notify_config_changed();
+            }
+        }
+        Ok(scene_changed)
+    }
+
+    fn request_all(&mut self, reason: RepaintReasons) {
+        let outputs = self
+            .devices
+            .values()
+            .flat_map(|device| device.outputs.values().map(|surface| surface.output))
+            .collect::<Vec<_>>();
+        for output in outputs {
+            self.scheduler.request(output, reason);
+        }
     }
 
     fn device_added(&mut self, node: DrmNode, path: &Path) -> Result<()> {
@@ -234,7 +353,7 @@ impl NativeLoop {
         let registration = self
             .handle
             .insert_source(notifier, move |event, _, runtime| {
-                runtime.events.push_back(NativeEvent::Drm { node, event });
+                runtime.enqueue(NativeEvent::Drm { node, event });
             })?;
         self.devices.insert(
             node,
@@ -357,14 +476,25 @@ impl NativeLoop {
                                         NativeSurface {
                                             output: id,
                                             drm: drm_output,
-                                            pending: false,
+                                            pending: None,
                                             applied_size: Size::new(
                                                 i64::from(width),
                                                 i64::from(height),
                                             ),
                                             modes: connector.modes().to_vec(),
+                                            retrace: if mode.vrefresh() > 0 {
+                                                Duration::from_secs_f64(
+                                                    1000.0 / f64::from(mode.vrefresh()),
+                                                )
+                                            } else {
+                                                DEFAULT_RETRACE
+                                            },
+                                            waiting_fence: None,
                                         },
                                     );
+                                    self.scheduler.add_output(id);
+                                    self.scheduler
+                                        .request(id, RepaintReasons::FULL_REPAINT);
                                     self.connectors.insert((node, connector.handle()), id);
                                     tracing::info!(?node, ?id, %name, "DRM connector connected");
                                 }
@@ -386,6 +516,7 @@ impl NativeLoop {
                     if let Err(error) = self.state.disconnect_output(id) {
                         tracing::error!(?node, ?id, %error, "could not unregister output");
                     }
+                    self.scheduler.remove_output(id);
                     if let Some(crtc) = crtc
                         && let Some(device) = self.devices.get_mut(&node)
                     {
@@ -407,6 +538,7 @@ impl NativeLoop {
             if let Err(error) = self.state.disconnect_output(output) {
                 tracing::error!(?node, ?output, %error, "could not remove DRM output");
             }
+            self.scheduler.remove_output(output);
         }
         if let Some(device) = self.devices.remove(&node) {
             self.handle.remove(device.registration);
@@ -422,26 +554,109 @@ impl NativeLoop {
         else {
             return;
         };
-        if let Err(error) = surface.drm.frame_submitted() {
-            tracing::warn!(?node, ?crtc, ?error, "could not retire submitted DRM frame");
+        let frame_id = match surface.drm.frame_submitted() {
+            Ok(Some(frame_id)) => frame_id,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(?node, ?crtc, ?error, "could not retire submitted DRM frame");
+                return;
+            }
+        };
+        let Some(frame) = surface
+            .pending
+            .take_if(|frame| frame.queued && frame.frame_id == frame_id)
+        else {
+            tracing::warn!(
+                ?node,
+                ?crtc,
+                frame_id,
+                "retired DRM frame has no matching snapshot"
+            );
+            return;
+        };
+        if self.scheduler.presented(surface.output, frame.frame_id) {
+            let frame_time = self.started.elapsed().as_millis() as u32;
+            complete_frame_callbacks(&frame.callbacks, frame_time);
         }
-        surface.pending = false;
+    }
+
+    fn retire_software_presentations(&mut self, now: Instant) {
+        let ready =
+            self.devices
+                .values_mut()
+                .flat_map(|device| device.outputs.values_mut())
+                .filter_map(|surface| {
+                    let due = surface.pending.as_ref().is_some_and(|frame| {
+                        !frame.queued && frame.deadline.is_some_and(|d| d <= now)
+                    });
+                    due.then(|| (surface.output, surface.pending.take().unwrap()))
+                })
+                .collect::<Vec<_>>();
+        for (output, frame) in ready {
+            if self.scheduler.presented(output, frame.frame_id) {
+                complete_frame_callbacks(
+                    &frame.callbacks,
+                    self.started.elapsed().as_millis() as u32,
+                );
+            }
+        }
+    }
+
+    fn next_software_presentation(&self) -> Option<Instant> {
+        self.devices
+            .values()
+            .flat_map(|device| device.outputs.values())
+            .filter_map(|surface| surface.pending.as_ref()?.deadline)
+            .min()
+    }
+
+    fn next_fence_check(&self) -> Option<Instant> {
+        self.devices
+            .values()
+            .flat_map(|device| device.outputs.values())
+            .filter_map(|surface| surface.waiting_fence.as_ref().map(|fence| fence.deadline))
+            .min()
+    }
+
+    fn poll_non_exportable_fences(&mut self, now: Instant) {
+        let mut ready = Vec::new();
+        for (node, device) in &mut self.devices {
+            for (crtc, surface) in &mut device.outputs {
+                let Some(fence) = surface.waiting_fence.as_mut() else {
+                    continue;
+                };
+                if fence.deadline > now {
+                    continue;
+                }
+                if fence.sync.is_reached() {
+                    let fence = surface.waiting_fence.take().unwrap();
+                    ready.push((*node, *crtc, fence.frame_id, fence.callbacks));
+                } else {
+                    fence.delay = (fence.delay * 2).min(surface.retrace);
+                    fence.deadline = now + fence.delay;
+                }
+            }
+        }
+        for (node, crtc, frame_id, callbacks) in ready {
+            self.queue_prepared_frame(node, crtc, frame_id, callbacks);
+        }
     }
 
     fn render_all(&mut self) {
-        let outputs = self
-            .devices
-            .iter()
-            .flat_map(|(node, device)| {
-                device
-                    .outputs
-                    .iter()
-                    .filter(|(_, surface)| !surface.pending)
-                    .map(|(crtc, surface)| (*node, *crtc, surface.output))
-            })
-            .collect::<Vec<_>>();
-        for (node, crtc, output) in outputs {
-            self.render_output(node, crtc, output);
+        let requests = self
+            .scheduler
+            .begin_ready(Instant::now(), MAX_NATIVE_FRAMES_PER_BATCH);
+        for request in requests {
+            let route = self.devices.iter().find_map(|(node, device)| {
+                device.outputs.iter().find_map(|(crtc, surface)| {
+                    (surface.output == request.output).then_some((*node, *crtc))
+                })
+            });
+            let Some((node, crtc)) = route else {
+                self.scheduler.remove_output(request.output);
+                continue;
+            };
+            self.render_output(node, crtc, request);
         }
     }
 
@@ -451,6 +666,12 @@ impl NativeLoop {
             .iter()
             .flat_map(|(node, device)| {
                 device.outputs.iter().filter_map(|(crtc, surface)| {
+                    if !matches!(
+                        self.scheduler.phase(surface.output),
+                        Some(OutputPhase::Idle | OutputPhase::Scheduled)
+                    ) {
+                        return None;
+                    }
                     let requested = self.state.desktop_output(surface.output)?.physical_size;
                     (requested != surface.applied_size).then_some((
                         *node,
@@ -496,7 +717,15 @@ impl NativeLoop {
                 .get_mut(&crtc)
                 .unwrap();
             match surface.drm.use_mode(mode, &mut renderer, &empty) {
-                Ok(()) => surface.applied_size = requested,
+                Ok(()) => {
+                    surface.applied_size = requested;
+                    surface.retrace = if mode.vrefresh() > 0 {
+                        Duration::from_secs_f64(1000.0 / f64::from(mode.vrefresh()))
+                    } else {
+                        DEFAULT_RETRACE
+                    };
+                    self.scheduler.request(output, RepaintReasons::FULL_REPAINT);
+                }
                 Err(error) => {
                     tracing::warn!(?output, ?error, "KMS mode switch failed; rolling back");
                     self.state.rollback_output_physical_size(output, previous);
@@ -505,16 +734,53 @@ impl NativeLoop {
         }
     }
 
-    fn render_output(&mut self, node: DrmNode, crtc: crtc::Handle, output: OutputId) {
+    fn queue_prepared_frame(
+        &mut self,
+        node: DrmNode,
+        crtc: crtc::Handle,
+        frame_id: u64,
+        callbacks: Vec<FrameCallback>,
+    ) {
+        let Some(surface) = self
+            .devices
+            .get_mut(&node)
+            .and_then(|device| device.outputs.get_mut(&crtc))
+        else {
+            return;
+        };
+        let output = surface.output;
+        if !self.scheduler.submitted(output, frame_id) {
+            tracing::debug!(?output, frame_id, "discarding stale prepared DRM frame");
+            return;
+        }
+        if let Err(error) = surface.drm.queue_frame(frame_id) {
+            tracing::warn!(?node, ?crtc, ?error, "could not queue prepared DRM frame");
+            self.scheduler
+                .retry_at(output, frame_id, Instant::now() + surface.retrace);
+            return;
+        }
+        surface.pending = Some(PendingNativeFrame {
+            frame_id,
+            callbacks,
+            queued: true,
+            deadline: None,
+        });
+    }
+
+    fn render_output(&mut self, node: DrmNode, crtc: crtc::Handle, request: RenderRequest) {
+        let output = request.output;
         let roots = self.state.render_roots_for_output(output);
         let mut renderer = match self.gpus.single_renderer(&node) {
             Ok(renderer) => renderer,
             Err(error) => {
                 tracing::error!(?node, %error, "could not acquire output renderer");
+                self.scheduler
+                    .retry_at(output, request.frame_id, Instant::now() + DEFAULT_RETRACE);
                 return;
             }
         };
         self.state.validate_dmabuf_imports(&mut renderer);
+        let mut callbacks = Vec::new();
         let elements: Vec<WaylandSurfaceRenderElement<NativeRenderer<'_>>> = roots
             .iter()
             .flat_map(|(surface, location, scale)| {
@@ -526,22 +792,24 @@ impl NativeLoop {
                         ((popup_offset.y - geometry.loc.y) as f64 * scale).round() as i32,
                     )
                         .into();
-                    elements.extend(render_elements_from_surface_tree(
+                    elements.extend(surface_tree_snapshot(
                         &mut renderer,
                         popup.wl_surface(),
                         *location + offset,
                         *scale,
                         1.0,
                         Kind::Unspecified,
+                        &mut callbacks,
                     ));
                 }
-                elements.extend(render_elements_from_surface_tree(
+                elements.extend(surface_tree_snapshot(
                     &mut renderer,
                     surface,
                     *location,
                     *scale,
                     1.0,
                     Kind::Unspecified,
+                    &mut callbacks,
                 ));
                 elements
             })
@@ -551,44 +819,108 @@ impl NativeLoop {
             .get_mut(&node)
             .and_then(|device| device.outputs.get_mut(&crtc))
         else {
+            self.scheduler.remove_output(output);
             return;
         };
-        let submitted = match surface.drm.render_frame(
+        match surface.drm.render_frame(
             &mut renderer,
             &elements,
             Color32F::new(0.025, 0.035, 0.06, 1.0),
             FrameFlags::empty(),
         ) {
-            Ok(frame) if frame.is_empty => true,
-            Ok(frame) => {
-                if frame.needs_sync()
-                    && let PrimaryPlaneElement::Swapchain(primary) = frame.primary_element
-                {
-                    let _ = primary.sync.wait();
+            Ok(frame) if frame.is_empty => {
+                if self.scheduler.submitted(output, request.frame_id) {
+                    surface.pending = Some(PendingNativeFrame {
+                        frame_id: request.frame_id,
+                        callbacks,
+                        queued: false,
+                        deadline: Some(Instant::now() + surface.retrace),
+                    });
                 }
-                if let Err(error) = surface.drm.queue_frame(()) {
-                    tracing::warn!(?node, ?crtc, ?error, "could not queue DRM frame");
-                    false
+            }
+            Ok(frame) => {
+                let sync = frame
+                    .needs_sync()
+                    .then(|| match frame.primary_element {
+                        PrimaryPlaneElement::Swapchain(primary) => Some(primary.sync),
+                        PrimaryPlaneElement::Element(_) => None,
+                    })
+                    .flatten();
+                if let Some(fence_fd) = sync.as_ref().and_then(|sync| sync.export()) {
+                    let mut callbacks = Some(callbacks);
+                    let registration = self.handle.insert_source(
+                        OneShotReadableFdSource::new(fence_fd),
+                        move |(), _, runtime| {
+                            runtime.enqueue(NativeEvent::FenceReady {
+                                node,
+                                crtc,
+                                frame_id: request.frame_id,
+                                callbacks: callbacks
+                                    .take()
+                                    .expect("one-shot GPU fence fired more than once"),
+                            });
+                        },
+                    );
+                    if let Err(error) = registration {
+                        tracing::warn!(%error, "could not register GPU fence; retrying frame");
+                        self.scheduler.retry_at(
+                            output,
+                            request.frame_id,
+                            Instant::now() + surface.retrace,
+                        );
+                    }
                 } else {
-                    surface.pending = true;
-                    true
+                    if let Some(sync) = sync.filter(|sync| !sync.is_reached()) {
+                        // A non-exportable fence cannot wake calloop. Check it
+                        // with an exponentially backed-off deadline instead of
+                        // blocking the compositor thread.
+                        surface.waiting_fence = Some(PendingGpuFence {
+                            frame_id: request.frame_id,
+                            callbacks,
+                            sync,
+                            deadline: Instant::now() + FENCE_RECHECK_INITIAL,
+                            delay: FENCE_RECHECK_INITIAL,
+                        });
+                    } else if !self.scheduler.submitted(output, request.frame_id) {
+                        tracing::debug!(
+                            ?output,
+                            frame_id = request.frame_id,
+                            "discarding stale rendered DRM frame"
+                        );
+                    } else if let Err(error) = surface.drm.queue_frame(request.frame_id) {
+                        tracing::warn!(?node, ?crtc, ?error, "could not queue DRM frame");
+                        self.scheduler.retry_at(
+                            output,
+                            request.frame_id,
+                            Instant::now() + surface.retrace,
+                        );
+                    } else {
+                        surface.pending = Some(PendingNativeFrame {
+                            frame_id: request.frame_id,
+                            callbacks,
+                            queued: true,
+                            deadline: None,
+                        });
+                    }
                 }
             }
             Err(error) => {
                 tracing::warn!(?node, ?crtc, ?error, "could not render DRM frame");
-                false
-            }
-        };
-        if submitted {
-            let frame_time = self.started.elapsed().as_millis() as u32;
-            for (root, _, _) in roots {
-                send_frames_surface_tree(&root, frame_time);
-                for (popup, _) in PopupManager::popups_for_surface(&root) {
-                    send_frames_surface_tree(popup.wl_surface(), frame_time);
-                }
+                self.scheduler
+                    .retry_at(output, request.frame_id, Instant::now() + surface.retrace);
             }
         }
     }
+}
+
+fn is_lossy_native_motion(event: &NativeEvent) -> bool {
+    matches!(
+        event,
+        NativeEvent::Input(
+            BackendInputEvent::PointerMotion { .. }
+                | BackendInputEvent::PointerMotionAbsolute { .. }
+        )
+    )
 }
 
 pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
@@ -609,26 +941,26 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     event_loop
         .handle()
         .insert_source(ipc.event_source(), |(), _, runtime| {
-            runtime.events.push_back(NativeEvent::IpcReady);
+            runtime.enqueue(NativeEvent::IpcReady);
         })
         .map_err(|error| anyhow!(error.to_string()))?;
     event_loop
         .handle()
         .insert_source(listener, |stream, _, runtime| {
-            runtime.events.push_back(NativeEvent::WaylandClient(stream));
+            runtime.enqueue(NativeEvent::WaylandClient(stream));
         })
         .map_err(|error| anyhow!(error.to_string()))?;
     event_loop
         .handle()
         .insert_source(ReadableFdSource::duplicate(&display)?, |(), _, runtime| {
-            runtime.events.push_back(NativeEvent::WaylandReady);
+            runtime.enqueue(NativeEvent::WaylandReady);
         })
         .map_err(|error| anyhow!(error.to_string()))?;
     if let Some(config_fd) = state.config_watch_fd()? {
         event_loop
             .handle()
             .insert_source(ReadableFdSource::new(config_fd), |(), _, runtime| {
-                runtime.events.push_back(NativeEvent::ConfigChanged);
+                runtime.enqueue(NativeEvent::ConfigChanged);
             })
             .map_err(|error| anyhow!(error.to_string()))?;
     }
@@ -653,19 +985,19 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     event_loop
         .handle()
         .insert_source(input, |event, _, runtime| {
-            runtime.events.push_back(NativeEvent::Input(event));
+            runtime.enqueue(NativeEvent::Input(event));
         })
         .map_err(|error| anyhow!(error.to_string()))?;
     event_loop
         .handle()
         .insert_source(session_notifier, |event, _, runtime| {
-            runtime.events.push_back(NativeEvent::Session(event));
+            runtime.enqueue(NativeEvent::Session(event));
         })
         .map_err(|error| anyhow!(error.to_string()))?;
     event_loop
         .handle()
         .insert_source(udev, |event, _, runtime| {
-            runtime.events.push_back(NativeEvent::Udev(event));
+            runtime.enqueue(NativeEvent::Udev(event));
         })
         .map_err(|error| anyhow!(error.to_string()))?;
 
@@ -682,6 +1014,10 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         next_output_id: 1,
         gpus: GpuManager::new(GbmGlesBackend::with_context_priority(ContextPriority::High))?,
         started: Instant::now(),
+        scheduler: RepaintScheduler::default(),
+        wayland_ready_queued: false,
+        ipc_ready_queued: false,
+        config_changed_queued: false,
     };
     for (device_id, path) in initial_devices {
         match DrmNode::from_dev_id(device_id) {
@@ -697,22 +1033,31 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     println!("WAYLAND_DISPLAY={socket_name}");
 
     loop {
-        let frame_timeout = Instant::now() + Duration::from_millis(16);
-        let deadline = if runtime.events.is_empty() {
-            runtime
-                .ipc
-                .next_timeout()
-                .map_or(frame_timeout, |ipc| ipc.min(frame_timeout))
+        let now = Instant::now();
+        let deadline = [
+            runtime.ipc.next_timeout(),
+            runtime.state.next_timer_deadline(),
+            runtime.scheduler.earliest_deadline(),
+            runtime.next_software_presentation(),
+            runtime.next_fence_check(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        let timeout = if runtime.events.is_empty() && !runtime.scheduler.has_ready_at(now) {
+            deadline.map(|deadline| deadline.saturating_duration_since(now))
         } else {
-            Instant::now()
+            Some(Duration::ZERO)
         };
-        event_loop.dispatch(
-            Some(deadline.saturating_duration_since(Instant::now())),
-            &mut runtime,
-        )?;
+        event_loop.dispatch(timeout, &mut runtime)?;
         runtime.process_events()?;
-        runtime.ipc.expire(Instant::now());
+        let now = Instant::now();
+        runtime.ipc.expire(now);
         runtime.apply_output_configurations();
+        let timer_due = runtime
+            .state
+            .next_timer_deadline()
+            .is_some_and(|deadline| deadline <= now);
         runtime.state.poll_config();
         if runtime.state.should_quit() {
             tracing::info!("quit action requested");
@@ -720,6 +1065,11 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         }
         runtime.state.process_key_repeats();
         runtime.state.remove_dead_windows();
+        runtime.poll_non_exportable_fences(now);
+        runtime.retire_software_presentations(now);
+        if timer_due {
+            runtime.request_all(RepaintReasons::DAMAGE);
+        }
         runtime.ipc.finish_tick(&mut runtime.state);
         runtime.render_all();
         runtime.display.flush_clients()?;

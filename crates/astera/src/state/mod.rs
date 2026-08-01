@@ -1163,32 +1163,6 @@ pub fn frame_callbacks_surface(surface: &WlSurface) -> Vec<FrameCallback> {
     })
 }
 
-pub fn frame_callbacks_surface_tree(surface: &WlSurface) -> Vec<FrameCallback> {
-    let mut callbacks = Vec::new();
-    with_surface_tree_downward(
-        surface,
-        (),
-        |_, _, &()| TraversalAction::DoChildren(()),
-        |surface, states, &()| {
-            callbacks.extend(
-                states
-                    .cached_state
-                    .get::<SurfaceAttributes>()
-                    .current()
-                    .frame_callbacks
-                    .iter()
-                    .cloned()
-                    .map(|callback| FrameCallback {
-                        surface: surface.clone(),
-                        callback,
-                    }),
-            );
-        },
-        |_, _, &()| true,
-    );
-    callbacks
-}
-
 /// Complete exactly the callback objects captured for a successfully submitted frame.
 pub fn complete_frame_callbacks(callbacks: &[FrameCallback], time: u32) {
     use smithay::reexports::wayland_server::Resource;
@@ -1213,12 +1187,6 @@ pub fn complete_frame_callbacks(callbacks: &[FrameCallback], time: u32) {
                 .retain(|callback| !callback_ids.contains(&callback.id()));
         });
     }
-}
-
-/// Legacy immediate completion used by the native backend until its frame
-/// submission path adopts the same explicit snapshot type.
-pub fn send_frames_surface_tree(surface: &WlSurface, time: u32) {
-    complete_frame_callbacks(&frame_callbacks_surface_tree(surface), time);
 }
 
 fn extend_surface_tree(surfaces: &mut HashSet<WlSurface>, root: &WlSurface) {

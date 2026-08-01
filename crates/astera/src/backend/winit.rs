@@ -14,25 +14,21 @@ use smithay::{
             damage::OutputDamageTracker,
             element::{Kind, surface::WaylandSurfaceRenderElement},
             gles::GlesRenderer,
-            utils::RendererSurfaceStateUserData,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     desktop::PopupManager,
-    reexports::{
-        calloop::EventLoop,
-        wayland_server::{Display, protocol::wl_surface::WlSurface},
-    },
-    utils::{Physical, Point, Scale, Transform},
-    wayland::compositor::{TraversalAction, with_surface_tree_downward},
+    reexports::{calloop::EventLoop, wayland_server::Display},
+    utils::{Physical, Point, Transform},
 };
 
 use crate::{
-    backend::sources::{ReadableFdSource, WaylandSocketSource},
-    ipc_server::IpcServer,
-    state::{
-        Astera, ClientState, FrameCallback, complete_frame_callbacks, frame_callbacks_surface,
+    backend::{
+        render::surface_tree_snapshot,
+        sources::{ReadableFdSource, WaylandSocketSource},
     },
+    ipc_server::IpcServer,
+    state::{Astera, ClientState, complete_frame_callbacks},
 };
 
 const MAX_EVENTS_PER_BATCH: usize = 256;
@@ -245,7 +241,7 @@ impl WinitLoop {
                             ((popup_offset.y - geometry.loc.y) as f64 * scale).round() as i32,
                         )
                             .into();
-                        let popup_elements = render_surface_tree_snapshot(
+                        let popup_elements = surface_tree_snapshot(
                             renderer,
                             popup.wl_surface(),
                             *location + offset,
@@ -256,7 +252,7 @@ impl WinitLoop {
                         );
                         elements.extend(popup_elements);
                     }
-                    let root_elements = render_surface_tree_snapshot(
+                    let root_elements = surface_tree_snapshot(
                         renderer,
                         surface,
                         *location,
@@ -323,61 +319,6 @@ fn is_lossy_motion(event: &RuntimeEvent) -> bool {
                 | smithay::backend::input::InputEvent::PointerMotionAbsolute { .. }
         ))
     )
-}
-
-/// Build one immutable render snapshot and associate callbacks only with
-/// surfaces that produced an element in that snapshot.
-fn render_surface_tree_snapshot(
-    renderer: &mut GlesRenderer,
-    surface: &WlSurface,
-    location: Point<i32, Physical>,
-    scale: f64,
-    alpha: f32,
-    kind: Kind,
-    callbacks: &mut Vec<FrameCallback>,
-) -> Vec<WaylandSurfaceRenderElement<GlesRenderer>> {
-    let location = location.to_f64();
-    let scale = Scale::from(scale);
-    let mut elements = Vec::new();
-    with_surface_tree_downward(
-        surface,
-        location,
-        |_, states, location| {
-            let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() else {
-                return TraversalAction::SkipChildren;
-            };
-            let Some(view) = data.lock().expect("renderer surface state poisoned").view() else {
-                return TraversalAction::SkipChildren;
-            };
-            TraversalAction::DoChildren(*location + view.offset.to_f64().to_physical(scale))
-        },
-        |surface, states, location| {
-            let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() else {
-                return;
-            };
-            let Some(view) = data.lock().expect("renderer surface state poisoned").view() else {
-                return;
-            };
-            let element_location = *location + view.offset.to_f64().to_physical(scale);
-            match WaylandSurfaceRenderElement::from_surface(
-                renderer,
-                surface,
-                states,
-                element_location,
-                alpha,
-                kind,
-            ) {
-                Ok(Some(element)) => {
-                    callbacks.extend(frame_callbacks_surface(surface));
-                    elements.push(element);
-                }
-                Ok(None) => {}
-                Err(error) => tracing::warn!(%error, "could not import surface for nested frame"),
-            }
-        },
-        |_, _, _| true,
-    );
-    elements
 }
 
 pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {

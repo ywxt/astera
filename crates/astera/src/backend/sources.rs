@@ -91,6 +91,21 @@ pub struct ReadableFdSource {
     fd: Generic<OwnedFd>,
 }
 
+/// A readable fd that unregisters itself after the first readiness event.
+///
+/// Native rendering uses this for exported GPU fence fds.
+pub struct OneShotReadableFdSource {
+    fd: Generic<OwnedFd>,
+}
+
+impl OneShotReadableFdSource {
+    pub fn new(fd: OwnedFd) -> Self {
+        Self {
+            fd: Generic::new(fd, Interest::READ, Mode::Level),
+        }
+    }
+}
+
 impl ReadableFdSource {
     pub fn new(fd: OwnedFd) -> Self {
         Self {
@@ -121,6 +136,48 @@ impl EventSource for ReadableFdSource {
         self.fd.process_events(readiness, token, |_, _| {
             callback((), &mut ());
             Ok(PostAction::Continue)
+        })
+    }
+
+    fn register(
+        &mut self,
+        poll: &mut Poll,
+        tokens: &mut TokenFactory,
+    ) -> smithay::reexports::calloop::Result<()> {
+        self.fd.register(poll, tokens)
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &mut Poll,
+        tokens: &mut TokenFactory,
+    ) -> smithay::reexports::calloop::Result<()> {
+        self.fd.reregister(poll, tokens)
+    }
+
+    fn unregister(&mut self, poll: &mut Poll) -> smithay::reexports::calloop::Result<()> {
+        self.fd.unregister(poll)
+    }
+}
+
+impl EventSource for OneShotReadableFdSource {
+    type Event = ();
+    type Metadata = ();
+    type Ret = ();
+    type Error = io::Error;
+
+    fn process_events<F>(
+        &mut self,
+        readiness: Readiness,
+        token: Token,
+        mut callback: F,
+    ) -> io::Result<PostAction>
+    where
+        F: FnMut(Self::Event, &mut Self::Metadata),
+    {
+        self.fd.process_events(readiness, token, |_, _| {
+            callback((), &mut ());
+            Ok(PostAction::Remove)
         })
     }
 
