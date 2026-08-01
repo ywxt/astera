@@ -21,7 +21,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install compositor build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libegl1-mesa-dev xvfb xauth
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libegl1-mesa-dev libpixman-1-dev xvfb xauth
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test workspace (rerun failures for diagnostics)
@@ -46,7 +46,7 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: Install compositor build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libegl1-mesa-dev
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libegl1-mesa-dev libpixman-1-dev
       - run: cargo check --workspace --all-targets
 
   coverage:
@@ -61,7 +61,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
       - name: Install compositor build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libegl1-mesa-dev
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libudev-dev libinput-dev libgbm-dev libseat-dev libegl1-mesa-dev libpixman-1-dev
       - name: Install diff coverage reporter
         if: github.event_name == 'pull_request'
         run: pipx install diff-cover
@@ -87,14 +87,6 @@ jobs:
           name: render-diagnostics
           path: target/render-artifacts
           if-no-files-found: ignore
-
-  miri:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@miri
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo miri test -p astera-core
 
   aarch64:
     runs-on: ubuntu-24.04

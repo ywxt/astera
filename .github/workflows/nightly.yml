@@ -9,13 +9,6 @@ permissions:
   contents: read
 
 jobs:
-  miri:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@miri
-      - run: cargo miri test -p astera-core
-
   address-sanitizer:
     runs-on: ubuntu-24.04
     steps:

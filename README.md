@@ -40,8 +40,8 @@ compositor-state tests. The layout solver also uses reproducible `proptest` case
 prints a seed that must be retained when turning it into a regression test. Key repeat and
 animation-facing state use an injectable monotonic clock, so tests do not sleep.
 
-GitHub Actions runs formatting, Clippy, tests, a nested Xvfb smoke test, coverage, Miri and an
-aarch64 portability check. Nightly jobs add ASan and a five-minute layout fuzz run. Run the same
+GitHub Actions runs formatting, Clippy, tests, a nested Xvfb smoke test, coverage and an aarch64
+portability check. Nightly jobs add ASan and a five-minute layout fuzz run. Run the same
 fuzzer locally with:
 
 ```sh
