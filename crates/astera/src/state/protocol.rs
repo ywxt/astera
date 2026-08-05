@@ -574,6 +574,8 @@ delegate_xdg_shell!(Astera);
 delegate_xdg_decoration!(Astera);
 delegate_xdg_activation!(Astera);
 delegate_idle_inhibit!(Astera);
+delegate_relative_pointer!(Astera);
+delegate_pointer_constraints!(Astera);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
     smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_manager_v1::ExtSessionLockManagerV1:
     smithay::wayland::session_lock::SessionLockManagerGlobalData

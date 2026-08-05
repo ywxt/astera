@@ -117,6 +117,8 @@ impl Astera {
         self.lock_surfaces.clear();
         self.mark_render_dirty();
         self.sync_keyboard_focus();
+        // Re-hit-test immediately so axis/relative input cannot target the destroyed lock surface.
+        self.handle_pointer_motion(self.pointer_location, 0);
         tracing::info!("session unlocked");
     }
 

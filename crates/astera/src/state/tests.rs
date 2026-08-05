@@ -13,7 +13,7 @@ use wayland_client::{
     globals::registry_queue_init,
     protocol::{
         wl_callback::WlCallback, wl_compositor::WlCompositor, wl_output::WlOutput,
-        wl_registry::WlRegistry, wl_seat::WlSeat, wl_surface::WlSurface,
+        wl_pointer::WlPointer, wl_registry::WlRegistry, wl_seat::WlSeat, wl_surface::WlSurface,
     },
 };
 use wayland_protocols::ext::idle_notify::v1::client::{
@@ -30,6 +30,14 @@ use wayland_protocols::wp::{
     idle_inhibit::zv1::client::{
         zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
         zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+    },
+    pointer_constraints::zv1::client::{
+        zwp_locked_pointer_v1::ZwpLockedPointerV1,
+        zwp_pointer_constraints_v1::{self, ZwpPointerConstraintsV1},
+    },
+    relative_pointer::zv1::client::{
+        zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
+        zwp_relative_pointer_v1::ZwpRelativePointerV1,
     },
     viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
 };
@@ -76,6 +84,7 @@ delegate_noop!(TestClient: ignore WlSurface);
 delegate_noop!(TestClient: ignore WlCallback);
 delegate_noop!(TestClient: ignore WlSeat);
 delegate_noop!(TestClient: ignore WlOutput);
+delegate_noop!(TestClient: ignore WlPointer);
 delegate_noop!(TestClient: ignore XdgToplevel);
 delegate_noop!(TestClient: ignore XdgPopup);
 delegate_noop!(TestClient: ignore XdgPositioner);
@@ -96,6 +105,10 @@ delegate_noop!(TestClient: ignore ExtSessionLockManagerV1);
 delegate_noop!(TestClient: ignore ExtSessionLockV1);
 delegate_noop!(TestClient: ignore ZwlrOutputPowerManagerV1);
 delegate_noop!(TestClient: ignore ZwlrOutputPowerV1);
+delegate_noop!(TestClient: ignore ZwpRelativePointerManagerV1);
+delegate_noop!(TestClient: ignore ZwpRelativePointerV1);
+delegate_noop!(TestClient: ignore ZwpPointerConstraintsV1);
+delegate_noop!(TestClient: ignore ZwpLockedPointerV1);
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
     fn event(
@@ -301,8 +314,24 @@ fn decoration_and_activation_globals_are_advertised() {
             .bind::<ZwpIdleInhibitManagerV1, _, _>(&queue, 1..=1, ())
             .unwrap();
         let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let pointer = seat.get_pointer(&queue, ());
+        let relative_manager = globals
+            .bind::<ZwpRelativePointerManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let constraints = globals
+            .bind::<ZwpPointerConstraintsV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
         let _idle_notification = idle.get_idle_notification(0, &seat, &queue, ());
         let surface = compositor.create_surface(&queue, ());
+        let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &queue, ());
+        let _locked_pointer = constraints.lock_pointer(
+            &surface,
+            &pointer,
+            None,
+            zwp_pointer_constraints_v1::Lifetime::Persistent,
+            &queue,
+            (),
+        );
         let _first_inhibitor = idle_inhibit.create_inhibitor(&surface, &queue, ());
         let _second_inhibitor = idle_inhibit.create_inhibitor(&surface, &queue, ());
         let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
@@ -330,6 +359,14 @@ fn decoration_and_activation_globals_are_advertised() {
             })
         })
     });
+    let constrained = state.windows[0].surface.wl_surface().clone();
+    assert!(
+        smithay::wayland::pointer_constraints::with_pointer_constraint(
+            &constrained,
+            &state.pointer,
+            |constraint| constraint.is_some()
+        )
+    );
     dispatch_until(&mut display, &mut state, |state| {
         !state.idle_notifications.is_empty()
     });

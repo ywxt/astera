@@ -18,6 +18,7 @@ mod key_repeat;
 mod model;
 mod output;
 mod output_power;
+mod pointer_constraints;
 mod process;
 mod public_state;
 mod scene;
@@ -63,8 +64,9 @@ use smithay::{
         },
     },
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
-    delegate_idle_inhibit, delegate_layer_shell, delegate_output, delegate_seat, delegate_shm,
-    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_idle_inhibit, delegate_layer_shell, delegate_output, delegate_pointer_constraints,
+    delegate_relative_pointer, delegate_seat, delegate_shm, delegate_viewporter,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -93,6 +95,8 @@ use smithay::{
         },
         idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
         output::{OutputHandler, OutputManagerState},
+        pointer_constraints::PointerConstraintsState,
+        relative_pointer::RelativePointerManagerState,
         selection::{
             SelectionHandler,
             data_device::{
@@ -129,6 +133,11 @@ pub struct Astera {
     next_window_id: u64,
     next_layer_id: u64,
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
+    pointer_focus_origin: Option<(
+        WlSurface,
+        SmithayPoint<f64, smithay::utils::Logical>,
+        f64,
+    )>,
     drag: Option<DragState>,
     key_repeat: KeyRepeatState,
     clock: Arc<dyn Clock>,
@@ -160,6 +169,8 @@ pub struct Astera {
     output_power_controls: BTreeMap<OutputId, smithay::reexports::wayland_protocols_wlr::output_power_management::v1::server::zwlr_output_power_v1::ZwlrOutputPowerV1>,
     output_power_modes: BTreeMap<OutputId, bool>,
     pending_output_power: VecDeque<(OutputId, bool)>,
+    _relative_pointer_state: RelativePointerManagerState,
+    _pointer_constraints_state: PointerConstraintsState,
     idle_runtime: IdleRuntime,
     idle_notifications: BTreeMap<u64, smithay::reexports::wayland_protocols::ext::idle_notify::v1::server::ext_idle_notification_v1::ExtIdleNotificationV1>,
     next_idle_notification: u64,
@@ -211,6 +222,8 @@ impl Astera {
                 visible: output_power_advertised.clone(),
             },
         );
+        let relative_pointer_state = RelativePointerManagerState::new::<Self>(display);
+        let pointer_constraints_state = PointerConstraintsState::new::<Self>(display);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(display);
         let wayland_output = SmithayOutput::new(
             "ASTERA-NESTED-1".into(),
@@ -300,6 +313,7 @@ impl Astera {
             next_window_id: 1,
             next_layer_id: 1,
             pointer_location: (0.0, 0.0).into(),
+            pointer_focus_origin: None,
             drag: None,
             key_repeat: KeyRepeatState::default(),
             clock,
@@ -329,6 +343,8 @@ impl Astera {
             output_power_controls: BTreeMap::new(),
             output_power_modes: BTreeMap::new(),
             pending_output_power: VecDeque::new(),
+            _relative_pointer_state: relative_pointer_state,
+            _pointer_constraints_state: pointer_constraints_state,
             idle_runtime: IdleRuntime::default(),
             idle_notifications: BTreeMap::new(),
             next_idle_notification: 1,
@@ -530,13 +546,9 @@ impl Astera {
                 let location = event.position_transformed(
                     (saturating_i32(size.width), saturating_i32(size.height)).into(),
                 );
-                self.handle_pointer_motion(location, event.time_msec());
+                self.handle_absolute_pointer_motion(location, event.time_msec());
             }
-            InputEvent::PointerMotion { event } => {
-                let delta = event.delta_unaccel();
-                let location = self.relative_pointer_location(delta.x, delta.y);
-                self.handle_pointer_motion(location, event.time_msec());
-            }
+            InputEvent::PointerMotion { event } => self.handle_relative_pointer_motion(event),
             InputEvent::PointerButton { event } => self.handle_pointer_button(
                 event.button(),
                 event.button_code(),
@@ -563,6 +575,12 @@ impl Astera {
         let focus = self.surface_under(location);
         let pointer = self.pointer.clone();
         let serial = self.next_serial();
+        let focus_origin = focus.as_ref().map(|(surface, origin, window)| {
+            let scale = window
+                .and_then(|window| self.visual_geometry(window).map(|geometry| geometry.2))
+                .unwrap_or(1.0);
+            (surface.clone(), *origin, scale)
+        });
         pointer.motion(
             self,
             focus.map(|(surface, origin, _)| (surface, origin)),
@@ -572,7 +590,73 @@ impl Astera {
                 time,
             },
         );
+        self.pointer_focus_origin = pointer
+            .current_focus()
+            .and_then(|current| focus_origin.filter(|(surface, _, _)| *surface == current));
         pointer.frame(self);
+        self.maybe_activate_pointer_constraint();
+    }
+
+    fn handle_absolute_pointer_motion(
+        &mut self,
+        target: SmithayPoint<f64, smithay::utils::Logical>,
+        time: u32,
+    ) {
+        match self.constrain_pointer_target(target) {
+            pointer_constraints::ConstrainedPointerTarget::Locked => {}
+            pointer_constraints::ConstrainedPointerTarget::Motion(location) => {
+                self.handle_pointer_motion(location, time);
+            }
+        }
+    }
+
+    fn handle_relative_pointer_motion<B: InputBackend, E: PointerMotionEvent<B>>(
+        &mut self,
+        event: E,
+    ) {
+        use smithay::input::pointer::RelativeMotionEvent;
+
+        let pointer = self.pointer.clone();
+        let previous = self
+            .pointer_focus_origin
+            .clone()
+            .and_then(|(surface, origin, _)| {
+                (pointer.current_focus().as_ref() == Some(&surface)).then_some((surface, origin))
+            });
+        let relative = RelativeMotionEvent {
+            delta: event.delta(),
+            delta_unaccel: event.delta_unaccel(),
+            utime: event.time(),
+        };
+        let relative_focus = previous;
+        if matches!(
+            self.active_pointer_constraint(),
+            Some(pointer_constraints::ActivePointerConstraint::Locked)
+        ) {
+            pointer.relative_motion(self, relative_focus, &relative);
+            pointer.frame(self);
+            return;
+        }
+
+        let delta = event.delta_unaccel();
+        let constrained = self.active_pointer_constraint().is_some();
+        let candidate = if constrained {
+            let size = self.desktop.outputs[&self.active_output]
+                .output
+                .logical_size;
+            SmithayPoint::from((
+                (self.pointer_location.x + delta.x).clamp(0.0, size.width as f64 - 1.0),
+                (self.pointer_location.y + delta.y).clamp(0.0, size.height as f64 - 1.0),
+            ))
+        } else {
+            self.relative_pointer_location(delta.x, delta.y)
+        };
+        let location = match self.constrain_pointer_target(candidate) {
+            pointer_constraints::ConstrainedPointerTarget::Locked => self.pointer_location,
+            pointer_constraints::ConstrainedPointerTarget::Motion(location) => location,
+        };
+        pointer.relative_motion(self, relative_focus, &relative);
+        self.handle_pointer_motion(location, event.time_msec());
     }
 
     fn handle_pointer_axis<B: InputBackend, E: PointerAxisEvent<B>>(&mut self, event: E) {
