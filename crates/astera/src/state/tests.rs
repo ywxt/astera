@@ -19,6 +19,9 @@ use wayland_client::{
 use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1::ExtIdleNotificationV1, ext_idle_notifier_v1::ExtIdleNotifierV1,
 };
+use wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_manager_v1::ExtSessionLockManagerV1, ext_session_lock_v1::ExtSessionLockV1,
+};
 use wayland_protocols::wp::{
     fractional_scale::v1::client::{
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
@@ -84,6 +87,8 @@ delegate_noop!(TestClient: ignore ExtIdleNotifierV1);
 delegate_noop!(TestClient: ignore ExtIdleNotificationV1);
 delegate_noop!(TestClient: ignore ZwpIdleInhibitManagerV1);
 delegate_noop!(TestClient: ignore ZwpIdleInhibitorV1);
+delegate_noop!(TestClient: ignore ExtSessionLockManagerV1);
+delegate_noop!(TestClient: ignore ExtSessionLockV1);
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
     fn event(
@@ -150,6 +155,61 @@ fn dispatch_until(
         thread::yield_now();
     }
     panic!("Wayland harness condition did not become true");
+}
+
+#[test]
+fn session_lock_is_fail_closed_before_confirmation_and_after_disconnect() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (requested_tx, requested_rx) = mpsc::sync_channel(0);
+    let (invalid_tx, invalid_rx) = mpsc::sync_channel(0);
+    let (invalid_sent_tx, invalid_sent_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, event_queue) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let manager = globals
+            .bind::<ExtSessionLockManagerV1, _, _>(&event_queue.handle(), 1..=1, ())
+            .unwrap();
+        let lock = manager.lock(&event_queue.handle(), ());
+        connection.flush().unwrap();
+        requested_tx.send(()).unwrap();
+        invalid_rx.recv().unwrap();
+        lock.unlock_and_destroy();
+        connection.flush().unwrap();
+        invalid_sent_tx.send(()).unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        requested_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| state.session_is_locked());
+    assert!(matches!(state.session_state, SessionState::Locking { .. }));
+    assert!(state.render_roots().is_empty());
+
+    invalid_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        invalid_sent_rx.try_recv().is_ok()
+    });
+    for _ in 0..8 {
+        display.dispatch_clients(&mut state).unwrap();
+    }
+    assert!(matches!(state.session_state, SessionState::Locking { .. }));
+    state.lock_frame_presented(OutputId(0), None);
+    assert!(matches!(state.session_state, SessionState::Locking { .. }));
+    let generation = state.locking_generation();
+    state.lock_frame_presented(OutputId(0), generation);
+    assert!(matches!(state.session_state, SessionState::Locked { .. }));
+    client.join().unwrap();
+    for _ in 0..8 {
+        display.dispatch_clients(&mut state).unwrap();
+    }
+    assert!(state.session_is_locked());
+    assert!(state.render_roots().is_empty());
 }
 
 #[test]

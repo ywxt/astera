@@ -295,12 +295,17 @@ impl WinitLoop {
                 elements = elements.len(),
                 "nested render elements collected"
             );
+            let clear = if self.state.session_is_locked() {
+                Color32F::new(0.0, 0.0, 0.0, 1.0)
+            } else {
+                Color32F::new(0.025, 0.035, 0.06, 1.0)
+            };
             let result = self.damage_tracker.render_output(
                 renderer,
                 &mut framebuffer,
                 buffer_age,
                 &elements,
-                Color32F::new(0.025, 0.035, 0.06, 1.0),
+                clear,
             )?;
             (result.damage.cloned(), result.states)
         };
@@ -358,6 +363,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     let mut event_loop: EventLoop<WinitLoop> = EventLoop::try_new()?;
     let display: Display<Astera> = Display::new()?;
     let mut state = Astera::new(&display.handle(), config);
+    state.disable_session_lock_advertisement();
     state.watch_config(config_path);
     tracing::debug!(state = ?state.execute_command(Command::GetState), "initial desktop state");
     let listener = WaylandSocketSource::bind_auto("astera", 1..32)?;

@@ -174,6 +174,9 @@ impl Astera {
     }
 
     pub(super) fn sync_keyboard_focus(&mut self) {
+        let lock_target = self
+            .lock_surface_for_output(self.active_output)
+            .map(|surface| surface.wl_surface().clone());
         let layer_target = self
             .layers
             .iter()
@@ -202,7 +205,11 @@ impl Astera {
                 .find(|mapped| mapped.id == id)
                 .map(|mapped| mapped.surface.wl_surface().clone())
         });
-        let target = layer_target.or(window_target);
+        let target = if self.session_is_locked() {
+            lock_target
+        } else {
+            layer_target.or(window_target)
+        };
         for mapped in &mut self.windows {
             let activated = Some(mapped.surface.wl_surface()) == target.as_ref();
             if activated {

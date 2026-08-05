@@ -159,6 +159,7 @@ struct PendingNativeFrame {
     callbacks: Vec<FrameCallback>,
     queued: bool,
     deadline: Option<Instant>,
+    lock_generation: Option<u64>,
 }
 
 struct PendingGpuFence {
@@ -178,6 +179,7 @@ struct PreparedScanout {
         f64,
     )>,
     states: RenderElementStates,
+    lock_generation: Option<u64>,
 }
 
 struct PendingExportedFence {
@@ -619,6 +621,8 @@ impl NativeLoop {
             return;
         };
         if self.scheduler.presented(surface.output, frame.frame_id) {
+            self.state
+                .lock_frame_presented(surface.output, frame.lock_generation);
             let frame_time = self.started.elapsed().as_millis() as u32;
             complete_frame_callbacks(&frame.callbacks, frame_time);
         }
@@ -671,6 +675,8 @@ impl NativeLoop {
                 .collect::<Vec<_>>();
         for (output, frame) in ready {
             if self.scheduler.presented(output, frame.frame_id) {
+                self.state
+                    .lock_frame_presented(output, frame.lock_generation);
                 complete_frame_callbacks(
                     &frame.callbacks,
                     self.started.elapsed().as_millis() as u32,
@@ -808,11 +814,13 @@ impl NativeLoop {
             callbacks,
             queued: true,
             deadline: None,
+            lock_generation: scanout.lock_generation,
         });
     }
 
     fn render_output(&mut self, node: DrmNode, crtc: crtc::Handle, request: RenderRequest) {
         let output = request.output;
+        let lock_generation = self.state.locking_generation();
         let roots = self.state.render_roots_for_output(output);
         let mut renderer = match self.gpus.single_renderer(&node) {
             Ok(renderer) => renderer,
@@ -866,12 +874,15 @@ impl NativeLoop {
             self.scheduler.remove_output(output);
             return;
         };
-        match surface.drm.render_frame(
-            &mut renderer,
-            &elements,
-            Color32F::new(0.025, 0.035, 0.06, 1.0),
-            FrameFlags::empty(),
-        ) {
+        let clear = if self.state.session_is_locked() {
+            Color32F::new(0.0, 0.0, 0.0, 1.0)
+        } else {
+            Color32F::new(0.025, 0.035, 0.06, 1.0)
+        };
+        match surface
+            .drm
+            .render_frame(&mut renderer, &elements, clear, FrameFlags::empty())
+        {
             Ok(frame) if frame.is_empty => {
                 if self.scheduler.submitted(output, request.frame_id) {
                     self.state
@@ -881,6 +892,7 @@ impl NativeLoop {
                         callbacks,
                         queued: false,
                         deadline: Some(Instant::now() + surface.retrace),
+                        lock_generation,
                     });
                 }
             }
@@ -895,6 +907,7 @@ impl NativeLoop {
                 let scanout = PreparedScanout {
                     roots,
                     states: frame.states,
+                    lock_generation,
                 };
                 if let Some(fence_fd) = sync.as_ref().and_then(|sync| sync.export()) {
                     let mut callbacks = Some(callbacks);
@@ -971,6 +984,7 @@ impl NativeLoop {
                             callbacks,
                             queued: true,
                             deadline: None,
+                            lock_generation,
                         });
                     }
                 }

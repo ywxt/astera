@@ -118,6 +118,20 @@ impl Astera {
         &self,
         output: OutputId,
     ) -> Vec<(WlSurface, SmithayPoint<i32, Physical>, f64)> {
+        // Locking immediately hides every desktop surface. Before the locker attaches a buffer,
+        // the renderer clear colour is the fail-closed frame for this output.
+        if self.session_is_locked() {
+            return self
+                .lock_surface_for_output(output)
+                .map(|surface| {
+                    vec![(
+                        surface.wl_surface().clone(),
+                        (0, 0).into(),
+                        self.output_scale(output),
+                    )]
+                })
+                .unwrap_or_default();
+        }
         // Compute window geometry once. Previously each frame rebuilt and sorted this list twice,
         // then performed another linear surface-to-window lookup for every item.
         let windows = self.mapped_windows_for_output(output).collect::<Vec<_>>();
@@ -260,6 +274,7 @@ impl Astera {
         self.reflow_outputs();
         self.configure_fullscreen_windows();
         self.configure_layer_surfaces();
+        self.configure_lock_surface(output);
         self.refresh_visible_scales();
         self.mark_public_dirty();
         Ok(())

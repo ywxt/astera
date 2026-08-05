@@ -189,6 +189,7 @@ impl CompositorHandler for Astera {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        self.validate_lock_surface_commit(surface);
         self.popup_manager.commit(surface);
         let committed_buffer =
             with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
@@ -198,6 +199,13 @@ impl CompositorHandler for Astera {
         // host frame before the surface maps.
         if committed_buffer {
             self.mark_render_dirty();
+        }
+        if self
+            .lock_surfaces
+            .values()
+            .any(|lock| lock.wl_surface() == surface)
+        {
+            self.sync_keyboard_focus();
         }
         // Creating an xdg role is not mapping. The first non-null buffer maps the window and a
         // null-buffer commit unmaps it while preserving the role for a later remap.
@@ -566,6 +574,13 @@ delegate_xdg_shell!(Astera);
 delegate_xdg_decoration!(Astera);
 delegate_xdg_activation!(Astera);
 delegate_idle_inhibit!(Astera);
+smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_manager_v1::ExtSessionLockManagerV1:
+    smithay::wayland::session_lock::SessionLockManagerGlobalData
+] => smithay::wayland::session_lock::SessionLockManagerState);
+smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_manager_v1::ExtSessionLockManagerV1: ()
+] => smithay::wayland::session_lock::SessionLockManagerState);
 delegate_layer_shell!(Astera);
 delegate_fractional_scale!(Astera);
 delegate_viewporter!(Astera);

@@ -9,6 +9,16 @@ impl Astera {
         SmithayPoint<f64, smithay::utils::Logical>,
         Option<WindowId>,
     )> {
+        if self.session_is_locked() {
+            let surface = self.lock_surface_for_output(self.active_output)?;
+            let (hit, offset) = under_from_surface_tree(
+                surface.wl_surface(),
+                location,
+                (0, 0),
+                WindowSurfaceType::ALL,
+            )?;
+            return Some((hit, (f64::from(offset.x), f64::from(offset.y)).into(), None));
+        }
         // Hit testing mirrors render stacking. We retain every hit and choose the highest tuple so
         // popups, floating/fullscreen windows and layer surfaces resolve deterministically.
         let mut candidates = Vec::new();

@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, HashSet},
     ops::{Deref, DerefMut},
     os::fd::OwnedFd,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 mod activation;
@@ -17,6 +20,7 @@ mod output;
 mod process;
 mod public_state;
 mod scene;
+mod session_lock;
 #[cfg(test)]
 mod snapshot;
 
@@ -30,6 +34,7 @@ use geometry::{
 use idle::{IdleEvent, IdleRuntime};
 use key_repeat::KeyRepeatState;
 use model::{DragState, MappedLayer, MappedWindow, OutputRuntime, ProtocolState};
+use session_lock::{LockSurfaces, SessionState};
 
 use anyhow::{Result as AnyResult, anyhow};
 use astera_config::{
@@ -92,6 +97,7 @@ use smithay::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
             },
         },
+        session_lock::SessionLockManagerState,
         shell::wlr_layer::{
             KeyboardInteractivity, Layer, LayerSurface, LayerSurfaceCachedState,
             WlrLayerShellHandler, WlrLayerShellState,
@@ -143,6 +149,11 @@ pub struct Astera {
     pending_dmabufs: Vec<(Dmabuf, ImportNotifier)>,
     dmabuf_enabled: bool,
     serial: u32,
+    session_lock_manager: SessionLockManagerState,
+    session_lock_advertised: Arc<AtomicBool>,
+    session_state: SessionState,
+    lock_surfaces: LockSurfaces,
+    next_lock_generation: u64,
     idle_runtime: IdleRuntime,
     idle_notifications: BTreeMap<u64, smithay::reexports::wayland_protocols::ext::idle_notify::v1::server::ext_idle_notification_v1::ExtIdleNotificationV1>,
     next_idle_notification: u64,
@@ -178,6 +189,11 @@ impl Astera {
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(display);
         let viewporter_state = ViewporterState::new::<Self>(display);
         let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(display);
+        let session_lock_advertised = Arc::new(AtomicBool::new(true));
+        let advertised = session_lock_advertised.clone();
+        let session_lock_manager = SessionLockManagerState::new::<Self, _>(display, move |_| {
+            advertised.load(Ordering::Relaxed)
+        });
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(display);
         let wayland_output = SmithayOutput::new(
             "ASTERA-NESTED-1".into(),
@@ -287,6 +303,11 @@ impl Astera {
             pending_dmabufs: Vec::new(),
             dmabuf_enabled: false,
             serial: 1,
+            session_lock_manager,
+            session_lock_advertised,
+            session_state: SessionState::default(),
+            lock_surfaces: LockSurfaces::new(),
+            next_lock_generation: 0,
             idle_runtime: IdleRuntime::default(),
             idle_notifications: BTreeMap::new(),
             next_idle_notification: 1,
@@ -340,6 +361,7 @@ impl Astera {
                 location: Point::ORIGIN,
             },
         );
+        self.session_output_connected(output.id);
         if self.desktop.outputs.len() == 1 {
             self.active_output = output.id;
             for layer in &mut self.layers {
@@ -387,6 +409,7 @@ impl Astera {
         }
         self.display.disable_global::<Self>(runtime.global);
         self.layers.retain(|mapped| mapped.output != output);
+        self.session_output_disconnected(output);
         if self.active_output == output
             && let Some(next) = self.desktop.outputs.keys().next().copied()
         {
@@ -433,6 +456,20 @@ impl Astera {
                     serial,
                     event.time_msec(),
                     move |state, modifiers, key| {
+                        // The locker receives all keyboard input; compositor bindings must not
+                        // launch programs or mutate the hidden desktop while locked.
+                        if state.session_is_locked() {
+                            if !pressed
+                                && state.key_repeat.release(
+                                    key_code,
+                                    state.config.key_repeat.rate,
+                                    state.clock.now(),
+                                )
+                            {
+                                return FilterResult::Intercept(());
+                            }
+                            return FilterResult::Forward;
+                        }
                         if !pressed {
                             return if state.key_repeat.release(
                                 key_code,
@@ -516,6 +553,9 @@ impl Astera {
     }
 
     fn handle_pointer_axis<B: InputBackend, E: PointerAxisEvent<B>>(&mut self, event: E) {
+        if self.session_is_locked() {
+            self.handle_pointer_motion(self.pointer_location, event.time_msec());
+        }
         let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
         for axis in [Axis::Horizontal, Axis::Vertical] {
             frame = frame.relative_direction(axis, event.relative_direction(axis));
@@ -614,7 +654,8 @@ impl Astera {
         state: BackendButtonState,
         time: u32,
     ) {
-        let compositor_drag = button == Some(MouseButton::Left)
+        let compositor_drag = !self.session_is_locked()
+            && button == Some(MouseButton::Left)
             && (self.drag.is_some() || self.keyboard.modifier_state().logo);
         if compositor_drag {
             match state {
@@ -857,6 +898,10 @@ impl Astera {
     }
 
     pub fn process_key_repeats(&mut self) {
+        if self.session_is_locked() {
+            self.key_repeat.cancel_repeats();
+            return;
+        }
         // Read modifiers again on every tick; releasing a modifier cancels the held action.
         let state = self.keyboard.modifier_state();
         let current = BindingModifiers::from_state(state.ctrl, state.alt, state.shift, state.logo);
