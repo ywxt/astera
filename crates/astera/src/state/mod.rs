@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, VecDeque},
     ops::{Deref, DerefMut},
     os::fd::OwnedFd,
     sync::{
@@ -17,6 +17,7 @@ mod idle;
 mod key_repeat;
 mod model;
 mod output;
+mod output_power;
 mod process;
 mod public_state;
 mod scene;
@@ -34,6 +35,7 @@ use geometry::{
 use idle::{IdleEvent, IdleRuntime};
 use key_repeat::KeyRepeatState;
 use model::{DragState, MappedLayer, MappedWindow, OutputRuntime, ProtocolState};
+use output_power::OutputPowerGlobalData;
 use session_lock::{LockSurfaces, SessionState};
 
 use anyhow::{Result as AnyResult, anyhow};
@@ -154,6 +156,10 @@ pub struct Astera {
     session_state: SessionState,
     lock_surfaces: LockSurfaces,
     next_lock_generation: u64,
+    output_power_advertised: Arc<AtomicBool>,
+    output_power_controls: BTreeMap<OutputId, smithay::reexports::wayland_protocols_wlr::output_power_management::v1::server::zwlr_output_power_v1::ZwlrOutputPowerV1>,
+    output_power_modes: BTreeMap<OutputId, bool>,
+    pending_output_power: VecDeque<(OutputId, bool)>,
     idle_runtime: IdleRuntime,
     idle_notifications: BTreeMap<u64, smithay::reexports::wayland_protocols::ext::idle_notify::v1::server::ext_idle_notification_v1::ExtIdleNotificationV1>,
     next_idle_notification: u64,
@@ -194,6 +200,17 @@ impl Astera {
         let session_lock_manager = SessionLockManagerState::new::<Self, _>(display, move |_| {
             advertised.load(Ordering::Relaxed)
         });
+        let output_power_advertised = Arc::new(AtomicBool::new(false));
+        display.create_global::<
+            Self,
+            smithay::reexports::wayland_protocols_wlr::output_power_management::v1::server::zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
+            _,
+        >(
+            1,
+            OutputPowerGlobalData {
+                visible: output_power_advertised.clone(),
+            },
+        );
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(display);
         let wayland_output = SmithayOutput::new(
             "ASTERA-NESTED-1".into(),
@@ -308,6 +325,10 @@ impl Astera {
             session_state: SessionState::default(),
             lock_surfaces: LockSurfaces::new(),
             next_lock_generation: 0,
+            output_power_advertised,
+            output_power_controls: BTreeMap::new(),
+            output_power_modes: BTreeMap::new(),
+            pending_output_power: VecDeque::new(),
             idle_runtime: IdleRuntime::default(),
             idle_notifications: BTreeMap::new(),
             next_idle_notification: 1,
@@ -362,6 +383,7 @@ impl Astera {
             },
         );
         self.session_output_connected(output.id);
+        self.output_power_connected(output.id);
         if self.desktop.outputs.len() == 1 {
             self.active_output = output.id;
             for layer in &mut self.layers {
@@ -410,6 +432,7 @@ impl Astera {
         self.display.disable_global::<Self>(runtime.global);
         self.layers.retain(|mapped| mapped.output != output);
         self.session_output_disconnected(output);
+        self.output_power_disconnected(output);
         if self.active_output == output
             && let Some(next) = self.desktop.outputs.keys().next().copied()
         {

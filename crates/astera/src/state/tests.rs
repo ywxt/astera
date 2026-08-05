@@ -12,8 +12,8 @@ use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
     globals::registry_queue_init,
     protocol::{
-        wl_callback::WlCallback, wl_compositor::WlCompositor, wl_registry::WlRegistry,
-        wl_seat::WlSeat, wl_surface::WlSurface,
+        wl_callback::WlCallback, wl_compositor::WlCompositor, wl_output::WlOutput,
+        wl_registry::WlRegistry, wl_seat::WlSeat, wl_surface::WlSurface,
     },
 };
 use wayland_protocols::ext::idle_notify::v1::client::{
@@ -49,6 +49,10 @@ use wayland_protocols::xdg::{
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::ZwlrLayerShellV1, zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
 };
+use wayland_protocols_wlr::output_power_management::v1::client::{
+    zwlr_output_power_manager_v1::ZwlrOutputPowerManagerV1,
+    zwlr_output_power_v1::{self, ZwlrOutputPowerV1},
+};
 
 use super::clock::testing::ManualClock;
 use super::*;
@@ -71,6 +75,7 @@ delegate_noop!(TestClient: ignore WlCompositor);
 delegate_noop!(TestClient: ignore WlSurface);
 delegate_noop!(TestClient: ignore WlCallback);
 delegate_noop!(TestClient: ignore WlSeat);
+delegate_noop!(TestClient: ignore WlOutput);
 delegate_noop!(TestClient: ignore XdgToplevel);
 delegate_noop!(TestClient: ignore XdgPopup);
 delegate_noop!(TestClient: ignore XdgPositioner);
@@ -89,6 +94,8 @@ delegate_noop!(TestClient: ignore ZwpIdleInhibitManagerV1);
 delegate_noop!(TestClient: ignore ZwpIdleInhibitorV1);
 delegate_noop!(TestClient: ignore ExtSessionLockManagerV1);
 delegate_noop!(TestClient: ignore ExtSessionLockV1);
+delegate_noop!(TestClient: ignore ZwlrOutputPowerManagerV1);
+delegate_noop!(TestClient: ignore ZwlrOutputPowerV1);
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
     fn event(
@@ -155,6 +162,55 @@ fn dispatch_until(
         thread::yield_now();
     }
     panic!("Wayland harness condition did not become true");
+}
+
+#[test]
+fn output_power_requests_are_exclusive_coalesced_and_backend_confirmed() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    state.enable_output_power_management();
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (requested_tx, requested_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, event_queue) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = event_queue.handle();
+        let output = globals.bind::<WlOutput, _, _>(&queue, 1..=4, ()).unwrap();
+        let manager = globals
+            .bind::<ZwlrOutputPowerManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let control = manager.get_output_power(&output, &queue, ());
+        let rejected = manager.get_output_power(&output, &queue, ());
+        rejected.destroy();
+        control.set_mode(zwlr_output_power_v1::Mode::Off);
+        control.set_mode(zwlr_output_power_v1::Mode::On);
+        control.set_mode(zwlr_output_power_v1::Mode::Off);
+        connection.flush().unwrap();
+        requested_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        requested_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        !state.pending_output_power.is_empty()
+    });
+    assert_eq!(state.output_power_controls.len(), 1);
+    assert_eq!(
+        state.take_output_power_requests(),
+        vec![(OutputId(0), false)],
+        "only the latest request for an output should reach KMS"
+    );
+    state.confirm_output_power(OutputId(0), false);
+    assert!(!state.output_power_modes[&OutputId(0)]);
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -81,6 +81,8 @@ struct NativeLoop {
     wayland_ready_queued: bool,
     ipc_ready_queued: bool,
     config_changed_queued: bool,
+    session_active: bool,
+    deferred_devices: HashMap<DrmNode, PathBuf>,
     shutdown_deadline: Option<Instant>,
 }
 
@@ -143,6 +145,7 @@ struct NativeDevice {
     scanner: DrmScanner,
     registration: RegistrationToken,
     outputs: HashMap<crtc::Handle, NativeSurface>,
+    active: bool,
 }
 
 struct NativeSurface {
@@ -152,6 +155,8 @@ struct NativeSurface {
     retrace: Duration,
     waiting_fence: Option<PendingGpuFence>,
     exported_fence: Option<PendingExportedFence>,
+    requested_power_mode: Option<bool>,
+    committing_power_mode: Option<bool>,
 }
 
 struct PendingNativeFrame {
@@ -160,6 +165,7 @@ struct PendingNativeFrame {
     queued: bool,
     deadline: Option<Instant>,
     lock_generation: Option<u64>,
+    power_mode: Option<bool>,
 }
 
 struct PendingGpuFence {
@@ -180,6 +186,7 @@ struct PreparedScanout {
     )>,
     states: RenderElementStates,
     lock_generation: Option<u64>,
+    power_mode: Option<bool>,
 }
 
 struct PendingExportedFence {
@@ -241,7 +248,52 @@ impl NativeLoop {
         if scene_changed {
             self.request_all(RepaintReasons::DAMAGE);
         }
+        self.apply_output_power_requests();
         Ok(())
+    }
+
+    fn apply_output_power_requests(&mut self) {
+        for (output, powered) in self.state.take_output_power_requests() {
+            let Some(surface) = self
+                .devices
+                .values_mut()
+                .flat_map(|device| device.outputs.values_mut())
+                .find(|surface| surface.output == output)
+            else {
+                self.state.fail_output_power(output);
+                continue;
+            };
+            surface.requested_power_mode = Some(powered);
+        }
+        for device in self.devices.values_mut().filter(|device| device.active) {
+            for surface in device.outputs.values_mut() {
+                let idle = surface.pending.is_none()
+                    && surface.waiting_fence.is_none()
+                    && surface.exported_fence.is_none()
+                    && surface.committing_power_mode.is_none();
+                let Some(powered) = idle.then(|| surface.requested_power_mode.take()).flatten()
+                else {
+                    continue;
+                };
+                if powered {
+                    surface.committing_power_mode = Some(true);
+                    self.scheduler.add_output(surface.output);
+                    self.scheduler
+                        .request(surface.output, RepaintReasons::FULL_REPAINT);
+                } else {
+                    match surface.drm.with_compositor(|compositor| compositor.clear()) {
+                        Ok(()) => {
+                            self.state.confirm_output_power(surface.output, false);
+                            self.scheduler.remove_output(surface.output);
+                        }
+                        Err(error) => {
+                            tracing::warn!(output = ?surface.output, ?error, "KMS rejected output power-off request");
+                            self.state.fail_output_power(surface.output);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn process_event(&mut self, event: NativeEvent) -> Result<bool> {
@@ -252,11 +304,16 @@ impl NativeLoop {
                 scene_changed = true;
             }
             NativeEvent::Session(SessionEvent::PauseSession) => {
+                self.session_active = false;
                 self.libinput.suspend();
                 self.scheduler.pause();
                 for device in self.devices.values_mut() {
+                    device.active = false;
                     device.output_manager.pause();
                     for surface in device.outputs.values_mut() {
+                        if let Some(powered) = surface.committing_power_mode.take() {
+                            surface.requested_power_mode = Some(powered);
+                        }
                         surface.pending = None;
                         surface.waiting_fence = None;
                         if let Some(fence) = surface.exported_fence.take() {
@@ -267,21 +324,45 @@ impl NativeLoop {
                 tracing::info!("native session paused");
             }
             NativeEvent::Session(SessionEvent::ActivateSession) => {
+                self.session_active = true;
                 if let Err(error) = self.libinput.resume() {
                     tracing::error!(?error, "could not resume libinput");
                 }
+                self.scheduler.resume();
                 for device in self.devices.values_mut() {
-                    if let Err(error) = device.output_manager.activate(false) {
-                        tracing::error!(?error, "could not reactivate DRM device");
+                    match device.output_manager.activate(false) {
+                        Ok(()) => {
+                            device.active = true;
+                            for surface in device.outputs.values() {
+                                if self.state.output_is_powered(surface.output) {
+                                    self.scheduler.add_output(surface.output);
+                                    self.scheduler
+                                        .request(surface.output, RepaintReasons::FULL_REPAINT);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            device.active = false;
+                            for surface in device.outputs.values() {
+                                self.scheduler.remove_output(surface.output);
+                            }
+                            tracing::error!(?error, "could not reactivate DRM device");
+                        }
                     }
                 }
-                self.scheduler.resume();
+                for (node, path) in std::mem::take(&mut self.deferred_devices) {
+                    if let Err(error) = self.device_added(node, &path) {
+                        tracing::error!(?node, ?path, %error, "could not add deferred DRM device");
+                    }
+                }
                 tracing::info!("native session activated");
             }
             NativeEvent::Udev(UdevEvent::Added { device_id, path }) => {
                 match DrmNode::from_dev_id(device_id) {
                     Ok(node) => {
-                        if let Err(error) = self.device_added(node, &path) {
+                        if !self.session_active {
+                            self.deferred_devices.insert(node, path);
+                        } else if let Err(error) = self.device_added(node, &path) {
                             tracing::error!(?device_id, ?path, %error, "could not add DRM device");
                         }
                     }
@@ -289,12 +370,15 @@ impl NativeLoop {
                 }
             }
             NativeEvent::Udev(UdevEvent::Changed { device_id }) => {
-                if let Ok(node) = DrmNode::from_dev_id(device_id) {
+                if let Ok(node) = DrmNode::from_dev_id(device_id)
+                    && self.session_active
+                {
                     self.device_changed(node);
                 }
             }
             NativeEvent::Udev(UdevEvent::Removed { device_id }) => {
                 if let Ok(node) = DrmNode::from_dev_id(device_id) {
+                    self.deferred_devices.remove(&node);
                     self.device_removed(node);
                 }
             }
@@ -404,6 +488,7 @@ impl NativeLoop {
                 scanner: DrmScanner::new(),
                 registration,
                 outputs: HashMap::new(),
+                active: true,
             },
         );
         self.device_changed(node);
@@ -528,6 +613,8 @@ impl NativeLoop {
                                             },
                                             waiting_fence: None,
                                             exported_fence: None,
+                                            requested_power_mode: None,
+                                            committing_power_mode: None,
                                         },
                                     );
                                     self.scheduler.add_output(id);
@@ -621,6 +708,13 @@ impl NativeLoop {
             return;
         };
         if self.scheduler.presented(surface.output, frame.frame_id) {
+            if let Some(powered) = frame.power_mode {
+                surface.committing_power_mode = None;
+                self.state.confirm_output_power(surface.output, powered);
+                if !powered {
+                    self.scheduler.remove_output(surface.output);
+                }
+            }
             self.state
                 .lock_frame_presented(surface.output, frame.lock_generation);
             let frame_time = self.started.elapsed().as_millis() as u32;
@@ -675,6 +769,22 @@ impl NativeLoop {
                 .collect::<Vec<_>>();
         for (output, frame) in ready {
             if self.scheduler.presented(output, frame.frame_id) {
+                let power_mode = frame.power_mode;
+                if power_mode.is_some()
+                    && let Some(surface) = self
+                        .devices
+                        .values_mut()
+                        .flat_map(|device| device.outputs.values_mut())
+                        .find(|surface| surface.output == output)
+                {
+                    surface.committing_power_mode = None;
+                }
+                if let Some(powered) = power_mode {
+                    self.state.confirm_output_power(output, powered);
+                    if !powered {
+                        self.scheduler.remove_output(output);
+                    }
+                }
                 self.state
                     .lock_frame_presented(output, frame.lock_generation);
                 complete_frame_callbacks(
@@ -815,6 +925,7 @@ impl NativeLoop {
             queued: true,
             deadline: None,
             lock_generation: scanout.lock_generation,
+            power_mode: scanout.power_mode,
         });
     }
 
@@ -874,6 +985,7 @@ impl NativeLoop {
             self.scheduler.remove_output(output);
             return;
         };
+        let power_mode = surface.committing_power_mode;
         let clear = if self.state.session_is_locked() {
             Color32F::new(0.0, 0.0, 0.0, 1.0)
         } else {
@@ -893,6 +1005,7 @@ impl NativeLoop {
                         queued: false,
                         deadline: Some(Instant::now() + surface.retrace),
                         lock_generation,
+                        power_mode,
                     });
                 }
             }
@@ -908,6 +1021,7 @@ impl NativeLoop {
                     roots,
                     states: frame.states,
                     lock_generation,
+                    power_mode,
                 };
                 if let Some(fence_fd) = sync.as_ref().and_then(|sync| sync.export()) {
                     let mut callbacks = Some(callbacks);
@@ -985,6 +1099,7 @@ impl NativeLoop {
                             queued: true,
                             deadline: None,
                             lock_generation,
+                            power_mode,
                         });
                     }
                 }
@@ -1013,6 +1128,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     let handle = event_loop.handle();
     let display = Display::<Astera>::new()?;
     let mut state = Astera::new(&display.handle(), config);
+    state.enable_output_power_management();
     state.set_output_configuration_supported(false);
     state.watch_config(config_path);
     state.disconnect_output(astera_core::OutputId(0))?;
@@ -1103,6 +1219,8 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         wayland_ready_queued: false,
         ipc_ready_queued: false,
         config_changed_queued: false,
+        session_active: true,
+        deferred_devices: HashMap::new(),
         shutdown_deadline: None,
     };
     for (device_id, path) in initial_devices {

@@ -313,7 +313,12 @@ impl SessionLockHandler for Astera {
         let owner = confirmation.ext_session_lock().clone();
         self.next_lock_generation = self.next_lock_generation.wrapping_add(1).max(1);
         let generation = self.next_lock_generation;
-        let pending = self.output_runtime.keys().copied().collect::<BTreeSet<_>>();
+        let pending = self
+            .output_runtime
+            .keys()
+            .filter(|output| self.output_power_modes.get(output).copied().unwrap_or(true))
+            .copied()
+            .collect::<BTreeSet<_>>();
         if pending.is_empty() {
             confirmation.lock();
             self.session_state = SessionState::Locked { owner };
