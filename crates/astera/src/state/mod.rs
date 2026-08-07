@@ -25,6 +25,7 @@ mod scene;
 mod session_lock;
 #[cfg(test)]
 mod snapshot;
+mod touch;
 
 use activation::ActivationTracker;
 use clock::{Clock, SystemClock};
@@ -279,7 +280,7 @@ impl Astera {
             )
             .expect("default keyboard map must compile");
         let pointer = seat.add_pointer();
-        let touch = seat.add_touch();
+        let touch = touch::add_touch(&mut seat);
         let data_device_state = DataDeviceState::new::<Self>(display);
 
         let active_output = OutputId(0);
@@ -867,7 +868,7 @@ impl Astera {
         // Smithay 0.7 may retain already-framed slots on cancel. Replacing the handle is a
         // fail-closed workaround: old wl_touch resources become inert and cannot retain focus.
         self.protocol.seat.remove_touch();
-        self.protocol.touch = self.protocol.seat.add_touch();
+        self.protocol.touch = touch::add_touch(&mut self.protocol.seat);
         self.touch_slots.clear();
     }
 
