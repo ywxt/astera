@@ -31,9 +31,19 @@ use wayland_protocols::wp::{
         zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
         zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
     },
+    keyboard_shortcuts_inhibit::zv1::client::{
+        zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
+        zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
+    },
     pointer_constraints::zv1::client::{
         zwp_locked_pointer_v1::ZwpLockedPointerV1,
         zwp_pointer_constraints_v1::{self, ZwpPointerConstraintsV1},
+    },
+    pointer_gestures::zv1::client::{
+        zwp_pointer_gesture_hold_v1::ZwpPointerGestureHoldV1,
+        zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
+        zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1,
+        zwp_pointer_gestures_v1::ZwpPointerGesturesV1,
     },
     relative_pointer::zv1::client::{
         zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
@@ -109,6 +119,12 @@ delegate_noop!(TestClient: ignore ZwpRelativePointerManagerV1);
 delegate_noop!(TestClient: ignore ZwpRelativePointerV1);
 delegate_noop!(TestClient: ignore ZwpPointerConstraintsV1);
 delegate_noop!(TestClient: ignore ZwpLockedPointerV1);
+delegate_noop!(TestClient: ignore ZwpKeyboardShortcutsInhibitManagerV1);
+delegate_noop!(TestClient: ignore ZwpKeyboardShortcutsInhibitorV1);
+delegate_noop!(TestClient: ignore ZwpPointerGesturesV1);
+delegate_noop!(TestClient: ignore ZwpPointerGestureSwipeV1);
+delegate_noop!(TestClient: ignore ZwpPointerGesturePinchV1);
+delegate_noop!(TestClient: ignore ZwpPointerGestureHoldV1);
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
     fn event(
@@ -321,6 +337,12 @@ fn decoration_and_activation_globals_are_advertised() {
         let constraints = globals
             .bind::<ZwpPointerConstraintsV1, _, _>(&queue, 1..=1, ())
             .unwrap();
+        let shortcut_inhibit = globals
+            .bind::<ZwpKeyboardShortcutsInhibitManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let gestures = globals
+            .bind::<ZwpPointerGesturesV1, _, _>(&queue, 1..=3, ())
+            .unwrap();
         let _idle_notification = idle.get_idle_notification(0, &seat, &queue, ());
         let surface = compositor.create_surface(&queue, ());
         let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &queue, ());
@@ -332,6 +354,10 @@ fn decoration_and_activation_globals_are_advertised() {
             &queue,
             (),
         );
+        let _shortcut_inhibitor = shortcut_inhibit.inhibit_shortcuts(&surface, &seat, &queue, ());
+        let _swipe = gestures.get_swipe_gesture(&pointer, &queue, ());
+        let _pinch = gestures.get_pinch_gesture(&pointer, &queue, ());
+        let _hold = gestures.get_hold_gesture(&pointer, &queue, ());
         let _first_inhibitor = idle_inhibit.create_inhibitor(&surface, &queue, ());
         let _second_inhibitor = idle_inhibit.create_inhibitor(&surface, &queue, ());
         let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
@@ -359,6 +385,34 @@ fn decoration_and_activation_globals_are_advertised() {
             })
         })
     });
+    let inhibited_surface = state.windows[0].surface.wl_surface().clone();
+    let inhibitor = state
+        .seat
+        .keyboard_shortcuts_inhibitor_for_surface(&inhibited_surface)
+        .expect("client created shortcut inhibitor");
+    let keyboard = state.keyboard.clone();
+    let serial = state.next_serial();
+    keyboard.set_focus(&mut state, None, serial);
+    let seat_handle = state.seat.clone();
+    state.update_shortcut_inhibitor(&seat_handle, None);
+    assert!(!inhibitor.is_active());
+    let repeat_key = smithay::backend::input::Keycode::new(30);
+    state.key_repeat.intercept(repeat_key);
+    state.key_repeat.register(
+        repeat_key,
+        BindingModifiers::default(),
+        astera_config::Action::Quit,
+        100,
+        state.clock.now(),
+    );
+    let serial = state.next_serial();
+    keyboard.set_focus(&mut state, Some(inhibited_surface), serial);
+    assert!(inhibitor.is_active());
+    assert!(state.key_repeat.deadline().is_none());
+    let serial = state.next_serial();
+    keyboard.set_focus(&mut state, None, serial);
+    state.update_shortcut_inhibitor(&seat_handle, None);
+    assert!(!inhibitor.is_active());
     let constrained = state.windows[0].surface.wl_surface().clone();
     assert!(
         smithay::wayland::pointer_constraints::with_pointer_constraint(

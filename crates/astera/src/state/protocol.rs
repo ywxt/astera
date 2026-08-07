@@ -544,13 +544,60 @@ impl SeatHandler for Astera {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        self.update_shortcut_inhibitor(seat, focused);
+    }
 
     fn cursor_image(
         &mut self,
         _seat: &Seat<Self>,
         _image: smithay::input::pointer::CursorImageStatus,
     ) {
+    }
+}
+
+impl Astera {
+    pub(super) fn update_shortcut_inhibitor(
+        &mut self,
+        seat: &Seat<Self>,
+        focused: Option<&WlSurface>,
+    ) {
+        if let Some(inhibitor) = self.active_shortcut_inhibitor.take() {
+            if Some(inhibitor.wl_surface()) == focused {
+                self.active_shortcut_inhibitor = Some(inhibitor);
+                return;
+            }
+            inhibitor.inactivate();
+        }
+        if let Some(focused) = focused
+            && let Some(inhibitor) = seat.keyboard_shortcuts_inhibitor_for_surface(focused)
+        {
+            if !inhibitor.is_active() {
+                inhibitor.activate();
+            }
+            self.active_shortcut_inhibitor = Some(inhibitor);
+            self.key_repeat.cancel_repeats();
+        }
+    }
+}
+
+impl KeyboardShortcutsInhibitHandler for Astera {
+    fn keyboard_shortcuts_inhibit_state(&mut self) -> &mut KeyboardShortcutsInhibitState {
+        &mut self.keyboard_shortcuts_inhibit_state
+    }
+
+    fn new_inhibitor(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        if self.keyboard.current_focus().as_ref() == Some(inhibitor.wl_surface()) {
+            inhibitor.activate();
+            self.active_shortcut_inhibitor = Some(inhibitor);
+            self.key_repeat.cancel_repeats();
+        }
+    }
+
+    fn inhibitor_destroyed(&mut self, inhibitor: KeyboardShortcutsInhibitor) {
+        if self.active_shortcut_inhibitor.as_ref() == Some(&inhibitor) {
+            self.active_shortcut_inhibitor = None;
+        }
     }
 }
 
@@ -574,6 +621,8 @@ delegate_xdg_shell!(Astera);
 delegate_xdg_decoration!(Astera);
 delegate_xdg_activation!(Astera);
 delegate_idle_inhibit!(Astera);
+delegate_keyboard_shortcuts_inhibit!(Astera);
+delegate_pointer_gestures!(Astera);
 delegate_relative_pointer!(Astera);
 delegate_pointer_constraints!(Astera);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [

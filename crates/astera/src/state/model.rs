@@ -13,7 +13,9 @@ use smithay::{
         dmabuf::DmabufState,
         fractional_scale::FractionalScaleManagerState,
         idle_inhibit::IdleInhibitManagerState,
+        keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState,
         output::OutputManagerState,
+        pointer_gestures::PointerGesturesState,
         selection::data_device::DataDeviceState,
         shell::{
             wlr_layer::{Layer, WlrLayerShellState},
@@ -40,6 +42,8 @@ pub struct ProtocolState {
     pub(super) _fractional_scale_state: FractionalScaleManagerState,
     pub(super) _viewporter_state: ViewporterState,
     pub(super) _idle_inhibit_state: IdleInhibitManagerState,
+    pub(super) keyboard_shortcuts_inhibit_state: KeyboardShortcutsInhibitState,
+    pub(super) _pointer_gestures_state: PointerGesturesState,
     pub(super) _output_manager_state: OutputManagerState,
     pub(super) shm_state: ShmState,
     pub(super) seat_state: SeatState<Astera>,

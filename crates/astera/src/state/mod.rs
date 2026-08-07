@@ -54,8 +54,9 @@ use smithay::{
     backend::{
         allocator::{Format, dmabuf::Dmabuf},
         input::{
-            AbsolutePositionEvent, Axis, ButtonState as BackendButtonState, Event, InputBackend,
-            InputEvent, KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent,
+            AbsolutePositionEvent, Axis, ButtonState as BackendButtonState, Event,
+            GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent, GestureSwipeUpdateEvent,
+            InputBackend, InputEvent, KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent,
             PointerButtonEvent, PointerMotionEvent,
         },
         renderer::{
@@ -64,7 +65,8 @@ use smithay::{
         },
     },
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
-    delegate_idle_inhibit, delegate_layer_shell, delegate_output, delegate_pointer_constraints,
+    delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit, delegate_layer_shell,
+    delegate_output, delegate_pointer_constraints, delegate_pointer_gestures,
     delegate_relative_pointer, delegate_seat, delegate_shm, delegate_viewporter,
     delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
@@ -74,7 +76,13 @@ use smithay::{
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::{FilterResult, ModifiersState},
-        pointer::{AxisFrame, ButtonEvent, Focus as PointerFocusMode, MotionEvent},
+        pointer::{
+            AxisFrame, ButtonEvent, Focus as PointerFocusMode, GestureHoldBeginEvent,
+            GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
+            GesturePinchUpdateEvent as SmithayGesturePinchUpdateEvent, GestureSwipeBeginEvent,
+            GestureSwipeEndEvent, GestureSwipeUpdateEvent as SmithayGestureSwipeUpdateEvent,
+            MotionEvent,
+        },
     },
     output::{Mode, Output as SmithayOutput, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::{
@@ -94,8 +102,13 @@ use smithay::{
             FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
         },
         idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
+        keyboard_shortcuts_inhibit::{
+            KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
+            KeyboardShortcutsInhibitor, KeyboardShortcutsInhibitorSeat,
+        },
         output::{OutputHandler, OutputManagerState},
         pointer_constraints::PointerConstraintsState,
+        pointer_gestures::PointerGesturesState,
         relative_pointer::RelativePointerManagerState,
         selection::{
             SelectionHandler,
@@ -140,6 +153,7 @@ pub struct Astera {
     )>,
     drag: Option<DragState>,
     key_repeat: KeyRepeatState,
+    active_shortcut_inhibitor: Option<KeyboardShortcutsInhibitor>,
     clock: Arc<dyn Clock>,
     config: Config,
     config_source: Option<String>,
@@ -206,6 +220,8 @@ impl Astera {
         let fractional_scale_state = FractionalScaleManagerState::new::<Self>(display);
         let viewporter_state = ViewporterState::new::<Self>(display);
         let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(display);
+        let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(display);
+        let pointer_gestures_state = PointerGesturesState::new::<Self>(display);
         let session_lock_advertised = Arc::new(AtomicBool::new(true));
         let advertised = session_lock_advertised.clone();
         let session_lock_manager = SessionLockManagerState::new::<Self, _>(display, move |_| {
@@ -285,6 +301,8 @@ impl Astera {
                 _fractional_scale_state: fractional_scale_state,
                 _viewporter_state: viewporter_state,
                 _idle_inhibit_state: idle_inhibit_state,
+                keyboard_shortcuts_inhibit_state,
+                _pointer_gestures_state: pointer_gestures_state,
                 _output_manager_state: output_manager_state,
                 shm_state,
                 seat_state,
@@ -316,6 +334,7 @@ impl Astera {
             pointer_focus_origin: None,
             drag: None,
             key_repeat: KeyRepeatState::default(),
+            active_shortcut_inhibitor: None,
             clock,
             config,
             config_source: None,
@@ -470,6 +489,14 @@ impl Astera {
                 | InputEvent::PointerMotion { .. }
                 | InputEvent::PointerButton { .. }
                 | InputEvent::PointerAxis { .. }
+                | InputEvent::GestureSwipeBegin { .. }
+                | InputEvent::GestureSwipeUpdate { .. }
+                | InputEvent::GestureSwipeEnd { .. }
+                | InputEvent::GesturePinchBegin { .. }
+                | InputEvent::GesturePinchUpdate { .. }
+                | InputEvent::GesturePinchEnd { .. }
+                | InputEvent::GestureHoldBegin { .. }
+                | InputEvent::GestureHoldEnd { .. }
         );
         if is_activity {
             let events = self.idle_runtime.activity(0, self.clock.now());
@@ -498,6 +525,22 @@ impl Astera {
                         // The locker receives all keyboard input; compositor bindings must not
                         // launch programs or mutate the hidden desktop while locked.
                         if state.session_is_locked() {
+                            if !pressed
+                                && state.key_repeat.release(
+                                    key_code,
+                                    state.config.key_repeat.rate,
+                                    state.clock.now(),
+                                )
+                            {
+                                return FilterResult::Intercept(());
+                            }
+                            return FilterResult::Forward;
+                        }
+                        if state.seat.keyboard_shortcuts_inhibited() {
+                            state.key_repeat.cancel_repeats();
+                            // A shortcut press consumed before inhibition must retain its consumed
+                            // release; forwarding only that release would give the client an
+                            // impossible key sequence.
                             if !pressed
                                 && state.key_repeat.release(
                                     key_code,
@@ -549,6 +592,103 @@ impl Astera {
                 self.handle_absolute_pointer_motion(location, event.time_msec());
             }
             InputEvent::PointerMotion { event } => self.handle_relative_pointer_motion(event),
+            InputEvent::GestureSwipeBegin { event } => {
+                self.handle_absolute_pointer_motion(self.pointer_location, event.time_msec());
+                let pointer = self.pointer.clone();
+                let serial = self.next_serial();
+                pointer.gesture_swipe_begin(
+                    self,
+                    &GestureSwipeBeginEvent {
+                        serial,
+                        time: event.time_msec(),
+                        fingers: event.fingers(),
+                    },
+                );
+            }
+            InputEvent::GestureSwipeUpdate { event } => {
+                let pointer = self.pointer.clone();
+                pointer.gesture_swipe_update(
+                    self,
+                    &SmithayGestureSwipeUpdateEvent {
+                        time: event.time_msec(),
+                        delta: event.delta(),
+                    },
+                );
+            }
+            InputEvent::GestureSwipeEnd { event } => {
+                let pointer = self.pointer.clone();
+                let serial = self.next_serial();
+                pointer.gesture_swipe_end(
+                    self,
+                    &GestureSwipeEndEvent {
+                        serial,
+                        time: event.time_msec(),
+                        cancelled: event.cancelled(),
+                    },
+                );
+            }
+            InputEvent::GesturePinchBegin { event } => {
+                self.handle_absolute_pointer_motion(self.pointer_location, event.time_msec());
+                let pointer = self.pointer.clone();
+                let serial = self.next_serial();
+                pointer.gesture_pinch_begin(
+                    self,
+                    &GesturePinchBeginEvent {
+                        serial,
+                        time: event.time_msec(),
+                        fingers: event.fingers(),
+                    },
+                );
+            }
+            InputEvent::GesturePinchUpdate { event } => {
+                let pointer = self.pointer.clone();
+                pointer.gesture_pinch_update(
+                    self,
+                    &SmithayGesturePinchUpdateEvent {
+                        time: event.time_msec(),
+                        delta: event.delta(),
+                        scale: event.scale(),
+                        rotation: event.rotation(),
+                    },
+                );
+            }
+            InputEvent::GesturePinchEnd { event } => {
+                let pointer = self.pointer.clone();
+                let serial = self.next_serial();
+                pointer.gesture_pinch_end(
+                    self,
+                    &GesturePinchEndEvent {
+                        serial,
+                        time: event.time_msec(),
+                        cancelled: event.cancelled(),
+                    },
+                );
+            }
+            InputEvent::GestureHoldBegin { event } => {
+                self.handle_absolute_pointer_motion(self.pointer_location, event.time_msec());
+                let pointer = self.pointer.clone();
+                let serial = self.next_serial();
+                pointer.gesture_hold_begin(
+                    self,
+                    &GestureHoldBeginEvent {
+                        serial,
+                        time: event.time_msec(),
+                        fingers: event.fingers(),
+                    },
+                );
+            }
+            InputEvent::GestureHoldEnd { event } => {
+                let pointer = self.pointer.clone();
+                let serial = self.next_serial();
+                pointer.gesture_hold_end(
+                    self,
+                    &GestureHoldEndEvent {
+                        serial,
+                        time: event.time_msec(),
+                        cancelled: event.cancelled(),
+                    },
+                );
+            }
             InputEvent::PointerButton { event } => self.handle_pointer_button(
                 event.button(),
                 event.button_code(),
@@ -1005,7 +1145,7 @@ impl Astera {
     }
 
     pub fn process_key_repeats(&mut self) {
-        if self.session_is_locked() {
+        if self.session_is_locked() || self.seat.keyboard_shortcuts_inhibited() {
             self.key_repeat.cancel_repeats();
             return;
         }

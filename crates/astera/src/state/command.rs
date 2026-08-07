@@ -226,7 +226,10 @@ impl Astera {
         }
         let keyboard = self.keyboard.clone();
         let serial = self.next_serial();
-        keyboard.set_focus(self, target, serial);
+        keyboard.set_focus(self, target.clone(), serial);
+        // Smithay's keyboard callback is not invoked when focus becomes None.
+        let seat = self.seat.clone();
+        self.update_shortcut_inhibitor(&seat, target.as_ref());
     }
 
     fn resolve_output(&self, selector: OutputSelector) -> Result<OutputId, CommandError> {
