@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 use astera_core::{OutputId, Point, WindowId, WindowMode};
 use smithay::{
     desktop::{LayerSurface, PopupManager},
-    input::{Seat, SeatState, keyboard::KeyboardHandle, pointer::PointerHandle},
+    input::{
+        Seat, SeatState, keyboard::KeyboardHandle, pointer::PointerHandle, touch::TouchHandle,
+    },
     output::Output as SmithayOutput,
     reexports::wayland_server::{
         DisplayHandle, backend::GlobalId, protocol::wl_surface::WlSurface,
@@ -53,6 +55,7 @@ pub struct ProtocolState {
     pub(super) seat: Seat<Astera>,
     pub(super) keyboard: KeyboardHandle<Astera>,
     pub(super) pointer: PointerHandle<Astera>,
+    pub(super) touch: TouchHandle<Astera>,
     pub(super) idle_inhibitors: HashMap<WlSurface, usize>,
 }
 

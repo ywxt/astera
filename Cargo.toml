@@ -27,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 smithay = { version = "0.7", default-features = false, features = ["backend_drm", "backend_gbm", "backend_libinput", "backend_session_libseat", "backend_udev", "backend_winit", "desktop", "renderer_gl", "renderer_multi", "renderer_pixman", "wayland_frontend"] }
 smithay-drm-extras = { version = "0.1", default-features = false }
+input = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 winit = { version = "0.30", default-features = false, features = ["wayland", "x11", "rwh_06"] }

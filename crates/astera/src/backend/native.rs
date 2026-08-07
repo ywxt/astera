@@ -21,7 +21,7 @@ use smithay::{
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
         },
         egl::context::ContextPriority,
-        input::InputEvent as BackendInputEvent,
+        input::{Device as _, Event as _, InputEvent as BackendInputEvent},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             Color32F, ImportDma,
@@ -300,6 +300,19 @@ impl NativeLoop {
         let mut scene_changed = false;
         match event {
             NativeEvent::Input(event) => {
+                let touch_device = match &event {
+                    BackendInputEvent::TouchDown { event } => Some(event.device()),
+                    BackendInputEvent::TouchMotion { event } => Some(event.device()),
+                    BackendInputEvent::TouchUp { event } => Some(event.device()),
+                    BackendInputEvent::TouchCancel { event } => Some(event.device()),
+                    BackendInputEvent::TouchFrame { event } => Some(event.device()),
+                    _ => None,
+                };
+                if let Some(device) = touch_device
+                    && let Some(output) = device.output_name()
+                {
+                    self.state.bind_touch_device_output(device.id(), output);
+                }
                 self.state.process_input(event);
                 scene_changed = true;
             }
@@ -567,6 +580,8 @@ impl NativeLoop {
                     );
                     match self.state.connect_output(output) {
                         Ok(()) => {
+                            self.state.register_output_alias(name.clone(), id);
+                            self.state.register_output_alias(plan.connector.clone(), id);
                             let protocol_output = self
                                 .state
                                 .protocol_output(id)

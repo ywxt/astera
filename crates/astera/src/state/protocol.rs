@@ -231,12 +231,20 @@ impl CompositorHandler for Astera {
             .find(|mapped| mapped.surface.wl_surface() == surface)
             .map(|mapped| mapped.surface.clone())
         {
+            let was_mapped = self
+                .layers
+                .iter()
+                .find(|mapped| mapped.surface == layer)
+                .is_some_and(|mapped| mapped.mapped);
             if let Some(mapped) = self.layers.iter().find(|mapped| mapped.surface == layer)
                 && let Some(runtime) = self.output_runtime.get(&mapped.output)
             {
                 layer_map_for_output(&runtime.wayland).arrange();
             }
             let has_buffer = committed_buffer;
+            if was_mapped && !has_buffer {
+                self.cancel_touch_sequences();
+            }
             if let Some(mapped) = self
                 .layers
                 .iter_mut()
@@ -309,6 +317,7 @@ impl WlrLayerShellHandler for Astera {
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
+        self.cancel_touch_sequences();
         if let Some(mapped) = self
             .layers
             .iter()
@@ -491,6 +500,7 @@ impl XdgShellHandler for Astera {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        self.cancel_touch_sequences();
         let Some(index) = self
             .windows
             .iter()

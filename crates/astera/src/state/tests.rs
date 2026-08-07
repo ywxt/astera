@@ -301,6 +301,7 @@ fn session_lock_is_fail_closed_before_confirmation_and_after_disconnect() {
 fn decoration_and_activation_globals_are_advertised() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
+    assert!(state.seat.get_touch().is_some());
     let (server_socket, client_socket) = UnixStream::pair().unwrap();
     display
         .handle()
@@ -811,4 +812,24 @@ fn pointer_crosses_outputs_but_compositor_drag_stays_local() {
 fn fractional_output_converts_logical_origins_to_physical_pixels() {
     let physical = physical_point(Point::new(101, -25), 1.5);
     assert_eq!(physical, (152, -38).into());
+}
+
+#[test]
+fn touch_routing_is_stable_and_cancel_replaces_buggy_handle() {
+    let display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    state.register_output_alias("HDMI-A-1".into(), OutputId(0));
+    state.bind_touch_device_output("touchscreen".into(), "HDMI-A-1");
+    assert_eq!(
+        state.touch_output_for_device("touchscreen"),
+        Some(OutputId(0))
+    );
+    assert_ne!(state.allocate_touch_slot(), state.allocate_touch_slot());
+
+    state
+        .touch_slots
+        .insert(("touchscreen".into(), 7), (OutputId(0), Some(42).into()));
+    state.cancel_touch_sequences();
+    assert!(state.touch_slots.is_empty());
+    assert!(state.seat.get_touch().is_some());
 }

@@ -141,6 +141,7 @@ dependencies = [
  "astera-core",
  "astera-ipc",
  "clap",
+ "input",
  "rustix 1.1.4",
  "serde_json",
  "smithay",
@@ -768,6 +769,7 @@ dependencies = [
  "bitflags 2.13.1",
  "input-sys",
  "libc",
+ "log",
  "udev",
 ]
 

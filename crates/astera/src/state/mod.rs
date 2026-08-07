@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ops::{Deref, DerefMut},
     os::fd::OwnedFd,
     sync::{
@@ -54,10 +54,10 @@ use smithay::{
     backend::{
         allocator::{Format, dmabuf::Dmabuf},
         input::{
-            AbsolutePositionEvent, Axis, ButtonState as BackendButtonState, Event,
+            AbsolutePositionEvent, Axis, ButtonState as BackendButtonState, Device, Event,
             GestureBeginEvent, GestureEndEvent, GesturePinchUpdateEvent, GestureSwipeUpdateEvent,
             InputBackend, InputEvent, KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent,
-            PointerButtonEvent, PointerMotionEvent,
+            PointerButtonEvent, PointerMotionEvent, TouchEvent,
         },
         renderer::{
             ImportDma,
@@ -83,6 +83,7 @@ use smithay::{
             GestureSwipeEndEvent, GestureSwipeUpdateEvent as SmithayGestureSwipeUpdateEvent,
             MotionEvent,
         },
+        touch::{DownEvent, MotionEvent as SmithayTouchMotionEvent, UpEvent},
     },
     output::{Mode, Output as SmithayOutput, PhysicalProperties, Scale, Subpixel},
     reexports::wayland_server::{
@@ -154,6 +155,11 @@ pub struct Astera {
     drag: Option<DragState>,
     key_repeat: KeyRepeatState,
     active_shortcut_inhibitor: Option<KeyboardShortcutsInhibitor>,
+    touch_device_outputs: HashMap<String, OutputId>,
+    output_aliases: HashMap<String, OutputId>,
+    ambiguous_output_aliases: HashSet<String>,
+    touch_slots: HashMap<(String, i32), (OutputId, smithay::backend::input::TouchSlot)>,
+    next_touch_slot: u32,
     clock: Arc<dyn Clock>,
     config: Config,
     config_source: Option<String>,
@@ -273,6 +279,7 @@ impl Astera {
             )
             .expect("default keyboard map must compile");
         let pointer = seat.add_pointer();
+        let touch = seat.add_touch();
         let data_device_state = DataDeviceState::new::<Self>(display);
 
         let active_output = OutputId(0);
@@ -312,6 +319,7 @@ impl Astera {
                 seat,
                 keyboard,
                 pointer,
+                touch,
                 idle_inhibitors: std::collections::HashMap::new(),
             },
             output_runtime: BTreeMap::from([(
@@ -335,6 +343,11 @@ impl Astera {
             drag: None,
             key_repeat: KeyRepeatState::default(),
             active_shortcut_inhibitor: None,
+            touch_device_outputs: HashMap::new(),
+            output_aliases: HashMap::new(),
+            ambiguous_output_aliases: HashSet::new(),
+            touch_slots: HashMap::new(),
+            next_touch_slot: 0,
             clock,
             config,
             config_source: None,
@@ -444,6 +457,7 @@ impl Astera {
 
     #[allow(dead_code)] // Used by the native backend's hotplug path.
     pub fn disconnect_output(&mut self, output: OutputId) -> Result<(), astera_core::DesktopError> {
+        self.cancel_touch_sequences();
         let event = self.desktop.disconnect_output(output)?;
         let runtime = self
             .output_runtime
@@ -468,6 +482,9 @@ impl Astera {
         self.layers.retain(|mapped| mapped.output != output);
         self.session_output_disconnected(output);
         self.output_power_disconnected(output);
+        self.output_aliases.retain(|_, mapped| *mapped != output);
+        self.touch_device_outputs
+            .retain(|_, mapped| *mapped != output);
         if self.active_output == output
             && let Some(next) = self.desktop.outputs.keys().next().copied()
         {
@@ -497,6 +514,11 @@ impl Astera {
                 | InputEvent::GesturePinchEnd { .. }
                 | InputEvent::GestureHoldBegin { .. }
                 | InputEvent::GestureHoldEnd { .. }
+                | InputEvent::TouchDown { .. }
+                | InputEvent::TouchMotion { .. }
+                | InputEvent::TouchUp { .. }
+                | InputEvent::TouchCancel { .. }
+                | InputEvent::TouchFrame { .. }
         );
         if is_activity {
             let events = self.idle_runtime.activity(0, self.clock.now());
@@ -689,6 +711,90 @@ impl Astera {
                     },
                 );
             }
+            InputEvent::TouchDown { event } => {
+                let device = event.device().id();
+                let slot = i32::from(event.slot());
+                let Some(output) = self.touch_output_for_device(&device) else {
+                    tracing::warn!(%device, "ignoring unmapped touch device on multi-output desktop");
+                    return;
+                };
+                let synthetic_slot = self.allocate_touch_slot();
+                self.touch_slots
+                    .insert((device, slot), (output, synthetic_slot));
+                let size = self.desktop.outputs[&output].output.logical_size;
+                let location = event.position_transformed(
+                    (saturating_i32(size.width), saturating_i32(size.height)).into(),
+                );
+                let previous_output = self.active_output;
+                self.active_output = output;
+                let focus = self
+                    .surface_under(location)
+                    .map(|(surface, origin, _)| (surface, origin));
+                self.active_output = previous_output;
+                let touch = self.touch.clone();
+                let serial = self.next_serial();
+                touch.down(
+                    self,
+                    focus,
+                    &DownEvent {
+                        slot: synthetic_slot,
+                        location,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+            }
+            InputEvent::TouchMotion { event } => {
+                let key = (event.device().id(), i32::from(event.slot()));
+                let Some((output, synthetic_slot)) = self.touch_slots.get(&key).copied() else {
+                    return;
+                };
+                let size = self.desktop.outputs[&output].output.logical_size;
+                let location = event.position_transformed(
+                    (saturating_i32(size.width), saturating_i32(size.height)).into(),
+                );
+                let previous_output = self.active_output;
+                self.active_output = output;
+                let focus = self
+                    .surface_under(location)
+                    .map(|(surface, origin, _)| (surface, origin));
+                self.active_output = previous_output;
+                let touch = self.touch.clone();
+                touch.motion(
+                    self,
+                    focus,
+                    &SmithayTouchMotionEvent {
+                        slot: synthetic_slot,
+                        location,
+                        time: event.time_msec(),
+                    },
+                );
+            }
+            InputEvent::TouchUp { event } => {
+                let Some((_, synthetic_slot)) = self
+                    .touch_slots
+                    .remove(&(event.device().id(), i32::from(event.slot())))
+                else {
+                    return;
+                };
+                let touch = self.touch.clone();
+                let serial = self.next_serial();
+                touch.up(
+                    self,
+                    &UpEvent {
+                        slot: synthetic_slot,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
+            }
+            InputEvent::TouchCancel { .. } => {
+                self.cancel_touch_sequences();
+            }
+            InputEvent::TouchFrame { .. } => {
+                let touch = self.touch.clone();
+                touch.frame(self);
+            }
             InputEvent::PointerButton { event } => self.handle_pointer_button(
                 event.button(),
                 event.button_code(),
@@ -698,6 +804,71 @@ impl Astera {
             InputEvent::PointerAxis { event } => self.handle_pointer_axis(event),
             _ => {}
         }
+    }
+
+    pub fn bind_touch_device_output(&mut self, device: String, output_key: &str) {
+        let output = self.output_aliases.get(output_key).copied().or_else(|| {
+            self.desktop
+                .outputs
+                .iter()
+                .find_map(|(id, output)| (output.output.stable_key == output_key).then_some(*id))
+        });
+        if let Some(output) = output {
+            self.touch_device_outputs.insert(device, output);
+        }
+    }
+
+    pub fn register_output_alias(&mut self, alias: String, output: OutputId) {
+        if !self.desktop.outputs.contains_key(&output)
+            || self.ambiguous_output_aliases.contains(&alias)
+        {
+            return;
+        }
+        if self
+            .output_aliases
+            .get(&alias)
+            .is_some_and(|existing| *existing != output)
+        {
+            self.output_aliases.remove(&alias);
+            self.ambiguous_output_aliases.insert(alias);
+        } else {
+            self.output_aliases.insert(alias, output);
+        }
+    }
+
+    fn touch_output_for_device(&self, device: &str) -> Option<OutputId> {
+        self.touch_device_outputs
+            .get(device)
+            .copied()
+            .filter(|output| self.desktop.outputs.contains_key(output))
+            .or_else(|| (self.desktop.outputs.len() == 1).then_some(self.active_output))
+    }
+
+    fn allocate_touch_slot(&mut self) -> smithay::backend::input::TouchSlot {
+        loop {
+            let slot = Some(self.next_touch_slot).into();
+            self.next_touch_slot = self.next_touch_slot.wrapping_add(1);
+            if self
+                .touch_slots
+                .values()
+                .all(|(_, active_slot)| *active_slot != slot)
+            {
+                return slot;
+            }
+        }
+    }
+
+    pub(super) fn cancel_touch_sequences(&mut self) {
+        if self.touch_slots.is_empty() {
+            return;
+        }
+        let touch = self.touch.clone();
+        touch.cancel(self);
+        // Smithay 0.7 may retain already-framed slots on cancel. Replacing the handle is a
+        // fail-closed workaround: old wl_touch resources become inert and cannot retain focus.
+        self.protocol.seat.remove_touch();
+        self.protocol.touch = self.protocol.seat.add_touch();
+        self.touch_slots.clear();
     }
 
     fn handle_pointer_motion(
@@ -1490,6 +1661,7 @@ impl Astera {
     }
 
     fn unmap_toplevel(&mut self, index: usize) {
+        self.cancel_touch_sequences();
         let id = self.windows[index].id;
         if let Ok(workspace) = self.desktop.find_window(id)
             && let Err(error) = self
