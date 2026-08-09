@@ -11,6 +11,7 @@ use std::{
 mod activation;
 mod clock;
 mod config_watcher;
+pub(crate) mod cursor;
 mod event_hub;
 mod geometry;
 mod idle;
@@ -25,6 +26,7 @@ mod scene;
 mod session_lock;
 #[cfg(test)]
 mod snapshot;
+mod tablet_input;
 mod touch;
 
 use activation::ActivationTracker;
@@ -65,11 +67,11 @@ use smithay::{
             utils::{on_commit_buffer_handler, with_renderer_surface_state},
         },
     },
-    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_fractional_scale,
-    delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit, delegate_layer_shell,
-    delegate_output, delegate_pointer_constraints, delegate_pointer_gestures,
-    delegate_relative_pointer, delegate_seat, delegate_shm, delegate_viewporter,
-    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
+    delegate_fractional_scale, delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit,
+    delegate_layer_shell, delegate_output, delegate_pointer_constraints, delegate_pointer_gestures,
+    delegate_relative_pointer, delegate_seat, delegate_shm, delegate_tablet_manager,
+    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -99,6 +101,7 @@ use smithay::{
             CompositorClientState, CompositorHandler, CompositorState, TraversalAction,
             with_states, with_surface_tree_downward,
         },
+        cursor_shape::CursorShapeManagerState,
         dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         fractional_scale::{
             FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
@@ -129,6 +132,7 @@ use smithay::{
             decoration::{XdgDecorationHandler, XdgDecorationState},
         },
         shm::{ShmHandler, ShmState},
+        tablet_manager::{TabletManagerState, TabletSeatHandler},
         viewporter::ViewporterState,
         xdg_activation::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
@@ -148,6 +152,9 @@ pub struct Astera {
     next_window_id: u64,
     next_layer_id: u64,
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
+    cursor_image_status: smithay::input::pointer::CursorImageStatus,
+    named_cursors: HashMap<(smithay::input::pointer::CursorIcon, u32), cursor::NamedCursor>,
+    active_tablet_cursor: Option<smithay::backend::input::TabletToolDescriptor>,
     pointer_focus_origin: Option<(
         WlSurface,
         SmithayPoint<f64, smithay::utils::Logical>,
@@ -161,6 +168,11 @@ pub struct Astera {
     ambiguous_output_aliases: HashSet<String>,
     touch_slots: HashMap<(String, i32), (OutputId, smithay::backend::input::TouchSlot)>,
     next_touch_slot: u32,
+    tablets: HashMap<String, (smithay::wayland::tablet_manager::TabletDescriptor, smithay::wayland::tablet_manager::TabletHandle)>,
+    tablet_tools: HashMap<
+        smithay::backend::input::TabletToolDescriptor,
+        tablet_input::TabletToolRuntime,
+    >,
     clock: Arc<dyn Clock>,
     config: Config,
     config_source: Option<String>,
@@ -229,6 +241,8 @@ impl Astera {
         let idle_inhibit_state = IdleInhibitManagerState::new::<Self>(display);
         let keyboard_shortcuts_inhibit_state = KeyboardShortcutsInhibitState::new::<Self>(display);
         let pointer_gestures_state = PointerGesturesState::new::<Self>(display);
+        let tablet_manager_state = TabletManagerState::new::<Self>(display);
+        let cursor_shape_state = CursorShapeManagerState::new::<Self>(display);
         let session_lock_advertised = Arc::new(AtomicBool::new(true));
         let advertised = session_lock_advertised.clone();
         let session_lock_manager = SessionLockManagerState::new::<Self, _>(display, move |_| {
@@ -311,6 +325,8 @@ impl Astera {
                 _idle_inhibit_state: idle_inhibit_state,
                 keyboard_shortcuts_inhibit_state,
                 _pointer_gestures_state: pointer_gestures_state,
+                _tablet_manager_state: tablet_manager_state,
+                _cursor_shape_state: cursor_shape_state,
                 _output_manager_state: output_manager_state,
                 shm_state,
                 seat_state,
@@ -340,6 +356,14 @@ impl Astera {
             next_window_id: 1,
             next_layer_id: 1,
             pointer_location: (0.0, 0.0).into(),
+            cursor_image_status: smithay::input::pointer::CursorImageStatus::Named(
+                smithay::input::pointer::CursorIcon::Default,
+            ),
+            named_cursors: HashMap::from([(
+                (smithay::input::pointer::CursorIcon::Default, 120),
+                cursor::load_named_cursor(smithay::input::pointer::CursorIcon::Default, 120),
+            )]),
+            active_tablet_cursor: None,
             pointer_focus_origin: None,
             drag: None,
             key_repeat: KeyRepeatState::default(),
@@ -349,6 +373,8 @@ impl Astera {
             ambiguous_output_aliases: HashSet::new(),
             touch_slots: HashMap::new(),
             next_touch_slot: 0,
+            tablets: HashMap::new(),
+            tablet_tools: HashMap::new(),
             clock,
             config,
             config_source: None,
@@ -458,7 +484,7 @@ impl Astera {
 
     #[allow(dead_code)] // Used by the native backend's hotplug path.
     pub fn disconnect_output(&mut self, output: OutputId) -> Result<(), astera_core::DesktopError> {
-        self.cancel_touch_sequences();
+        self.cancel_surface_bound_input();
         let event = self.desktop.disconnect_output(output)?;
         let runtime = self
             .output_runtime
@@ -520,10 +546,27 @@ impl Astera {
                 | InputEvent::TouchUp { .. }
                 | InputEvent::TouchCancel { .. }
                 | InputEvent::TouchFrame { .. }
+                | InputEvent::TabletToolAxis { .. }
+                | InputEvent::TabletToolProximity { .. }
+                | InputEvent::TabletToolTip { .. }
+                | InputEvent::TabletToolButton { .. }
         );
         if is_activity {
             let events = self.idle_runtime.activity(0, self.clock.now());
             self.send_idle_events(events);
+        }
+        // Device lifecycle must remain correct while headless; otherwise unplugging the last
+        // output can leave stale tablet protocol objects and routing state behind.
+        match &event {
+            InputEvent::DeviceAdded { device } => {
+                self.tablet_device_added(device);
+                return;
+            }
+            InputEvent::DeviceRemoved { device } => {
+                self.tablet_device_removed(device);
+                return;
+            }
+            _ => {}
         }
         if !self.desktop.outputs.contains_key(&self.active_output) {
             return;
@@ -796,6 +839,10 @@ impl Astera {
                 let touch = self.touch.clone();
                 touch.frame(self);
             }
+            InputEvent::TabletToolProximity { event } => self.handle_tablet_proximity(event),
+            InputEvent::TabletToolAxis { event } => self.handle_tablet_axis(event),
+            InputEvent::TabletToolTip { event } => self.handle_tablet_tip(event),
+            InputEvent::TabletToolButton { event } => self.handle_tablet_button(event),
             InputEvent::PointerButton { event } => self.handle_pointer_button(
                 event.button(),
                 event.button_code(),
@@ -872,12 +919,22 @@ impl Astera {
         self.touch_slots.clear();
     }
 
+    pub(super) fn cancel_surface_bound_input(&mut self) {
+        self.cancel_touch_sequences();
+        self.cancel_tablet_focus(0);
+    }
+
     fn handle_pointer_motion(
         &mut self,
         location: SmithayPoint<f64, smithay::utils::Logical>,
         time: u32,
     ) {
         self.pointer_location = location;
+        let changed_owner = self.active_tablet_cursor.take().is_some();
+        self.mark_render_dirty();
+        if changed_owner {
+            self.refresh_visible_scales();
+        }
         // During compositor grabs, clients do not receive motion; the pending tiled placement is
         // committed only on release so the radial solver does not run for every pointer sample.
         if self.drag.is_some() {
@@ -972,6 +1029,10 @@ impl Astera {
     }
 
     fn handle_pointer_axis<B: InputBackend, E: PointerAxisEvent<B>>(&mut self, event: E) {
+        if self.active_tablet_cursor.take().is_some() {
+            self.mark_render_dirty();
+            self.refresh_visible_scales();
+        }
         if self.session_is_locked() {
             self.handle_pointer_motion(self.pointer_location, event.time_msec());
         }
@@ -1048,6 +1109,7 @@ impl Astera {
                 "pointer crossed output boundary"
             );
             self.sync_keyboard_focus();
+            self.refresh_visible_scales();
             self.mark_public_dirty();
         }
         location
@@ -1073,6 +1135,10 @@ impl Astera {
         state: BackendButtonState,
         time: u32,
     ) {
+        if self.active_tablet_cursor.take().is_some() {
+            self.mark_render_dirty();
+            self.refresh_visible_scales();
+        }
         let compositor_drag = !self.session_is_locked()
             && button == Some(MouseButton::Left)
             && (self.drag.is_some() || self.keyboard.modifier_state().logo);
@@ -1662,7 +1728,7 @@ impl Astera {
     }
 
     fn unmap_toplevel(&mut self, index: usize) {
-        self.cancel_touch_sequences();
+        self.cancel_surface_bound_input();
         let id = self.windows[index].id;
         if let Ok(workspace) = self.desktop.find_window(id)
             && let Err(error) = self

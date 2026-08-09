@@ -50,6 +50,9 @@ impl Astera {
                 update_tree(popup.wl_surface());
             }
         }
+        if let Some(cursor) = self.cursor_surface_for_output(output) {
+            update_tree(&cursor);
+        }
         if let Some(runtime) = self.output_runtime.get_mut(&output) {
             runtime.presented_surfaces = presented;
         }
@@ -326,6 +329,9 @@ impl Astera {
                     .map(|(surface, _, _)| surface)
                     .collect::<Vec<_>>();
                 let mut visible = HashSet::new();
+                if let Some(cursor) = self.cursor_surface_for_output(output) {
+                    extend_surface_tree(&mut visible, &cursor);
+                }
                 for root in roots {
                     for (popup, _) in PopupManager::popups_for_surface(&root) {
                         extend_surface_tree(&mut visible, popup.wl_surface());

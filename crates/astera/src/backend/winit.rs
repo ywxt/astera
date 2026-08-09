@@ -12,7 +12,10 @@ use smithay::{
         renderer::{
             Color32F, ImportDma,
             damage::OutputDamageTracker,
-            element::{Kind, surface::WaylandSurfaceRenderElement},
+            element::{
+                Kind, memory::MemoryRenderBufferRenderElement, render_elements,
+                surface::WaylandSurfaceRenderElement,
+            },
             gles::GlesRenderer,
         },
         winit::{self, WinitEvent, WinitGraphicsBackend},
@@ -28,8 +31,14 @@ use crate::{
         sources::{ReadableFdSource, WaylandSocketSource},
     },
     ipc_server::IpcServer,
-    state::{Astera, ClientState},
+    state::{Astera, ClientState, cursor::CursorRenderSource},
 };
+
+render_elements! {
+    WinitRenderElement<=GlesRenderer>;
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
+    Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
+}
 
 const MAX_EVENTS_PER_BATCH: usize = 256;
 const MAX_QUEUED_SOURCE_EVENTS: usize = 4096;
@@ -256,7 +265,7 @@ impl WinitLoop {
             let (renderer, mut framebuffer) = self.backend.bind()?;
             tracing::trace!("nested framebuffer bound");
             self.state.validate_dmabuf_imports(renderer);
-            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = roots
+            let mut elements: Vec<WinitRenderElement> = roots
                 .iter()
                 .flat_map(|(surface, location, scale)| {
                     let mut elements = Vec::new();
@@ -276,7 +285,7 @@ impl WinitLoop {
                             Kind::Unspecified,
                             &mut frame_callbacks,
                         );
-                        elements.extend(popup_elements);
+                        elements.extend(popup_elements.into_iter().map(Into::into));
                     }
                     let root_elements = surface_tree_snapshot(
                         renderer,
@@ -287,10 +296,47 @@ impl WinitLoop {
                         Kind::Unspecified,
                         &mut frame_callbacks,
                     );
-                    elements.extend(root_elements);
+                    elements.extend(root_elements.into_iter().map(Into::into));
                     elements
                 })
                 .collect();
+            if let Some(cursor) = self.state.cursor_render_source(astera_core::OutputId(0)) {
+                match cursor {
+                    CursorRenderSource::Surface {
+                        surface,
+                        location,
+                        scale,
+                    } => {
+                        let cursor_elements = surface_tree_snapshot(
+                            renderer,
+                            &surface,
+                            location,
+                            scale,
+                            1.0,
+                            Kind::Cursor,
+                            &mut frame_callbacks,
+                        );
+                        elements.splice(0..0, cursor_elements.into_iter().map(Into::into));
+                    }
+                    CursorRenderSource::Memory {
+                        buffer,
+                        location,
+                        size,
+                        source_size,
+                    } => {
+                        let element = MemoryRenderBufferRenderElement::from_buffer(
+                            renderer,
+                            location,
+                            &buffer,
+                            None,
+                            Some(smithay::utils::Rectangle::from_size(source_size.to_f64())),
+                            Some(size),
+                            Kind::Cursor,
+                        )?;
+                        elements.insert(0, element.into());
+                    }
+                }
+            }
             tracing::trace!(
                 elements = elements.len(),
                 "nested render elements collected"
@@ -374,6 +420,9 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         .into_owned();
     let (mut backend, winit_events) =
         winit::init::<GlesRenderer>().map_err(|error| anyhow!(error.to_string()))?;
+    // Astera composites the same cursor path as the native backend. Leaving winit's host cursor
+    // visible would produce two cursors with unrelated shapes and hotspots inside the window.
+    backend.window().set_cursor_visible(false);
     // Capability discovery does not require binding the not-yet-configured host
     // EGL surface; doing so here can produce EGL_BAD_SURFACE on Wayland hosts.
     state.enable_dmabuf(backend.renderer().dmabuf_formats());

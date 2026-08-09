@@ -24,8 +24,11 @@ use smithay::{
         input::{Device as _, Event as _, InputEvent as BackendInputEvent},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            Color32F, ImportDma,
-            element::{Kind, RenderElementStates, surface::WaylandSurfaceRenderElement},
+            Color32F, ImportAll, ImportDma, ImportMem,
+            element::{
+                Kind, RenderElementStates, memory::MemoryRenderBufferRenderElement,
+                render_elements, surface::WaylandSurfaceRenderElement,
+            },
             gles::GlesRenderer,
             multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
             sync::SyncPoint,
@@ -53,7 +56,7 @@ use crate::{
         sources::{OneShotReadableFdSource, ReadableFdSource, WaylandSocketSource},
     },
     ipc_server::IpcServer,
-    state::{Astera, ClientState},
+    state::{Astera, ClientState, cursor::CursorRenderSource},
 };
 
 const MAX_NATIVE_EVENTS_PER_BATCH: usize = 256;
@@ -109,6 +112,12 @@ enum NativeEvent {
 
 type GraphicsBackend = GbmGlesBackend<GlesRenderer, DrmDeviceFd>;
 type NativeRenderer<'a> = MultiRenderer<'a, 'a, GraphicsBackend, GraphicsBackend>;
+
+render_elements! {
+    NativeRenderElement<R> where R: ImportMem + ImportAll;
+    Surface=WaylandSurfaceRenderElement<R>,
+    Memory=MemoryRenderBufferRenderElement<R>,
+}
 type NativeOutput =
     DrmOutput<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, u64, DrmDeviceFd>;
 type NativeOutputManager = DrmOutputManager<
@@ -306,6 +315,10 @@ impl NativeLoop {
                     BackendInputEvent::TouchUp { event } => Some(event.device()),
                     BackendInputEvent::TouchCancel { event } => Some(event.device()),
                     BackendInputEvent::TouchFrame { event } => Some(event.device()),
+                    BackendInputEvent::TabletToolAxis { event } => Some(event.device()),
+                    BackendInputEvent::TabletToolProximity { event } => Some(event.device()),
+                    BackendInputEvent::TabletToolTip { event } => Some(event.device()),
+                    BackendInputEvent::TabletToolButton { event } => Some(event.device()),
                     _ => None,
                 };
                 if let Some(device) = touch_device
@@ -959,7 +972,7 @@ impl NativeLoop {
         };
         self.state.validate_dmabuf_imports(&mut renderer);
         let mut callbacks = Vec::new();
-        let elements: Vec<WaylandSurfaceRenderElement<NativeRenderer<'_>>> = roots
+        let mut elements: Vec<NativeRenderElement<NativeRenderer<'_>>> = roots
             .iter()
             .flat_map(|(surface, location, scale)| {
                 let mut elements = Vec::new();
@@ -970,28 +983,75 @@ impl NativeLoop {
                         ((popup_offset.y - geometry.loc.y) as f64 * scale).round() as i32,
                     )
                         .into();
-                    elements.extend(surface_tree_snapshot(
+                    elements.extend(
+                        surface_tree_snapshot(
+                            &mut renderer,
+                            popup.wl_surface(),
+                            *location + offset,
+                            *scale,
+                            1.0,
+                            Kind::Unspecified,
+                            &mut callbacks,
+                        )
+                        .into_iter()
+                        .map(Into::into),
+                    );
+                }
+                elements.extend(
+                    surface_tree_snapshot(
                         &mut renderer,
-                        popup.wl_surface(),
-                        *location + offset,
+                        surface,
+                        *location,
                         *scale,
                         1.0,
                         Kind::Unspecified,
                         &mut callbacks,
-                    ));
-                }
-                elements.extend(surface_tree_snapshot(
-                    &mut renderer,
-                    surface,
-                    *location,
-                    *scale,
-                    1.0,
-                    Kind::Unspecified,
-                    &mut callbacks,
-                ));
+                    )
+                    .into_iter()
+                    .map(Into::into),
+                );
                 elements
             })
             .collect();
+        if let Some(cursor) = self.state.cursor_render_source(output) {
+            match cursor {
+                CursorRenderSource::Surface {
+                    surface,
+                    location,
+                    scale,
+                } => {
+                    let cursor_elements = surface_tree_snapshot(
+                        &mut renderer,
+                        &surface,
+                        location,
+                        scale,
+                        1.0,
+                        Kind::Cursor,
+                        &mut callbacks,
+                    );
+                    elements.splice(0..0, cursor_elements.into_iter().map(Into::into));
+                }
+                CursorRenderSource::Memory {
+                    buffer,
+                    location,
+                    size,
+                    source_size,
+                } => {
+                    match MemoryRenderBufferRenderElement::from_buffer(
+                        &mut renderer,
+                        location,
+                        &buffer,
+                        None,
+                        Some(smithay::utils::Rectangle::from_size(source_size.to_f64())),
+                        Some(size),
+                        Kind::Cursor,
+                    ) {
+                        Ok(element) => elements.insert(0, element.into()),
+                        Err(error) => tracing::warn!(?error, "could not import cursor image"),
+                    }
+                }
+            }
+        }
         let Some(surface) = self
             .devices
             .get_mut(&node)

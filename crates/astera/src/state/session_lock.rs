@@ -113,7 +113,7 @@ impl Astera {
             );
             return;
         }
-        self.cancel_touch_sequences();
+        self.cancel_surface_bound_input();
         self.session_state = SessionState::Unlocked;
         self.lock_surfaces.clear();
         self.mark_render_dirty();
@@ -127,7 +127,7 @@ impl Astera {
         if !matches!(self.session_state, SessionState::Locking { ref owner, .. } if owner == lock) {
             return;
         }
-        self.cancel_touch_sequences();
+        self.cancel_surface_bound_input();
         self.session_state = SessionState::Unlocked;
         self.lock_surfaces.clear();
         self.mark_render_dirty();
@@ -240,7 +240,7 @@ impl Astera {
         pointer.unset_grab(self, serial, 0);
         // Touch focus is fixed at the first contact, so terminate any desktop sequence before the
         // lock client becomes the only eligible input recipient.
-        self.cancel_touch_sequences();
+        self.cancel_surface_bound_input();
         // Re-hit-test immediately so axis/button events cannot use a stale desktop focus.
         self.handle_pointer_motion(self.pointer_location, 0);
     }

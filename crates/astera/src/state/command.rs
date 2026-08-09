@@ -39,7 +39,7 @@ impl Astera {
                 if !returns_state {
                     // Touch focus is fixed for a contact. End it before a successful command can
                     // move its target to another workspace/output or behind a changed scene.
-                    self.cancel_touch_sequences();
+                    self.cancel_surface_bound_input();
                     // The diff remains authoritative, so successful semantic no-ops still produce
                     // no event even though they request one snapshot comparison.
                     self.mark_public_dirty();

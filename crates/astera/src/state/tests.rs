@@ -23,6 +23,10 @@ use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1::ExtSessionLockManagerV1, ext_session_lock_v1::ExtSessionLockV1,
 };
 use wayland_protocols::wp::{
+    cursor_shape::v1::client::{
+        wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
+        wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+    },
     fractional_scale::v1::client::{
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
         wp_fractional_scale_v1::WpFractionalScaleV1,
@@ -48,6 +52,9 @@ use wayland_protocols::wp::{
     relative_pointer::zv1::client::{
         zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
         zwp_relative_pointer_v1::ZwpRelativePointerV1,
+    },
+    tablet::zv2::client::{
+        zwp_tablet_manager_v2::ZwpTabletManagerV2, zwp_tablet_seat_v2::ZwpTabletSeatV2,
     },
     viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
 };
@@ -125,6 +132,10 @@ delegate_noop!(TestClient: ignore ZwpPointerGesturesV1);
 delegate_noop!(TestClient: ignore ZwpPointerGestureSwipeV1);
 delegate_noop!(TestClient: ignore ZwpPointerGesturePinchV1);
 delegate_noop!(TestClient: ignore ZwpPointerGestureHoldV1);
+delegate_noop!(TestClient: ignore ZwpTabletManagerV2);
+delegate_noop!(TestClient: ignore ZwpTabletSeatV2);
+delegate_noop!(TestClient: ignore WpCursorShapeManagerV1);
+delegate_noop!(TestClient: ignore WpCursorShapeDeviceV1);
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
     fn event(
@@ -344,6 +355,12 @@ fn decoration_and_activation_globals_are_advertised() {
         let gestures = globals
             .bind::<ZwpPointerGesturesV1, _, _>(&queue, 1..=3, ())
             .unwrap();
+        let tablet_manager = globals
+            .bind::<ZwpTabletManagerV2, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let cursor_shapes = globals
+            .bind::<WpCursorShapeManagerV1, _, _>(&queue, 1..=2, ())
+            .unwrap();
         let _idle_notification = idle.get_idle_notification(0, &seat, &queue, ());
         let surface = compositor.create_surface(&queue, ());
         let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &queue, ());
@@ -359,6 +376,8 @@ fn decoration_and_activation_globals_are_advertised() {
         let _swipe = gestures.get_swipe_gesture(&pointer, &queue, ());
         let _pinch = gestures.get_pinch_gesture(&pointer, &queue, ());
         let _hold = gestures.get_hold_gesture(&pointer, &queue, ());
+        let _tablet_seat = tablet_manager.get_tablet_seat(&seat, &queue, ());
+        let _cursor_shape = cursor_shapes.get_pointer(&pointer, &queue, ());
         let _first_inhibitor = idle_inhibit.create_inhibitor(&surface, &queue, ());
         let _second_inhibitor = idle_inhibit.create_inhibitor(&surface, &queue, ());
         let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
@@ -812,6 +831,49 @@ fn pointer_crosses_outputs_but_compositor_drag_stays_local() {
 fn fractional_output_converts_logical_origins_to_physical_pixels() {
     let physical = physical_point(Point::new(101, -25), 1.5);
     assert_eq!(physical, (152, -38).into());
+}
+
+#[test]
+fn cursor_visual_honours_hotspot_visibility_and_output_ownership() {
+    let display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    state.pointer_location = (10.0, 20.0).into();
+    state
+        .named_cursors
+        .get_mut(&(smithay::input::pointer::CursorIcon::Default, 120))
+        .unwrap()
+        .hotspot = (3, 5).into();
+
+    let super::cursor::CursorRenderSource::Memory { location, .. } =
+        state.cursor_render_source(OutputId(0)).unwrap()
+    else {
+        panic!("default cursor must use the compositor-owned image");
+    };
+    assert_eq!(location, (7.0, 15.0).into());
+    assert!(state.cursor_render_source(OutputId(99)).is_none());
+
+    state
+        .desktop
+        .outputs
+        .get_mut(&OutputId(0))
+        .unwrap()
+        .output
+        .native_scale = Scale120(240);
+    let _ = state.cursor_render_source(OutputId(0)).unwrap();
+    state
+        .named_cursors
+        .get_mut(&(smithay::input::pointer::CursorIcon::Default, 240))
+        .unwrap()
+        .hotspot = (6, 10).into();
+    let super::cursor::CursorRenderSource::Memory { location, .. } =
+        state.cursor_render_source(OutputId(0)).unwrap()
+    else {
+        panic!("scaled cursor must remain compositor-owned");
+    };
+    assert_eq!(location, (14.0, 30.0).into());
+
+    state.cursor_image_status = smithay::input::pointer::CursorImageStatus::Hidden;
+    assert!(state.cursor_render_source(OutputId(0)).is_none());
 }
 
 #[test]

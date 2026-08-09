@@ -197,7 +197,7 @@ impl CompositorHandler for Astera {
         // when the public window metadata remains identical. A role's initial
         // null-buffer commit is protocol setup, however, and must not consume a
         // host frame before the surface maps.
-        if committed_buffer {
+        if committed_buffer || self.is_cursor_surface(surface) {
             self.mark_render_dirty();
         }
         if self
@@ -243,7 +243,7 @@ impl CompositorHandler for Astera {
             }
             let has_buffer = committed_buffer;
             if was_mapped && !has_buffer {
-                self.cancel_touch_sequences();
+                self.cancel_surface_bound_input();
             }
             if let Some(mapped) = self
                 .layers
@@ -317,7 +317,7 @@ impl WlrLayerShellHandler for Astera {
     }
 
     fn layer_destroyed(&mut self, surface: LayerSurface) {
-        self.cancel_touch_sequences();
+        self.cancel_surface_bound_input();
         if let Some(mapped) = self
             .layers
             .iter()
@@ -500,7 +500,7 @@ impl XdgShellHandler for Astera {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        self.cancel_touch_sequences();
+        self.cancel_surface_bound_input();
         let Some(index) = self
             .windows
             .iter()
@@ -561,8 +561,27 @@ impl SeatHandler for Astera {
     fn cursor_image(
         &mut self,
         _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
+        image: smithay::input::pointer::CursorImageStatus,
     ) {
+        self.update_named_cursor(&image);
+        self.cursor_image_status = image;
+        self.mark_render_dirty();
+        self.refresh_visible_scales();
+    }
+}
+
+impl TabletSeatHandler for Astera {
+    fn tablet_tool_image(
+        &mut self,
+        tool: &smithay::backend::input::TabletToolDescriptor,
+        image: smithay::input::pointer::CursorImageStatus,
+    ) {
+        self.update_named_cursor(&image);
+        if let Some(runtime) = self.tablet_tools.get_mut(tool) {
+            runtime.cursor_image = image;
+        }
+        self.mark_render_dirty();
+        self.refresh_visible_scales();
     }
 }
 
@@ -633,6 +652,8 @@ delegate_xdg_activation!(Astera);
 delegate_idle_inhibit!(Astera);
 delegate_keyboard_shortcuts_inhibit!(Astera);
 delegate_pointer_gestures!(Astera);
+delegate_tablet_manager!(Astera);
+delegate_cursor_shape!(Astera);
 delegate_relative_pointer!(Astera);
 delegate_pointer_constraints!(Astera);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [

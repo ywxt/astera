@@ -153,6 +153,7 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-wlr",
  "winit",
+ "xcursor",
 ]
 
 [[package]]

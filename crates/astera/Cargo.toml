@@ -21,6 +21,7 @@ input.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 winit.workspace = true
+xcursor.workspace = true
 
 [dev-dependencies]
 wayland-client.workspace = true
