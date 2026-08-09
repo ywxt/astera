@@ -16,6 +16,7 @@ use smithay::{
         dmabuf::DmabufState,
         fractional_scale::FractionalScaleManagerState,
         idle_inhibit::IdleInhibitManagerState,
+        input_method::{InputMethodManagerState, PopupSurface as InputMethodPopupSurface},
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState,
         output::OutputManagerState,
         pointer_gestures::PointerGesturesState,
@@ -26,7 +27,9 @@ use smithay::{
         },
         shm::ShmState,
         tablet_manager::TabletManagerState,
+        text_input::TextInputManagerState,
         viewporter::ViewporterState,
+        virtual_keyboard::VirtualKeyboardManagerState,
         xdg_activation::XdgActivationState,
     },
 };
@@ -50,6 +53,9 @@ pub struct ProtocolState {
     pub(super) _pointer_gestures_state: PointerGesturesState,
     pub(super) _tablet_manager_state: TabletManagerState,
     pub(super) _cursor_shape_state: CursorShapeManagerState,
+    pub(super) _text_input_state: TextInputManagerState,
+    pub(super) _input_method_state: InputMethodManagerState,
+    pub(super) _virtual_keyboard_state: VirtualKeyboardManagerState,
     pub(super) _output_manager_state: OutputManagerState,
     pub(super) shm_state: ShmState,
     pub(super) seat_state: SeatState<Astera>,
@@ -92,6 +98,11 @@ pub(super) struct MappedLayer {
     pub(super) layer: Layer,
     pub(super) output: OutputId,
     pub(super) mapped: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct MappedInputMethodPopup {
+    pub(super) surface: InputMethodPopupSurface,
 }
 
 #[derive(Debug)]

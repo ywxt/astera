@@ -19,6 +19,29 @@ impl Astera {
             )?;
             return Some((hit, (f64::from(offset.x), f64::from(offset.y)).into(), None));
         }
+        // Input-method candidate popups render above every normal desktop layer and must consume
+        // pointer/touch input instead of allowing clicks to pass through to the application.
+        for (popup, origin) in self
+            .input_method_popup_origins(self.active_output)
+            .into_iter()
+            .rev()
+        {
+            let local =
+                SmithayPoint::from((location.x - origin.x as f64, location.y - origin.y as f64));
+            if let Some((surface, offset)) =
+                under_from_surface_tree(&popup, local, (0, 0), WindowSurfaceType::ALL)
+            {
+                return Some((
+                    surface,
+                    (
+                        origin.x as f64 + f64::from(offset.x),
+                        origin.y as f64 + f64::from(offset.y),
+                    )
+                        .into(),
+                    None,
+                ));
+            }
+        }
         // Hit testing mirrors render stacking. We retain every hit and choose the highest tuple so
         // popups, floating/fullscreen windows and layer surfaces resolve deterministically.
         let mut candidates = Vec::new();

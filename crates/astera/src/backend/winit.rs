@@ -31,7 +31,7 @@ use crate::{
         sources::{ReadableFdSource, WaylandSocketSource},
     },
     ipc_server::IpcServer,
-    state::{Astera, ClientState, cursor::CursorRenderSource},
+    state::{Astera, ClientState, InputServiceSupervisor, cursor::CursorRenderSource},
 };
 
 render_elements! {
@@ -53,6 +53,7 @@ enum RuntimeEvent {
     WaylandReady,
     IpcReady,
     ConfigChanged,
+    InputServiceExited(crate::state::InputServiceExit),
 }
 
 struct WinitLoop {
@@ -72,6 +73,7 @@ struct WinitLoop {
     host_configured: bool,
     has_presented: bool,
     scene_dirty: bool,
+    input_service: Option<InputServiceSupervisor>,
 }
 
 impl WinitLoop {
@@ -227,6 +229,11 @@ impl WinitLoop {
             RuntimeEvent::WaylandReady => self.dispatch_wayland_clients()?,
             RuntimeEvent::IpcReady => self.ipc.dispatch(&mut self.state),
             RuntimeEvent::ConfigChanged => self.state.notify_config_changed(),
+            RuntimeEvent::InputServiceExited(exit) => {
+                if let Some(service) = &mut self.input_service {
+                    service.exited(exit);
+                }
+            }
         }
         Ok(false)
     }
@@ -376,6 +383,13 @@ impl WinitLoop {
             self.state.next_timer_deadline(),
             self.shutdown_deadline,
             self.frame_retry_deadline,
+            (!self.state.session_is_locked())
+                .then(|| {
+                    self.input_service
+                        .as_ref()
+                        .and_then(InputServiceSupervisor::next_deadline)
+                })
+                .flatten(),
         ]
         .into_iter()
         .flatten()
@@ -408,6 +422,7 @@ fn is_lossy_motion(event: &RuntimeEvent) -> bool {
 pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     let mut event_loop: EventLoop<WinitLoop> = EventLoop::try_new()?;
     let display: Display<Astera> = Display::new()?;
+    let input_service = config.input_service.clone();
     let mut state = Astera::new(&display.handle(), config);
     state.disable_session_lock_advertisement();
     state.watch_config(config_path);
@@ -423,6 +438,16 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     // Astera composites the same cursor path as the native backend. Leaving winit's host cursor
     // visible would produce two cursors with unrelated shapes and hotspots inside the window.
     backend.window().set_cursor_visible(false);
+    let (mut input_service, input_service_exits) = match input_service {
+        Some(argv) => {
+            let (service, exits) = InputServiceSupervisor::new(argv);
+            (Some(service), Some(exits))
+        }
+        None => (None, None),
+    };
+    if let Some(service) = &mut input_service {
+        service.start(display.handle())?;
+    }
     // Capability discovery does not require binding the not-yet-configured host
     // EGL surface; doing so here can produce EGL_BAD_SURFACE on Wayland hosts.
     state.enable_dmabuf(backend.renderer().dmabuf_formats());
@@ -436,6 +461,16 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
             runtime.enqueue(RuntimeEvent::Winit(event));
         })
         .map_err(|error| anyhow!(error.to_string()))?;
+    if let Some(exits) = input_service_exits {
+        event_loop
+            .handle()
+            .insert_source(exits, |event, _, runtime| {
+                if let smithay::reexports::calloop::channel::Event::Msg(exit) = event {
+                    runtime.enqueue(RuntimeEvent::InputServiceExited(exit));
+                }
+            })
+            .map_err(|error| anyhow!(error.to_string()))?;
+    }
     event_loop
         .handle()
         .insert_source(listener, |stream, _, runtime| {
@@ -480,6 +515,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         host_configured: false,
         has_presented: false,
         scene_dirty: false,
+        input_service,
     };
 
     tracing::info!(wayland_display = %socket_name, "nested compositor is ready");
@@ -495,6 +531,10 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         };
         event_loop.dispatch(timeout, &mut runtime)?;
         runtime.process_events()?;
+        let locked = runtime.state.session_is_locked();
+        if let Some(service) = &mut runtime.input_service {
+            service.poll(runtime.display.handle(), locked);
+        }
         if runtime.state.should_quit() {
             runtime.begin_shutdown();
         }

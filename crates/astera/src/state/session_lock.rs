@@ -233,6 +233,12 @@ impl Astera {
     fn secure_input_for_lock(&mut self) {
         self.key_repeat.cancel_repeats();
         self.drag = None;
+        // An input-method grab must not observe lock-screen keystrokes. End its privileged
+        // connection explicitly so the supervised service knows it must reconnect after unlock;
+        // silently unsetting Smithay's grab would leave the live protocol object permanently stale.
+        if let Some(input_method) = self.input_method_resource.take() {
+            input_method.post_error(0u32, "input method must reconnect after session lock");
+        }
         let serial = self.next_serial();
         let keyboard = self.keyboard.clone();
         keyboard.unset_grab(self);

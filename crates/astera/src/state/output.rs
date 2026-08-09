@@ -143,6 +143,7 @@ impl Astera {
             .any(|(_, _, _, mode)| *mode == WindowMode::Fullscreen);
         // Ordering here is both render order and the contract mirrored by scene hit testing.
         let mut roots = Vec::new();
+        roots.extend(self.input_method_roots(output));
         roots.extend(self.layer_roots(output, Layer::Overlay));
         roots.extend(
             windows

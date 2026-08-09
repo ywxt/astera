@@ -191,13 +191,17 @@ impl CompositorHandler for Astera {
         on_commit_buffer_handler::<Self>(surface);
         self.validate_lock_surface_commit(surface);
         self.popup_manager.commit(surface);
+        self.reposition_input_method_popup_surface(surface);
         let committed_buffer =
             with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
         // Buffer attachment, damage and subsurface state are visual changes even
         // when the public window metadata remains identical. A role's initial
         // null-buffer commit is protocol setup, however, and must not consume a
         // host frame before the surface maps.
-        if committed_buffer || self.is_cursor_surface(surface) {
+        if committed_buffer
+            || self.is_cursor_surface(surface)
+            || self.is_input_method_popup_surface(surface)
+        {
             self.mark_render_dirty();
         }
         if self
@@ -585,6 +589,29 @@ impl TabletSeatHandler for Astera {
     }
 }
 
+impl InputMethodHandler for Astera {
+    fn new_popup(&mut self, surface: InputMethodPopupSurface) {
+        self.add_input_method_popup(surface);
+    }
+
+    fn dismiss_popup(&mut self, surface: InputMethodPopupSurface) {
+        self.remove_input_method_popup(&surface);
+    }
+
+    fn popup_repositioned(&mut self, surface: InputMethodPopupSurface) {
+        self.reposition_input_method_popup(&surface);
+    }
+
+    fn parent_geometry(
+        &self,
+        parent: &WlSurface,
+    ) -> smithay::utils::Rectangle<i32, smithay::utils::Logical> {
+        self.input_method_parent_geometry(parent)
+            .map(|(_, geometry)| geometry)
+            .unwrap_or_default()
+    }
+}
+
 impl Astera {
     pub(super) fn update_shortcut_inhibitor(
         &mut self,
@@ -654,6 +681,145 @@ delegate_keyboard_shortcuts_inhibit!(Astera);
 delegate_pointer_gestures!(Astera);
 delegate_tablet_manager!(Astera);
 delegate_cursor_shape!(Astera);
+smithay::delegate_text_input_manager!(Astera);
+smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_manager_v2::ZwpInputMethodManagerV2:
+    smithay::wayland::input_method::InputMethodManagerGlobalData
+] => smithay::wayland::input_method::InputMethodManagerState);
+smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2:
+    smithay::wayland::input_method::InputMethodKeyboardUserData<Self>
+] => smithay::wayland::input_method::InputMethodManagerState);
+smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2:
+    smithay::wayland::input_method::InputMethodPopupSurfaceUserData
+] => smithay::wayland::input_method::InputMethodManagerState);
+
+impl smithay::reexports::wayland_server::Dispatch<
+    smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
+    (),
+> for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
+        request: smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_manager_v2::Request,
+        data: &(),
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        if matches!(
+            request,
+            smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_manager_v2::Request::GetInputMethod { .. }
+        ) {
+            if state.input_method_claimed {
+                resource.post_error(0u32, "this seat already has an input method");
+                return;
+            }
+            state.input_method_claimed = true;
+        }
+        <InputMethodManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, resource, request, data, display, data_init,
+        );
+    }
+}
+
+impl smithay::reexports::wayland_server::Dispatch<
+    smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::ZwpInputMethodV2,
+    smithay::wayland::input_method::InputMethodUserData<Self>,
+> for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::ZwpInputMethodV2,
+        request: smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::Request,
+        data: &smithay::wayland::input_method::InputMethodUserData<Self>,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        state.input_method_resource = Some(resource.clone());
+        if state.session_is_locked()
+            && matches!(
+                request,
+                smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::Request::GrabKeyboard { .. }
+            )
+        {
+            resource.post_error(0u32, "input-method keyboard grabs are disabled while locked");
+            return;
+        }
+        <InputMethodManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, resource, request, data, display, data_init,
+        );
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        client: ClientId,
+        resource: &smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::ZwpInputMethodV2,
+        data: &smithay::wayland::input_method::InputMethodUserData<Self>,
+    ) {
+        state.input_method_claimed = false;
+        if state.input_method_resource.as_ref() == Some(resource) {
+            state.input_method_resource = None;
+        }
+        <InputMethodManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::destroyed(
+            state, client, resource, data,
+        );
+    }
+}
+smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1:
+    smithay::wayland::virtual_keyboard::VirtualKeyboardManagerGlobalData
+] => smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState);
+smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1: ()
+] => smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState);
+
+impl smithay::reexports::wayland_server::Dispatch<
+    smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+    smithay::wayland::virtual_keyboard::VirtualKeyboardUserData<Self>,
+> for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+        request: smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_v1::Request,
+        data: &smithay::wayland::virtual_keyboard::VirtualKeyboardUserData<Self>,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        if state.session_is_locked() && !matches!(request, smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_v1::Request::Destroy) {
+            // A fatal error makes the required reconnect explicit and prevents silently losing a
+            // keymap or release, which would desynchronise client and compositor state.
+            resource.post_error(0u32, "virtual keyboards must reconnect after session lock");
+            return;
+        }
+        if matches!(
+            request,
+            smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_v1::Request::Key { .. }
+        ) {
+            let events = state.idle_runtime.activity(0, state.clock.now());
+            state.send_idle_events(events);
+        }
+        <VirtualKeyboardManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, resource, request, data, display, data_init,
+        );
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        client: ClientId,
+        resource: &smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+        data: &smithay::wayland::virtual_keyboard::VirtualKeyboardUserData<Self>,
+    ) {
+        <VirtualKeyboardManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::destroyed(
+            state, client, resource, data,
+        );
+    }
+}
 delegate_relative_pointer!(Astera);
 delegate_pointer_constraints!(Astera);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [

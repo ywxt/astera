@@ -56,7 +56,7 @@ use crate::{
         sources::{OneShotReadableFdSource, ReadableFdSource, WaylandSocketSource},
     },
     ipc_server::IpcServer,
-    state::{Astera, ClientState, cursor::CursorRenderSource},
+    state::{Astera, ClientState, InputServiceSupervisor, cursor::CursorRenderSource},
 };
 
 const MAX_NATIVE_EVENTS_PER_BATCH: usize = 256;
@@ -87,6 +87,7 @@ struct NativeLoop {
     session_active: bool,
     deferred_devices: HashMap<DrmNode, PathBuf>,
     shutdown_deadline: Option<Instant>,
+    input_service: Option<InputServiceSupervisor>,
 }
 
 enum NativeEvent {
@@ -108,6 +109,7 @@ enum NativeEvent {
     WaylandReady,
     IpcReady,
     ConfigChanged,
+    InputServiceExited(crate::state::InputServiceExit),
 }
 
 type GraphicsBackend = GbmGlesBackend<GlesRenderer, DrmDeviceFd>;
@@ -446,6 +448,11 @@ impl NativeLoop {
             NativeEvent::ConfigChanged => {
                 self.config_changed_queued = false;
                 self.state.notify_config_changed();
+            }
+            NativeEvent::InputServiceExited(exit) => {
+                if let Some(service) = &mut self.input_service {
+                    service.exited(exit);
+                }
             }
         }
         Ok(scene_changed)
@@ -1202,6 +1209,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     let mut event_loop: EventLoop<NativeLoop> = EventLoop::try_new()?;
     let handle = event_loop.handle();
     let display = Display::<Astera>::new()?;
+    let input_service = config.input_service.clone();
     let mut state = Astera::new(&display.handle(), config);
     state.enable_output_power_management();
     state.set_output_configuration_supported(false);
@@ -1214,12 +1222,32 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         .to_string_lossy()
         .into_owned();
     let ipc = IpcServer::bind(&socket_name)?;
+    let (mut input_service, input_service_exits) = match input_service {
+        Some(argv) => {
+            let (service, exits) = InputServiceSupervisor::new(argv);
+            (Some(service), Some(exits))
+        }
+        None => (None, None),
+    };
+    if let Some(service) = &mut input_service {
+        service.start(display.handle())?;
+    }
     event_loop
         .handle()
         .insert_source(ipc.event_source(), |(), _, runtime| {
             runtime.enqueue(NativeEvent::IpcReady);
         })
         .map_err(|error| anyhow!(error.to_string()))?;
+    if let Some(exits) = input_service_exits {
+        event_loop
+            .handle()
+            .insert_source(exits, |event, _, runtime| {
+                if let smithay::reexports::calloop::channel::Event::Msg(exit) = event {
+                    runtime.enqueue(NativeEvent::InputServiceExited(exit));
+                }
+            })
+            .map_err(|error| anyhow!(error.to_string()))?;
+    }
     event_loop
         .handle()
         .insert_source(listener, |stream, _, runtime| {
@@ -1297,6 +1325,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         session_active: true,
         deferred_devices: HashMap::new(),
         shutdown_deadline: None,
+        input_service,
     };
     for (device_id, path) in initial_devices {
         match DrmNode::from_dev_id(device_id) {
@@ -1320,6 +1349,14 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
             runtime.next_software_presentation(),
             runtime.next_fence_check(),
             runtime.shutdown_deadline,
+            (!runtime.state.session_is_locked())
+                .then(|| {
+                    runtime
+                        .input_service
+                        .as_ref()
+                        .and_then(InputServiceSupervisor::next_deadline)
+                })
+                .flatten(),
         ]
         .into_iter()
         .flatten()
@@ -1331,6 +1368,10 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         };
         event_loop.dispatch(timeout, &mut runtime)?;
         runtime.process_events()?;
+        let locked = runtime.state.session_is_locked();
+        if let Some(service) = &mut runtime.input_service {
+            service.poll(runtime.display.handle(), locked);
+        }
         let now = Instant::now();
         runtime.ipc.expire(now);
         let timer_due = runtime

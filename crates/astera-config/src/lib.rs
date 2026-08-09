@@ -11,6 +11,9 @@ pub struct Config {
     pub camera: CameraPolicy,
     pub key_repeat: KeyRepeatConfig,
     pub bindings: Bindings,
+    /// A compositor-spawned service receives a private WAYLAND_SOCKET with privileged input
+    /// protocol capabilities. Ordinary Wayland clients never receive those globals.
+    pub input_service: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,6 +255,7 @@ impl Default for Config {
             camera: CameraPolicy::KeepVisible { margin: 32 },
             key_repeat: KeyRepeatConfig::default(),
             bindings: Bindings::built_in(),
+            input_service: None,
         }
     }
 }
@@ -271,6 +275,7 @@ impl Config {
         let mut camera = defaults.camera;
         let mut key_repeat = defaults.key_repeat;
         let mut entries = BTreeMap::new();
+        let mut input_service = None;
         let mut sections = BTreeMap::<&str, ()>::new();
 
         for node in document.nodes() {
@@ -303,6 +308,19 @@ impl Config {
                         }
                         Ok(())
                     }
+                    "input-service" => {
+                        require_no_children(node)?;
+                        require_properties(node, &[])?;
+                        if input_service.is_some() {
+                            return invalid("duplicate `input-service` setting");
+                        }
+                        let argv = positional_strings(node)?;
+                        if argv.is_empty() {
+                            return invalid("`input-service` requires a non-empty argv");
+                        }
+                        input_service = Some(argv);
+                        Ok(())
+                    }
                     _ => unknown("top-level node", name, TOP_LEVEL_NAMES),
                 }
             })();
@@ -315,6 +333,7 @@ impl Config {
             camera,
             key_repeat,
             bindings: Bindings { entries },
+            input_service,
         };
         config.validate()?;
         Ok(config)
@@ -361,7 +380,7 @@ impl Config {
     }
 }
 
-const TOP_LEVEL_NAMES: &[&str] = &["general", "input", "camera", "bind"];
+const TOP_LEVEL_NAMES: &[&str] = &["general", "input", "camera", "input-service", "bind"];
 
 fn parse_general(document: &KdlDocument, gap: &mut i64) -> Result<(), ConfigError> {
     let mut seen = false;
@@ -778,6 +797,9 @@ input {
     repeat-rate 25
 }
 
+// Privileged input protocols are only exposed through this process's private WAYLAND_SOCKET.
+// input-service "fcitx5" "--replace"
+
 camera {
     keep-visible margin=32
 }
@@ -949,6 +971,7 @@ mod tests {
         let config = Config::from_kdl(
             r#"
                 general { gap 12 }
+                input-service "fcitx5" "--replace"
                 input { repeat-delay 400; repeat-rate 30 }
                 camera { keep-visible margin=40 }
                 bind "Super+Return" { spawn "kitty" }
@@ -962,6 +985,10 @@ mod tests {
         .unwrap();
         assert_eq!(config.bindings.len(), 6);
         assert_eq!(config.gap, 12);
+        assert_eq!(
+            config.input_service,
+            Some(vec!["fcitx5".into(), "--replace".into()])
+        );
         assert_eq!(config.key_repeat.delay_ms, 400);
     }
 

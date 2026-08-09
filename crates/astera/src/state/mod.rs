@@ -15,12 +15,14 @@ pub(crate) mod cursor;
 mod event_hub;
 mod geometry;
 mod idle;
+mod input_method;
 mod key_repeat;
 mod model;
 mod output;
 mod output_power;
 mod pointer_constraints;
 mod process;
+pub(crate) use process::{InputServiceExit, InputServiceSupervisor};
 mod public_state;
 mod scene;
 mod session_lock;
@@ -38,7 +40,9 @@ use geometry::{
 };
 use idle::{IdleEvent, IdleRuntime};
 use key_repeat::KeyRepeatState;
-use model::{DragState, MappedLayer, MappedWindow, OutputRuntime, ProtocolState};
+use model::{
+    DragState, MappedInputMethodPopup, MappedLayer, MappedWindow, OutputRuntime, ProtocolState,
+};
 use output_power::OutputPowerGlobalData;
 use session_lock::{LockSurfaces, SessionState};
 
@@ -107,6 +111,9 @@ use smithay::{
             FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
         },
         idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
+        input_method::{
+            InputMethodHandler, InputMethodManagerState, PopupSurface as InputMethodPopupSurface,
+        },
         keyboard_shortcuts_inhibit::{
             KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
             KeyboardShortcutsInhibitor, KeyboardShortcutsInhibitorSeat,
@@ -133,7 +140,9 @@ use smithay::{
         },
         shm::{ShmHandler, ShmState},
         tablet_manager::{TabletManagerState, TabletSeatHandler},
+        text_input::TextInputManagerState,
         viewporter::ViewporterState,
+        virtual_keyboard::VirtualKeyboardManagerState,
         xdg_activation::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
         },
@@ -149,6 +158,9 @@ pub struct Astera {
     active_output: OutputId,
     windows: Vec<MappedWindow>,
     layers: Vec<MappedLayer>,
+    input_method_popups: Vec<MappedInputMethodPopup>,
+    input_method_claimed: bool,
+    input_method_resource: Option<smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::ZwpInputMethodV2>,
     next_window_id: u64,
     next_layer_id: u64,
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
@@ -243,6 +255,20 @@ impl Astera {
         let pointer_gestures_state = PointerGesturesState::new::<Self>(display);
         let tablet_manager_state = TabletManagerState::new::<Self>(display);
         let cursor_shape_state = CursorShapeManagerState::new::<Self>(display);
+        let text_input_state = TextInputManagerState::new::<Self>(display);
+        // Privileged input globals are visible only on the private WAYLAND_SOCKET connection
+        // created by the compositor's supervised input-service process.
+        let input_method_state = InputMethodManagerState::new::<Self, _>(display, |client| {
+            client
+                .get_data::<ClientState>()
+                .is_some_and(|state| state.trusted_input)
+        });
+        let virtual_keyboard_state =
+            VirtualKeyboardManagerState::new::<Self, _>(display, |client| {
+                client
+                    .get_data::<ClientState>()
+                    .is_some_and(|state| state.trusted_input)
+            });
         let session_lock_advertised = Arc::new(AtomicBool::new(true));
         let advertised = session_lock_advertised.clone();
         let session_lock_manager = SessionLockManagerState::new::<Self, _>(display, move |_| {
@@ -327,6 +353,9 @@ impl Astera {
                 _pointer_gestures_state: pointer_gestures_state,
                 _tablet_manager_state: tablet_manager_state,
                 _cursor_shape_state: cursor_shape_state,
+                _text_input_state: text_input_state,
+                _input_method_state: input_method_state,
+                _virtual_keyboard_state: virtual_keyboard_state,
                 _output_manager_state: output_manager_state,
                 shm_state,
                 seat_state,
@@ -353,6 +382,9 @@ impl Astera {
             active_output,
             windows: Vec::new(),
             layers: Vec::new(),
+            input_method_popups: Vec::new(),
+            input_method_claimed: false,
+            input_method_resource: None,
             next_window_id: 1,
             next_layer_id: 1,
             pointer_location: (0.0, 0.0).into(),
@@ -1657,6 +1689,9 @@ impl Astera {
     }
 
     fn apply_config(&mut self, config: Config) -> AnyResult<()> {
+        if config.input_service != self.config.input_service {
+            anyhow::bail!("changing input-service requires restarting the compositor");
+        }
         // Validate layout changes on a clone before publishing any part of the new config.
         let mut desktop = self.desktop.clone();
         desktop.reconfigure_layout(config.gap, config.camera)?;
@@ -1798,6 +1833,16 @@ fn extend_surface_tree(surfaces: &mut HashSet<WlSurface>, root: &WlSurface) {
 #[derive(Default)]
 pub struct ClientState {
     compositor_state: CompositorClientState,
+    trusted_input: bool,
+}
+
+impl ClientState {
+    pub(crate) fn trusted_input() -> Self {
+        Self {
+            trusted_input: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl ClientData for ClientState {

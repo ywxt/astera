@@ -27,6 +27,7 @@ xcursor.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
 wayland-protocols-wlr.workspace = true
+wayland-protocols-misc.workspace = true
 
 [lints]
 workspace = true

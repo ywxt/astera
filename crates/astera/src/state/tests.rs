@@ -56,6 +56,9 @@ use wayland_protocols::wp::{
     tablet::zv2::client::{
         zwp_tablet_manager_v2::ZwpTabletManagerV2, zwp_tablet_seat_v2::ZwpTabletSeatV2,
     },
+    text_input::zv3::client::{
+        zwp_text_input_manager_v3::ZwpTextInputManagerV3, zwp_text_input_v3::ZwpTextInputV3,
+    },
     viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
 };
 use wayland_protocols::xdg::shell::client::{
@@ -70,6 +73,13 @@ use wayland_protocols::xdg::{
         zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
         zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
     },
+};
+use wayland_protocols_misc::zwp_input_method_v2::client::{
+    zwp_input_method_manager_v2::ZwpInputMethodManagerV2, zwp_input_method_v2::ZwpInputMethodV2,
+};
+use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::ZwlrLayerShellV1, zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
@@ -136,6 +146,12 @@ delegate_noop!(TestClient: ignore ZwpTabletManagerV2);
 delegate_noop!(TestClient: ignore ZwpTabletSeatV2);
 delegate_noop!(TestClient: ignore WpCursorShapeManagerV1);
 delegate_noop!(TestClient: ignore WpCursorShapeDeviceV1);
+delegate_noop!(TestClient: ignore ZwpTextInputManagerV3);
+delegate_noop!(TestClient: ignore ZwpTextInputV3);
+delegate_noop!(TestClient: ignore ZwpInputMethodManagerV2);
+delegate_noop!(TestClient: ignore ZwpInputMethodV2);
+delegate_noop!(TestClient: ignore ZwpVirtualKeyboardManagerV1);
+delegate_noop!(TestClient: ignore ZwpVirtualKeyboardV1);
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
     fn event(
@@ -254,6 +270,46 @@ fn output_power_requests_are_exclusive_coalesced_and_backend_confirmed() {
 }
 
 #[test]
+fn privileged_input_globals_are_hidden_from_ordinary_clients() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, queue) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let handle = queue.handle();
+        result_tx
+            .send((
+                globals
+                    .bind::<ZwpInputMethodManagerV2, _, _>(&handle, 1..=1, ())
+                    .is_err(),
+                globals
+                    .bind::<ZwpVirtualKeyboardManagerV1, _, _>(&handle, 1..=1, ())
+                    .is_err(),
+                globals
+                    .bind::<ZwpTextInputManagerV3, _, _>(&handle, 1..=1, ())
+                    .is_ok(),
+            ))
+            .unwrap();
+    });
+    let mut result = None;
+    dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
+        Ok(value) => {
+            result = Some(value);
+            true
+        }
+        Err(_) => false,
+    });
+    assert_eq!(result, Some((true, true, true)));
+    client.join().unwrap();
+}
+
+#[test]
 fn session_lock_is_fail_closed_before_confirmation_and_after_disconnect() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
@@ -316,7 +372,7 @@ fn decoration_and_activation_globals_are_advertised() {
     let (server_socket, client_socket) = UnixStream::pair().unwrap();
     display
         .handle()
-        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .insert_client(server_socket, Arc::new(ClientState::trusted_input()))
         .unwrap();
 
     let (requested_tx, requested_rx) = mpsc::sync_channel(0);
@@ -361,6 +417,15 @@ fn decoration_and_activation_globals_are_advertised() {
         let cursor_shapes = globals
             .bind::<WpCursorShapeManagerV1, _, _>(&queue, 1..=2, ())
             .unwrap();
+        let text_inputs = globals
+            .bind::<ZwpTextInputManagerV3, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let input_methods = globals
+            .bind::<ZwpInputMethodManagerV2, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let virtual_keyboards = globals
+            .bind::<ZwpVirtualKeyboardManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
         let _idle_notification = idle.get_idle_notification(0, &seat, &queue, ());
         let surface = compositor.create_surface(&queue, ());
         let _relative_pointer = relative_manager.get_relative_pointer(&pointer, &queue, ());
@@ -378,6 +443,9 @@ fn decoration_and_activation_globals_are_advertised() {
         let _hold = gestures.get_hold_gesture(&pointer, &queue, ());
         let _tablet_seat = tablet_manager.get_tablet_seat(&seat, &queue, ());
         let _cursor_shape = cursor_shapes.get_pointer(&pointer, &queue, ());
+        let _text_input = text_inputs.get_text_input(&seat, &queue, ());
+        let _input_method = input_methods.get_input_method(&seat, &queue, ());
+        let _virtual_keyboard = virtual_keyboards.create_virtual_keyboard(&seat, &queue, ());
         let _first_inhibitor = idle_inhibit.create_inhibitor(&surface, &queue, ());
         let _second_inhibitor = idle_inhibit.create_inhibitor(&surface, &queue, ());
         let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
