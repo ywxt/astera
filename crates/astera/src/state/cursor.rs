@@ -109,9 +109,30 @@ fn fallback_cursor(scale120: u32) -> NamedCursor {
 impl Astera {
     pub(super) fn is_cursor_surface(&self, surface: &WlSurface) -> bool {
         matches!(&self.cursor_image_status, CursorImageStatus::Surface(current) if current == surface)
+            || self.dnd_icon.as_ref() == Some(surface)
             || self.tablet_tools.values().any(|runtime| {
                 matches!(&runtime.cursor_image, CursorImageStatus::Surface(current) if current == surface)
             })
+    }
+
+    pub(crate) fn dnd_icon_render_source(
+        &self,
+        output: OutputId,
+    ) -> Option<(WlSurface, Point<i32, Physical>, f64)> {
+        if self.session_is_locked() || output != self.active_output {
+            return None;
+        }
+        let surface = self.dnd_icon.as_ref()?.clone();
+        let scale = self.output_scale(output);
+        Some((
+            surface,
+            (
+                (self.pointer_location.x * scale).round() as i32,
+                (self.pointer_location.y * scale).round() as i32,
+            )
+                .into(),
+            scale,
+        ))
     }
 
     pub(super) fn cursor_surface_for_output(&self, output: OutputId) -> Option<WlSurface> {

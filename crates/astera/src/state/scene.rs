@@ -199,7 +199,7 @@ impl Astera {
                     .drag
                     .filter(|drag| drag.window == id && output_id == self.active_output)
                 {
-                    rect.origin = drag.target;
+                    rect = drag.target;
                 }
                 let left = workspace.camera.center.x as f64 - usable.size.width as f64 / 2.0;
                 let top = workspace.camera.center.y as f64 - usable.size.height as f64 / 2.0;
@@ -219,12 +219,13 @@ impl Astera {
                     .drag
                     .filter(|drag| drag.window == id && output_id == self.active_output)
                 {
-                    rect.origin = drag.target;
+                    rect = drag.target;
                 }
                 Some((rect.origin, rect.size, 1.0, mode))
             }
             WindowMode::Maximized => Some((usable.origin, usable.size, 1.0, mode)),
             WindowMode::Fullscreen => Some((Point::ORIGIN, output.output.logical_size, 1.0, mode)),
+            WindowMode::Minimized => None,
         }
     }
 }

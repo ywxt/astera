@@ -32,6 +32,15 @@ impl Astera {
         // Protocol configure is emitted only after the core transaction commits successfully.
         let mode_change = match &command {
             Command::SetWindowMode { window, mode } => Some((*window, *mode)),
+            Command::FocusWindow(window) => self
+                .desktop
+                .find_window((*window).into())
+                .ok()
+                .and_then(|workspace| self.desktop.workspace(workspace).ok())
+                .filter(|workspace| {
+                    workspace.window_mode((*window).into()) == Some(WindowMode::Minimized)
+                })
+                .map(|_| (*window, astera_ipc::wire::v1::WindowMode::Tiled)),
             _ => None,
         };
         match self.execute_command_inner(command) {
@@ -45,7 +54,14 @@ impl Astera {
                     self.mark_public_dirty();
                 }
                 if let Some((window, mode)) = mode_change {
-                    self.configure_window_mode(window.into(), mode.into());
+                    let mode = self
+                        .desktop
+                        .find_window(window.into())
+                        .ok()
+                        .and_then(|workspace| self.desktop.workspace(workspace).ok())
+                        .and_then(|workspace| workspace.window_mode(window.into()))
+                        .unwrap_or_else(|| mode.into());
+                    self.configure_window_mode(window.into(), mode);
                 }
                 self.configure_fullscreen_windows();
                 self.refresh_visible_scales();
@@ -94,6 +110,7 @@ impl Astera {
                 .and_then(|output| self.usable_rect(output))
                 .map(|rect| rect.size),
             WindowMode::Tiled | WindowMode::Floating => workspace.window_size(window),
+            WindowMode::Minimized => None,
         };
         mapped.surface.with_pending_state(|state| {
             state.size =
@@ -198,6 +215,24 @@ impl Astera {
             })
             .max_by_key(|(index, mapped)| (layer_rank(mapped.layer), *index))
             .map(|(_, mapped)| mapped.surface.wl_surface().clone());
+        let on_demand_target = self.on_demand_layer_focus.and_then(|id| {
+            self.layers.iter().find_map(|mapped| {
+                if mapped.id != id || !mapped.mapped || mapped.output != self.active_output {
+                    return None;
+                }
+                let state = with_states(mapped.surface.wl_surface(), |states| {
+                    *states
+                        .cached_state
+                        .get::<LayerSurfaceCachedState>()
+                        .current()
+                });
+                (state.keyboard_interactivity == KeyboardInteractivity::OnDemand)
+                    .then(|| mapped.surface.wl_surface().clone())
+            })
+        });
+        if on_demand_target.is_none() {
+            self.on_demand_layer_focus = None;
+        }
         let focused = self
             .desktop
             .workspace_for_output(self.active_output)
@@ -211,7 +246,7 @@ impl Astera {
         let target = if self.session_is_locked() {
             lock_target
         } else {
-            layer_target.or(window_target)
+            layer_target.or(on_demand_target).or(window_target)
         };
         for mapped in &mut self.windows {
             let activated = Some(mapped.surface.wl_surface()) == target.as_ref();
@@ -233,6 +268,9 @@ impl Astera {
         // Smithay's keyboard callback is not invoked when focus becomes None.
         let seat = self.seat.clone();
         self.update_shortcut_inhibitor(&seat, target.as_ref());
+        if target.is_none() {
+            set_data_device_focus(&self.display, &seat, None);
+        }
     }
 
     fn resolve_output(&self, selector: OutputSelector) -> Result<OutputId, CommandError> {

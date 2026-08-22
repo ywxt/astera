@@ -524,6 +524,42 @@ fn same_workspace_send_still_honors_activate() {
 }
 
 #[test]
+fn focusing_a_minimized_window_restores_it() {
+    let mut desktop = Desktop::new(8);
+    desktop
+        .connect_output(Output::new(OutputId(1), "one", Size::new(800, 600)))
+        .unwrap();
+    let workspace = desktop.active_workspace_id(OutputId(1)).unwrap();
+    desktop
+        .apply_window(
+            workspace,
+            WindowTransaction::InsertTiled {
+                id: WindowId(1),
+                size: Size::new(320, 240),
+                anchor: Point::ORIGIN,
+                seed_direction: crate::Direction::RIGHT,
+            },
+        )
+        .unwrap();
+    desktop
+        .apply_window(
+            workspace,
+            WindowTransaction::SetMode {
+                id: WindowId(1),
+                mode: WindowMode::Minimized,
+                viewport_size: Size::new(800, 600),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(desktop.workspace(workspace).unwrap().focused_window, None);
+    assert_eq!(desktop.focus_window(WindowId(1)).unwrap(), workspace);
+    let workspace = desktop.workspace(workspace).unwrap();
+    assert_eq!(workspace.window_mode(WindowId(1)), Some(WindowMode::Tiled));
+    assert_eq!(workspace.focused_window, Some(WindowId(1)));
+}
+
+#[test]
 fn output_reconfigure_and_layout_reflow_commit_atomically() {
     let mut desktop = Desktop::new(8);
     desktop.connect_output(output(1, "A")).unwrap();

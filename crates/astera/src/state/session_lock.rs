@@ -230,9 +230,27 @@ impl Astera {
         self.lock_frame_presented(output, generation);
     }
 
+    pub(super) fn session_output_powered(&mut self, output: OutputId, powered: bool) {
+        if powered {
+            // Re-enabling scanout while lock confirmation is pending creates a new exposure path.
+            // Do not emit `locked` until that output has presented a frame from this generation.
+            if let SessionState::Locking { pending, .. } = &mut self.session_state {
+                pending.insert(output);
+                self.mark_render_dirty();
+            }
+        } else {
+            // A successfully disabled KMS output is already fail-closed for this generation.
+            let generation = self.locking_generation();
+            self.lock_frame_presented(output, generation);
+        }
+    }
+
     fn secure_input_for_lock(&mut self) {
         self.key_repeat.cancel_repeats();
-        self.drag = None;
+        self.cancel_drag();
+        // The data-device pointer grab is revoked below. Its role surface must disappear in the
+        // same frame and must never reappear after unlock if the client misses cancellation.
+        self.dnd_icon = None;
         // An input-method grab must not observe lock-screen keystrokes. End its privileged
         // connection explicitly so the supervised service knows it must reconnect after unlock;
         // silently unsetting Smithay's grab would leave the live protocol object permanently stale.
@@ -266,10 +284,18 @@ impl Astera {
             );
             return;
         };
+        let buffer =
+            smithay::backend::renderer::utils::with_renderer_surface_state(wl_surface, |state| {
+                state.buffer().cloned()
+            })
+            .flatten();
         compositor::with_states(wl_surface, |states| {
             let mut attributes = states.cached_state.get::<SurfaceAttributes>();
             let attributes = attributes.current();
-            let Some(BufferAssignment::NewBuffer(buffer)) = attributes.buffer.as_ref() else {
+            // A commit without wl_surface.attach reuses the current buffer. Validate the actual
+            // post-commit renderer state; requiring BufferAssignment::NewBuffer here incorrectly
+            // rejects ordinary damage-only commits as null-buffer commits.
+            let Some(buffer) = buffer.as_ref() else {
                 surface.protocol.post_error(
                     ext_session_lock_surface_v1::Error::NullBuffer,
                     "lock surfaces must always have a buffer",

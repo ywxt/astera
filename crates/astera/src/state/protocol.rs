@@ -96,7 +96,22 @@ impl XdgActivationHandler for Astera {
         }
 
         let window = self.windows[index].id;
+        let was_minimized = self
+            .desktop
+            .find_window(window)
+            .ok()
+            .and_then(|workspace| self.desktop.workspace(workspace).ok())
+            .is_some_and(|workspace| workspace.window_mode(window) == Some(WindowMode::Minimized));
         if let Ok(workspace) = self.desktop.focus_window(window) {
+            if was_minimized
+                && let Some(mode) = self
+                    .desktop
+                    .workspace(workspace)
+                    .ok()
+                    .and_then(|workspace| workspace.window_mode(window))
+            {
+                self.configure_window_mode(window, mode);
+            }
             if let Ok(location) = self.desktop.workspace_location(workspace)
                 && let Some(output) = location.output
             {
@@ -152,6 +167,42 @@ impl DmabufHandler for Astera {
         // Renderer ownership lives in the backend, so validation is deferred until its next tick.
         self.pending_dmabufs.push((dmabuf, notifier));
     }
+
+    fn new_surface_feedback(
+        &mut self,
+        surface: &WlSurface,
+        _global: &DmabufGlobal,
+    ) -> Option<DmabufFeedback> {
+        let output = self
+            .output_runtime
+            .iter()
+            .find_map(|(output, runtime)| {
+                runtime
+                    .entered_surfaces
+                    .contains(surface)
+                    .then_some(*output)
+            })
+            .or_else(|| {
+                self.layers.iter().find_map(|layer| {
+                    surface_tree_contains(layer.surface.wl_surface(), surface)
+                        .then_some(layer.output)
+                })
+            })
+            .or_else(|| {
+                self.windows.iter().find_map(|window| {
+                    if !surface_tree_contains(window.surface.wl_surface(), surface) {
+                        return None;
+                    }
+                    self.desktop
+                        .find_window(window.id)
+                        .ok()
+                        .and_then(|workspace| self.desktop.workspace_location(workspace).ok())
+                        .and_then(|location| location.output)
+                })
+            })
+            .unwrap_or(self.active_output);
+        self.dmabuf_output_feedback.get(&output).cloned()
+    }
 }
 
 impl OutputHandler for Astera {}
@@ -188,6 +239,10 @@ impl CompositorHandler for Astera {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        let was_entered = self
+            .output_runtime
+            .values()
+            .any(|runtime| runtime.entered_surfaces.contains(surface));
         on_commit_buffer_handler::<Self>(surface);
         self.validate_lock_surface_commit(surface);
         self.popup_manager.commit(surface);
@@ -199,10 +254,16 @@ impl CompositorHandler for Astera {
         // null-buffer commit is protocol setup, however, and must not consume a
         // host frame before the surface maps.
         if committed_buffer
+            || was_entered
             || self.is_cursor_surface(surface)
             || self.is_input_method_popup_surface(surface)
         {
             self.mark_render_dirty();
+        }
+        // Popup and subsurface roots do not have their own mapping callback. Once their first
+        // buffer becomes visible, immediately update wl_surface.enter and fractional scale.
+        if committed_buffer && !was_entered {
+            self.refresh_visible_scales();
         }
         if self
             .lock_surfaces
@@ -256,11 +317,33 @@ impl CompositorHandler for Astera {
             {
                 mapped.mapped = has_buffer;
                 mapped.layer = layer.layer();
+                if !has_buffer && self.on_demand_layer_focus == Some(mapped.id) {
+                    self.on_demand_layer_focus = None;
+                }
             }
             self.configure_layer_surface(&layer);
             self.refresh_visible_scales();
             self.sync_keyboard_focus();
             self.mark_public_dirty();
+        }
+    }
+
+    fn destroyed(&mut self, surface: &WlSurface) {
+        let was_visible = self
+            .output_runtime
+            .values()
+            .any(|runtime| runtime.entered_surfaces.contains(surface));
+        let was_pointer_visual = self.is_cursor_surface(surface);
+        if self.dnd_icon.as_ref() == Some(surface) {
+            self.dnd_icon = None;
+        }
+        // An idle inhibitor can outlive its wl_surface object. The protocol no longer allows it
+        // to suppress idle once that surface has left the visible scene, so resume timers now
+        // instead of waiting for the inhibitor object itself to be destroyed.
+        self.refresh_idle_inhibition();
+        if was_visible || was_pointer_visual {
+            self.mark_render_dirty();
+            self.refresh_visible_scales();
         }
     }
 }
@@ -311,6 +394,12 @@ impl WlrLayerShellHandler for Astera {
     }
 
     fn new_popup(&mut self, _parent: LayerSurface, popup: PopupSurface) {
+        // An xdg popup used by layer-shell is initially created without an xdg parent.  Its real
+        // root only becomes discoverable when get_popup assigns the layer surface here, so the
+        // generic XDG new_popup callback cannot constrain it correctly on its first pass.
+        let positioner = popup.with_pending_state(|state| state.positioner);
+        let geometry = self.constrain_popup_geometry(&popup, positioner);
+        popup.with_pending_state(|state| state.geometry = geometry);
         if let Err(error) = self.popup_manager.track_popup(popup.clone().into()) {
             tracing::warn!(%error, "could not track layer popup");
             return;
@@ -329,6 +418,15 @@ impl WlrLayerShellHandler for Astera {
             && let Some(runtime) = self.output_runtime.get(&mapped.output)
         {
             layer_map_for_output(&runtime.wayland).unmap_layer(&mapped.surface);
+        }
+        if let Some(id) = self
+            .layers
+            .iter()
+            .find(|mapped| mapped.surface.layer_surface() == &surface)
+            .map(|mapped| mapped.id)
+            && self.on_demand_layer_focus == Some(id)
+        {
+            self.on_demand_layer_focus = None;
         }
         self.layers
             .retain(|mapped| mapped.surface.layer_surface() != &surface);
@@ -364,15 +462,17 @@ impl XdgShellHandler for Astera {
             id,
             surface,
             mapped: false,
+            initial_mode: None,
             urgent: false,
         });
         tracing::debug!(window = ?id, "toplevel role created");
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        let geometry = self.constrain_popup_geometry(&surface, positioner);
         surface.with_pending_state(|state| {
             state.positioner = positioner;
-            state.geometry = positioner.get_geometry();
+            state.geometry = geometry;
         });
         if let Err(error) = self.popup_manager.track_popup(surface.clone().into()) {
             tracing::warn!(%error, "could not track xdg popup");
@@ -383,7 +483,167 @@ impl XdgShellHandler for Astera {
         }
     }
 
+    fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        if !self.seat.owns(&seat) || !self.pointer.has_grab(serial) || self.drag.is_some() {
+            return;
+        }
+        let Some(requested) = self
+            .windows
+            .iter()
+            .find(|window| window.mapped && window.surface == surface)
+            .map(|window| window.id)
+        else {
+            return;
+        };
+        let under_pointer = self
+            .surface_under(self.pointer_location)
+            .and_then(|(_, _, window)| window);
+        if under_pointer != Some(requested) {
+            return;
+        }
+        self.begin_drag();
+    }
+
+    fn resize_request(
+        &mut self,
+        surface: ToplevelSurface,
+        seat: wl_seat::WlSeat,
+        serial: Serial,
+        edges: xdg_toplevel::ResizeEdge,
+    ) {
+        if !self.seat.owns(&seat) || !self.pointer.has_grab(serial) || self.drag.is_some() {
+            return;
+        }
+        let Some(requested) = self
+            .windows
+            .iter()
+            .find(|window| window.mapped && window.surface == surface)
+            .map(|window| window.id)
+        else {
+            return;
+        };
+        let under_pointer = self
+            .surface_under(self.pointer_location)
+            .and_then(|(_, _, window)| window);
+        if under_pointer != Some(requested) {
+            return;
+        }
+        let edges = match edges {
+            xdg_toplevel::ResizeEdge::Top => ResizeEdges {
+                top: true,
+                bottom: false,
+                left: false,
+                right: false,
+            },
+            xdg_toplevel::ResizeEdge::Bottom => ResizeEdges {
+                top: false,
+                bottom: true,
+                left: false,
+                right: false,
+            },
+            xdg_toplevel::ResizeEdge::Left => ResizeEdges {
+                top: false,
+                bottom: false,
+                left: true,
+                right: false,
+            },
+            xdg_toplevel::ResizeEdge::Right => ResizeEdges {
+                top: false,
+                bottom: false,
+                left: false,
+                right: true,
+            },
+            xdg_toplevel::ResizeEdge::TopLeft => ResizeEdges {
+                top: true,
+                bottom: false,
+                left: true,
+                right: false,
+            },
+            xdg_toplevel::ResizeEdge::BottomLeft => ResizeEdges {
+                top: false,
+                bottom: true,
+                left: true,
+                right: false,
+            },
+            xdg_toplevel::ResizeEdge::TopRight => ResizeEdges {
+                top: true,
+                bottom: false,
+                left: false,
+                right: true,
+            },
+            xdg_toplevel::ResizeEdge::BottomRight => ResizeEdges {
+                top: false,
+                bottom: true,
+                left: false,
+                right: true,
+            },
+            xdg_toplevel::ResizeEdge::None => return,
+            _ => return,
+        };
+        self.begin_resize(requested, edges);
+    }
+
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        if self.queue_initial_toplevel_mode(&surface, Some(WindowMode::Maximized)) {
+            return;
+        }
+        self.apply_toplevel_mode_request(&surface, WindowMode::Maximized);
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        if self.clear_initial_toplevel_mode(&surface, WindowMode::Maximized) {
+            return;
+        }
+        let Some(window) = self
+            .windows
+            .iter()
+            .find(|window| window.mapped && window.surface == surface)
+            .map(|window| window.id)
+        else {
+            return;
+        };
+        let Ok(workspace_id) = self.desktop.find_window(window) else {
+            return;
+        };
+        let Some(target) = self
+            .desktop
+            .workspace(workspace_id)
+            .ok()
+            .and_then(|workspace| workspace.maximized.as_ref())
+            .filter(|maximized| maximized.window == window)
+            .map(|maximized| match maximized.restore {
+                RestorePlacement::Tiled { .. } => WindowMode::Tiled,
+                RestorePlacement::Floating { .. } => WindowMode::Floating,
+            })
+        else {
+            return;
+        };
+        self.apply_toplevel_mode_request(&surface, target);
+    }
+
+    fn minimize_request(&mut self, surface: ToplevelSurface) {
+        self.apply_toplevel_mode_request(&surface, WindowMode::Minimized);
+    }
+
     fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<WlOutput>) {
+        if let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| !window.mapped && window.surface == surface)
+        {
+            if let Some(requested) = output
+                && !self.output_runtime[&self.active_output]
+                    .wayland
+                    .owns(&requested)
+            {
+                tracing::warn!("initial fullscreen request targeted an inactive output");
+                surface.send_configure();
+                return;
+            }
+            self.windows[index].initial_mode = Some(WindowMode::Fullscreen);
+            self.configure_initial_toplevel_mode(index);
+            return;
+        }
         let Some(window) = self
             .windows
             .iter()
@@ -437,6 +697,9 @@ impl XdgShellHandler for Astera {
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        if self.clear_initial_toplevel_mode(&surface, WindowMode::Fullscreen) {
+            return;
+        }
         let Some(window) = self
             .windows
             .iter()
@@ -521,12 +784,19 @@ impl XdgShellHandler for Astera {
                 .apply_window(workspace, WindowTransaction::Remove { id: window.id });
         }
         if self.drag.is_some_and(|drag| drag.window == window.id) {
-            self.drag = None;
+            self.cancel_drag();
         }
         tracing::info!(window = ?window.id, "toplevel role destroyed");
         self.mark_public_dirty();
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
+    }
+
+    fn popup_destroyed(&mut self, _surface: PopupSurface) {
+        self.popup_manager.cleanup();
+        self.mark_render_dirty();
+        self.refresh_visible_scales();
+        self.handle_pointer_motion(self.pointer_location, 0);
     }
 
     fn reposition_request(
@@ -535,11 +805,239 @@ impl XdgShellHandler for Astera {
         positioner: PositionerState,
         token: u32,
     ) {
+        let geometry = self.constrain_popup_geometry(&surface, positioner);
         surface.with_pending_state(|state| {
             state.positioner = positioner;
-            state.geometry = positioner.get_geometry();
+            state.geometry = geometry;
         });
+        // Smithay emits the complete repositioned -> popup.configure -> xdg_surface.configure
+        // sequence and records its acknowledgement serial in this call.
         surface.send_repositioned(token);
+    }
+}
+
+impl Astera {
+    pub(super) fn reconstrain_reactive_popups(&mut self) {
+        // Collect first because calculating a popup target reads the complete desktop/layer scene,
+        // while sending a configure mutates protocol state.
+        let roots = self
+            .windows
+            .iter()
+            .map(|window| window.surface.wl_surface().clone())
+            .chain(
+                self.layers
+                    .iter()
+                    .map(|layer| layer.surface.wl_surface().clone()),
+            )
+            .collect::<Vec<_>>();
+        let popups = roots
+            .iter()
+            .flat_map(PopupManager::popups_for_surface)
+            .filter_map(|(popup, _)| match popup {
+                PopupKind::Xdg(popup) => Some(popup),
+                PopupKind::InputMethod(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        for popup in popups {
+            let (positioner, previous) =
+                popup.with_pending_state(|state| (state.positioner, state.geometry));
+            if !positioner.reactive {
+                continue;
+            }
+            let geometry = self.constrain_popup_geometry(&popup, positioner);
+            if geometry == previous {
+                continue;
+            }
+            popup.with_pending_state(|state| state.geometry = geometry);
+            if let Err(error) = popup.send_pending_configure() {
+                tracing::warn!(%error, "could not reconfigure reactive xdg popup");
+            }
+        }
+    }
+
+    /// Apply xdg-positioner's flip/slide/resize rules in coordinates relative to the popup's
+    /// immediate parent window geometry. PopupManager reports nested popup offsets relative to
+    /// the root, which keeps this correct for submenu trees as well as direct toplevel children.
+    fn constrain_popup_geometry(
+        &self,
+        surface: &PopupSurface,
+        positioner: PositionerState,
+    ) -> SmithayRectangle<i32, Logical> {
+        let fallback = positioner.get_geometry();
+        let popup = PopupKind::from(surface.clone());
+        let Ok(root) = find_popup_root_surface(&popup) else {
+            return fallback;
+        };
+        let Some(parent) = surface.get_parent_surface() else {
+            return fallback;
+        };
+
+        let parent_offset = if parent == root {
+            SmithayPoint::from((0, 0))
+        } else {
+            let Some((_, offset)) = PopupManager::popups_for_surface(&root)
+                .find(|(popup, _)| popup.wl_surface() == &parent)
+            else {
+                return fallback;
+            };
+            offset
+        };
+
+        let window_root = self
+            .windows
+            .iter()
+            .find(|window| window.mapped && window.surface.wl_surface() == &root)
+            .and_then(|window| {
+                let workspace = self.desktop.find_window(window.id).ok()?;
+                let output = self.desktop.workspace_location(workspace).ok()?.output?;
+                let (origin, _, scale, _) = self.visual_geometry_for_output(output, window.id)?;
+                Some((output, origin, scale))
+            });
+        let layer_root = self
+            .layers
+            .iter()
+            // Layer popups are assigned before the parent attaches its first buffer. The layer
+            // map already has authoritative geometry at that point, so mapping is not required
+            // to constrain the popup's initial configure.
+            .find(|layer| layer.surface.wl_surface() == &root)
+            .and_then(|layer| {
+                let (origin, _) = self.layer_geometry(layer)?;
+                Some((layer.output, origin, 1.0))
+            });
+        let Some((output, origin, scale)) = window_root.or(layer_root) else {
+            return fallback;
+        };
+        let Some(output_size) = self
+            .desktop
+            .output(output)
+            .map(|output| output.logical_size)
+        else {
+            return fallback;
+        };
+
+        let parent_x = origin.x as f64 / scale + f64::from(parent_offset.x);
+        let parent_y = origin.y as f64 / scale + f64::from(parent_offset.y);
+        let target = SmithayRectangle::new(
+            ((-parent_x).round() as i32, (-parent_y).round() as i32).into(),
+            (
+                (output_size.width as f64 / scale).round() as i32,
+                (output_size.height as f64 / scale).round() as i32,
+            )
+                .into(),
+        );
+        positioner.get_unconstrained_geometry(target)
+    }
+
+    fn queue_initial_toplevel_mode(
+        &mut self,
+        surface: &ToplevelSurface,
+        mode: Option<WindowMode>,
+    ) -> bool {
+        let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| !window.mapped && &window.surface == surface)
+        else {
+            return false;
+        };
+        self.windows[index].initial_mode = mode;
+        self.configure_initial_toplevel_mode(index);
+        true
+    }
+
+    fn clear_initial_toplevel_mode(
+        &mut self,
+        surface: &ToplevelSurface,
+        expected: WindowMode,
+    ) -> bool {
+        let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| !window.mapped && &window.surface == surface)
+        else {
+            return false;
+        };
+        if self.windows[index].initial_mode == Some(expected) {
+            self.windows[index].initial_mode = None;
+        }
+        self.configure_initial_toplevel_mode(index);
+        true
+    }
+
+    fn configure_initial_toplevel_mode(&self, index: usize) {
+        let mode = self.windows[index].initial_mode;
+        let size = match mode {
+            Some(WindowMode::Fullscreen) => self
+                .desktop
+                .output(self.active_output)
+                .map(|output| output.logical_size),
+            Some(WindowMode::Maximized) => {
+                self.usable_rect(self.active_output).map(|rect| rect.size)
+            }
+            _ => Some(DEFAULT_WINDOW_SIZE),
+        };
+        let surface = &self.windows[index].surface;
+        surface.with_pending_state(|state| {
+            state.size =
+                size.map(|size| (saturating_i32(size.width), saturating_i32(size.height)).into());
+            if mode == Some(WindowMode::Fullscreen) {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+            } else {
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+            }
+            if mode == Some(WindowMode::Maximized) {
+                state.states.set(xdg_toplevel::State::Maximized);
+            } else {
+                state.states.unset(xdg_toplevel::State::Maximized);
+            }
+        });
+        surface.send_pending_configure();
+    }
+
+    fn apply_toplevel_mode_request(&mut self, surface: &ToplevelSurface, mode: WindowMode) {
+        let Some(window) = self
+            .windows
+            .iter()
+            .find(|window| window.mapped && &window.surface == surface)
+            .map(|window| window.id)
+        else {
+            return;
+        };
+        let Ok(workspace) = self.desktop.find_window(window) else {
+            return;
+        };
+        let Some(viewport_size) = self
+            .desktop
+            .workspace_location(workspace)
+            .ok()
+            .and_then(|location| location.output)
+            .and_then(|output| self.desktop.output(output))
+            .map(|output| output.logical_size)
+        else {
+            return;
+        };
+        match self.desktop.apply_window(
+            workspace,
+            WindowTransaction::SetMode {
+                id: window,
+                mode,
+                viewport_size,
+            },
+        ) {
+            Ok(()) => {
+                self.configure_window_mode(window, mode);
+                self.refresh_visible_scales();
+                self.sync_keyboard_focus();
+                self.mark_public_dirty();
+            }
+            Err(error) => {
+                tracing::warn!(?window, ?mode, %error, "xdg toplevel mode request rejected");
+                // The request did not change compositor state.  A configure makes the current
+                // state authoritative so clients do not wait indefinitely for an accepted mode.
+                surface.send_configure();
+            }
+        }
     }
 }
 
@@ -560,6 +1058,7 @@ impl SeatHandler for Astera {
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         self.update_shortcut_inhibitor(seat, focused);
+        set_data_device_focus(&self.display, seat, focused.and_then(Resource::client));
     }
 
     fn cursor_image(
@@ -667,7 +1166,24 @@ impl DataDeviceHandler for Astera {
     }
 }
 
-impl ClientDndGrabHandler for Astera {}
+impl ClientDndGrabHandler for Astera {
+    fn started(
+        &mut self,
+        _source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
+        icon: Option<WlSurface>,
+        _seat: Seat<Self>,
+    ) {
+        self.dnd_icon = icon;
+        self.mark_render_dirty();
+        self.refresh_visible_scales();
+    }
+
+    fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+        self.dnd_icon = None;
+        self.mark_render_dirty();
+        self.refresh_visible_scales();
+    }
+}
 
 impl ServerDndGrabHandler for Astera {
     fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<Self>) {}
@@ -709,19 +1225,46 @@ impl smithay::reexports::wayland_server::Dispatch<
         display: &DisplayHandle,
         data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
     ) {
-        if matches!(
-            request,
-            smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_manager_v2::Request::GetInputMethod { .. }
-        ) {
-            if state.input_method_claimed {
-                resource.post_error(0u32, "this seat already has an input method");
-                return;
+        use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_manager_v2::Request;
+        if state.input_method_claimed {
+            match request {
+                Request::GetInputMethod { input_method, .. } => {
+                    // input-method-v2 requires a second instance to be created and receive the sole
+                    // `unavailable` event. It is not a protocol error on the manager or connection.
+                    let input_method = data_init.init(input_method, ());
+                    input_method.unavailable();
+                    return;
+                }
+                request => {
+                    return <InputMethodManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                        state, client, resource, request, data, display, data_init,
+                    );
+                }
             }
+        } else if matches!(&request, Request::GetInputMethod { .. }) {
             state.input_method_claimed = true;
         }
         <InputMethodManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
             state, client, resource, request, data, display, data_init,
         );
+    }
+}
+
+impl smithay::reexports::wayland_server::Dispatch<
+    smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::ZwpInputMethodV2,
+    (),
+> for Astera
+{
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::ZwpInputMethodV2,
+        _request: smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::Request,
+        _data: &(),
+        _display: &DisplayHandle,
+        _data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        // Objects rejected with `unavailable` are inert for the rest of their lifetime.
     }
 }
 

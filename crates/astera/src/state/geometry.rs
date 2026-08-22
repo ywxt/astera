@@ -10,6 +10,7 @@ pub(super) fn mode_layer(mode: WindowMode) -> u8 {
         WindowMode::Tiled => 2,
         WindowMode::Floating | WindowMode::Maximized => 3,
         WindowMode::Fullscreen => 5,
+        WindowMode::Minimized => 0,
     }
 }
 

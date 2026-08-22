@@ -259,6 +259,22 @@ impl NativeLoop {
         if scene_changed {
             self.request_all(RepaintReasons::DAMAGE);
         }
+        // dmabuf creation must complete while outputs are powered off as well. It only needs a
+        // renderer import check, not a KMS frame or presentation opportunity.
+        if self.state.has_pending_dmabuf_imports() {
+            if let Some(node) = self.devices.keys().next().copied() {
+                match self.gpus.single_renderer(&node) {
+                    Ok(mut renderer) => self.state.validate_dmabuf_imports(&mut renderer),
+                    Err(error) => {
+                        tracing::warn!(?node, %error, "could not validate pending dmabuf imports");
+                        self.state.fail_pending_dmabuf_imports();
+                    }
+                }
+            } else {
+                tracing::warn!("rejecting pending dmabuf imports because no GPU is available");
+                self.state.fail_pending_dmabuf_imports();
+            }
+        }
         self.apply_output_power_requests();
         Ok(())
     }
@@ -500,7 +516,8 @@ impl NativeLoop {
         );
         let exporter = GbmFramebufferExporter::new(gbm.clone(), Some(node));
         let render_formats = self.gpus.single_renderer(&node)?.dmabuf_formats();
-        self.state.enable_dmabuf(render_formats.clone());
+        self.state
+            .enable_dmabuf(Some(node.dev_id()), render_formats.clone());
         let output_manager = DrmOutputManager::new(
             drm,
             allocator,
@@ -614,6 +631,11 @@ impl NativeLoop {
                                     continue;
                                 }
                             };
+                            self.state.register_output_dmabuf_feedback(
+                                id,
+                                node.dev_id(),
+                                renderer.dmabuf_formats(),
+                            );
                             let device = self.devices.get_mut(&node).unwrap();
                             let planes = device.output_manager.device().planes(&crtc).ok();
                             let initial = DrmOutputRenderElements::<
@@ -1020,6 +1042,18 @@ impl NativeLoop {
                 elements
             })
             .collect();
+        if let Some((icon, location, scale)) = self.state.dnd_icon_render_source(output) {
+            let icon_elements = surface_tree_snapshot(
+                &mut renderer,
+                &icon,
+                location,
+                scale,
+                1.0,
+                Kind::Cursor,
+                &mut callbacks,
+            );
+            elements.splice(0..0, icon_elements.into_iter().map(Into::into));
+        }
         if let Some(cursor) = self.state.cursor_render_source(output) {
             match cursor {
                 CursorRenderSource::Surface {

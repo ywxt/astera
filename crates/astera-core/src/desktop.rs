@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::{
-    FullscreenRestorePlacement, LayoutError, Output, OutputId, OutputTransform, OutputWorkspaceSet,
-    Point, RadialSolver, RestorePlacement, Scale120, Size, WindowId, WindowMode, WindowTransaction,
-    Workspace, WorkspaceId,
+    FullscreenRestorePlacement, LayoutError, MinimizedRestorePlacement, Output, OutputId,
+    OutputTransform, OutputWorkspaceSet, Point, RadialSolver, RestorePlacement, Scale120, Size,
+    WindowId, WindowMode, WindowTransaction, Workspace, WorkspaceId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -445,6 +445,18 @@ impl Desktop {
         let mut working = self.clone();
         let workspace = working.find_window(window)?;
         let viewport = working.workspace_viewport_size(workspace);
+        if working.workspace(workspace)?.window_mode(window) == Some(WindowMode::Minimized) {
+            let target = working.workspace(workspace)?.minimized[&window].restore_mode();
+            let solver = working.solver.clone();
+            solver.apply(
+                working.workspace_mut(workspace)?,
+                WindowTransaction::SetMode {
+                    id: window,
+                    mode: target,
+                    viewport_size: viewport.unwrap_or(Size::new(1, 1)),
+                },
+            )?;
+        }
         working.workspace_mut(workspace)?.focus(window);
         if let Some(viewport) = viewport {
             working.workspace_mut(workspace)?.follow_focus(viewport);
@@ -472,13 +484,18 @@ impl Desktop {
         let Some(mode) = state.window_mode(focused) else {
             return Ok(None);
         };
-        if matches!(mode, WindowMode::Maximized | WindowMode::Fullscreen) {
+        if matches!(
+            mode,
+            WindowMode::Maximized | WindowMode::Fullscreen | WindowMode::Minimized
+        ) {
             return Ok(None);
         }
         let origin = match mode {
             WindowMode::Tiled => state.tiled[&focused].geometry.center(),
             WindowMode::Floating => state.floating[&focused].viewport.rect.center(),
-            WindowMode::Maximized | WindowMode::Fullscreen => unreachable!(),
+            WindowMode::Maximized | WindowMode::Fullscreen | WindowMode::Minimized => {
+                unreachable!()
+            }
         };
         let direction = direction.normalized();
         let candidates: Box<dyn Iterator<Item = (WindowId, Point)> + '_> = match mode {
@@ -494,7 +511,9 @@ impl Desktop {
                     .iter()
                     .map(|(id, window)| (*id, window.viewport.rect.center())),
             ),
-            WindowMode::Maximized | WindowMode::Fullscreen => unreachable!(),
+            WindowMode::Maximized | WindowMode::Fullscreen | WindowMode::Minimized => {
+                unreachable!()
+            }
         };
         let target = candidates
             .filter(|(id, _)| *id != focused)
@@ -754,8 +773,35 @@ impl Desktop {
                 self.workspace_mut(target)?.fullscreen = Some(fullscreen);
                 self.workspace_mut(target)?.focus(window);
             }
+            WindowMode::Minimized => {
+                let mut minimized = self
+                    .workspace_mut(source)?
+                    .minimized
+                    .remove(&window)
+                    .unwrap();
+                if let (Some(viewport), Some((target_key, target_size))) = (
+                    minimized_floating_restore_mut(&mut minimized.restore),
+                    &target_viewport,
+                ) {
+                    migrate_viewport_placement(
+                        viewport,
+                        source_viewport
+                            .as_ref()
+                            .map(|(key, size)| (key.as_str(), *size)),
+                        target_key,
+                        *target_size,
+                    );
+                }
+                self.workspace_mut(source)?.remove_focus(window);
+                self.workspace_mut(target)?
+                    .minimized
+                    .insert(window, minimized);
+            }
         }
         self.reset_original_output_for_ordinary(target);
+        if activate && mode == WindowMode::Minimized {
+            self.focus_window(window)?;
+        }
         if activate
             && let Ok(location) = self.workspace_location(target)
             && let Some(output) = location.output
@@ -913,6 +959,7 @@ impl Desktop {
                         .map(|maximized| &maximized.window),
                 )
                 .chain(workspace.fullscreen.iter().map(|full| &full.window))
+                .chain(workspace.minimized.keys())
             {
                 if let Some(first) = windows.insert(*window, workspace.id) {
                     return Err(DesktopError::DuplicateWindow {
@@ -946,6 +993,10 @@ fn validate_workspace_state(workspace: &Workspace) -> Result<(), DesktopError> {
         .floating
         .iter()
         .all(|(id, placement)| *id == placement.window && placement.viewport.rect.size.is_valid());
+    let minimized_valid = workspace
+        .minimized
+        .iter()
+        .all(|(id, placement)| *id == placement.window && placement.size().is_valid());
     let focus_valid = workspace
         .focused_window
         .is_none_or(|window| workspace.contains_window(window));
@@ -954,7 +1005,7 @@ fn validate_workspace_state(workspace: &Workspace) -> Result<(), DesktopError> {
         .focus_history
         .iter()
         .all(|window| workspace.contains_window(*window) && history.insert(*window, ()).is_none());
-    if tiled_valid && floating_valid && focus_valid && history_valid {
+    if tiled_valid && floating_valid && minimized_valid && focus_valid && history_valid {
         Ok(())
     } else {
         Err(DesktopError::InvalidWorkspaceState(workspace.id))
@@ -968,6 +1019,7 @@ impl Workspace {
             || !self.floating.is_empty()
             || self.maximized.is_some()
             || self.fullscreen.is_some()
+            || !self.minimized.is_empty()
     }
 }
 
@@ -984,6 +1036,11 @@ fn store_workspace_viewport(workspace: &mut Workspace, key: &str, size: Size) {
         && let Some(viewport) = fullscreen_floating_restore_mut(&mut fullscreen.restore)
     {
         viewport.store_for_output(key, size);
+    }
+    for minimized in workspace.minimized.values_mut() {
+        if let Some(viewport) = minimized_floating_restore_mut(&mut minimized.restore) {
+            viewport.store_for_output(key, size);
+        }
     }
 }
 
@@ -1005,6 +1062,11 @@ fn migrate_workspace_viewport(
         && let Some(viewport) = fullscreen_floating_restore_mut(&mut fullscreen.restore)
     {
         migrate_viewport_placement(viewport, source, target_key, target_size);
+    }
+    for minimized in workspace.minimized.values_mut() {
+        if let Some(viewport) = minimized_floating_restore_mut(&mut minimized.restore) {
+            migrate_viewport_placement(viewport, source, target_key, target_size);
+        }
     }
 }
 
@@ -1050,6 +1112,29 @@ fn remap_floating(workspace: &mut Workspace, key: &str, old: Size, new: Size) {
         && let Some(viewport) = fullscreen_floating_restore_mut(&mut fullscreen.restore)
     {
         remap_viewport(viewport, key, old, new);
+    }
+    for minimized in workspace.minimized.values_mut() {
+        if let Some(viewport) = minimized_floating_restore_mut(&mut minimized.restore) {
+            remap_viewport(viewport, key, old, new);
+        }
+    }
+}
+
+fn minimized_floating_restore_mut(
+    restore: &mut MinimizedRestorePlacement,
+) -> Option<&mut crate::ViewportPlacement> {
+    match restore {
+        MinimizedRestorePlacement::Floating { viewport }
+        | MinimizedRestorePlacement::Maximized {
+            restore: RestorePlacement::Floating { viewport },
+        } => Some(viewport),
+        MinimizedRestorePlacement::Fullscreen { restore } => {
+            fullscreen_floating_restore_mut(restore)
+        }
+        MinimizedRestorePlacement::Tiled { .. }
+        | MinimizedRestorePlacement::Maximized {
+            restore: RestorePlacement::Tiled { .. },
+        } => None,
     }
 }
 

@@ -20,6 +20,7 @@ pub enum WindowMode {
     Floating,
     Maximized,
     Fullscreen,
+    Minimized,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -233,6 +234,40 @@ pub struct FullscreenPlacement {
     pub restore: FullscreenRestorePlacement,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MinimizedRestorePlacement {
+    Tiled { world_rect: Rect },
+    Floating { viewport: ViewportPlacement },
+    Maximized { restore: RestorePlacement },
+    Fullscreen { restore: FullscreenRestorePlacement },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MinimizedPlacement {
+    pub window: WindowId,
+    pub restore: MinimizedRestorePlacement,
+}
+
+impl MinimizedPlacement {
+    pub fn restore_mode(&self) -> WindowMode {
+        match self.restore {
+            MinimizedRestorePlacement::Tiled { .. } => WindowMode::Tiled,
+            MinimizedRestorePlacement::Floating { .. } => WindowMode::Floating,
+            MinimizedRestorePlacement::Maximized { .. } => WindowMode::Maximized,
+            MinimizedRestorePlacement::Fullscreen { .. } => WindowMode::Fullscreen,
+        }
+    }
+
+    pub fn size(&self) -> Size {
+        match &self.restore {
+            MinimizedRestorePlacement::Tiled { world_rect } => world_rect.size,
+            MinimizedRestorePlacement::Floating { viewport } => viewport.rect.size,
+            MinimizedRestorePlacement::Maximized { restore } => restore_size(restore),
+            MinimizedRestorePlacement::Fullscreen { restore } => fullscreen_restore_size(restore),
+        }
+    }
+}
+
 impl FullscreenPlacement {
     pub fn size(&self) -> Size {
         match &self.restore {
@@ -246,6 +281,21 @@ impl FullscreenPlacement {
     }
 }
 
+fn restore_size(restore: &RestorePlacement) -> Size {
+    match restore {
+        RestorePlacement::Tiled { world_rect } => world_rect.size,
+        RestorePlacement::Floating { viewport } => viewport.rect.size,
+    }
+}
+
+fn fullscreen_restore_size(restore: &FullscreenRestorePlacement) -> Size {
+    match restore {
+        FullscreenRestorePlacement::Tiled { world_rect } => world_rect.size,
+        FullscreenRestorePlacement::Floating { viewport } => viewport.rect.size,
+        FullscreenRestorePlacement::Maximized { restore } => restore_size(restore),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: WorkspaceId,
@@ -255,6 +305,8 @@ pub struct Workspace {
     pub floating: BTreeMap<WindowId, FloatingPlacement>,
     pub maximized: Option<MaximizedPlacement>,
     pub fullscreen: Option<FullscreenPlacement>,
+    #[serde(default)]
+    pub minimized: BTreeMap<WindowId, MinimizedPlacement>,
     pub camera: CameraState,
     pub focused_window: Option<WindowId>,
     pub focus_history: Vec<WindowId>,
@@ -272,6 +324,7 @@ impl Workspace {
             floating: BTreeMap::new(),
             maximized: None,
             fullscreen: None,
+            minimized: BTreeMap::new(),
             camera: CameraState::default(),
             focused_window: None,
             focus_history: Vec::new(),
@@ -301,6 +354,8 @@ impl Workspace {
             .is_some_and(|full| full.window == id)
         {
             Some(WindowMode::Fullscreen)
+        } else if self.minimized.contains_key(&id) {
+            Some(WindowMode::Minimized)
         } else {
             None
         }
@@ -323,11 +378,15 @@ impl Workspace {
                     })
             }
             WindowMode::Fullscreen => self.fullscreen.as_ref().map(FullscreenPlacement::size),
+            WindowMode::Minimized => self.minimized.get(&id).map(MinimizedPlacement::size),
         }
     }
 
     pub fn focus(&mut self, id: WindowId) -> bool {
-        if !self.contains_window(id) {
+        if self
+            .window_mode(id)
+            .is_none_or(|mode| mode == WindowMode::Minimized)
+        {
             return false;
         }
         self.focus_history.retain(|candidate| *candidate != id);
@@ -339,12 +398,10 @@ impl Workspace {
     pub fn remove_focus(&mut self, id: WindowId) {
         self.focus_history.retain(|candidate| *candidate != id);
         if self.focused_window == Some(id) {
-            self.focused_window = self
-                .focus_history
-                .iter()
-                .rev()
-                .copied()
-                .find(|candidate| self.contains_window(*candidate));
+            self.focused_window = self.focus_history.iter().rev().copied().find(|candidate| {
+                self.window_mode(*candidate)
+                    .is_some_and(|mode| mode != WindowMode::Minimized)
+            });
         }
     }
 

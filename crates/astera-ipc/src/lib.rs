@@ -255,6 +255,9 @@ pub mod wire {
                     astera_core::WindowMode::Floating => Self::Floating,
                     astera_core::WindowMode::Maximized => Self::Maximized,
                     astera_core::WindowMode::Fullscreen => Self::Fullscreen,
+                    // Minimized is a compositor visibility state, not a new v1 wire mode. Public
+                    // snapshots expose its saved base mode together with visible_geometry=None.
+                    astera_core::WindowMode::Minimized => Self::Tiled,
                 }
             }
         }

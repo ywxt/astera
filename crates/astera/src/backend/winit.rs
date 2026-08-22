@@ -9,6 +9,7 @@ use astera_config::Config;
 use astera_ipc::Command;
 use smithay::{
     backend::{
+        egl::EGLDevice,
         renderer::{
             Color32F, ImportDma,
             damage::OutputDamageTracker,
@@ -137,6 +138,11 @@ impl WinitLoop {
         self.state.process_key_repeats();
         self.state.process_idle_timers();
         self.state.remove_dead_windows();
+        // Import replies are protocol progress, not visual damage. Process them even when the
+        // host suppresses redraws for an occluded or hidden nested window.
+        if self.state.has_pending_dmabuf_imports() {
+            self.state.validate_dmabuf_imports(self.backend.renderer());
+        }
         let size = self.backend.window_size();
         self.state
             .update_output_size(i64::from(size.w), i64::from(size.h));
@@ -307,6 +313,20 @@ impl WinitLoop {
                     elements
                 })
                 .collect();
+            if let Some((icon, location, scale)) =
+                self.state.dnd_icon_render_source(astera_core::OutputId(0))
+            {
+                let icon_elements = surface_tree_snapshot(
+                    renderer,
+                    &icon,
+                    location,
+                    scale,
+                    1.0,
+                    Kind::Cursor,
+                    &mut frame_callbacks,
+                );
+                elements.splice(0..0, icon_elements.into_iter().map(Into::into));
+            }
             if let Some(cursor) = self.state.cursor_render_source(astera_core::OutputId(0)) {
                 match cursor {
                     CursorRenderSource::Surface {
@@ -450,7 +470,16 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     }
     // Capability discovery does not require binding the not-yet-configured host
     // EGL surface; doing so here can produce EGL_BAD_SURFACE on Wayland hosts.
-    state.enable_dmabuf(backend.renderer().dmabuf_formats());
+    let renderer = backend.renderer();
+    let formats = renderer.dmabuf_formats();
+    let main_device = EGLDevice::device_for_display(renderer.egl_context().display())
+        .ok()
+        .and_then(|device| device.try_get_render_node().ok().flatten())
+        .map(|node| node.dev_id());
+    state.enable_dmabuf(main_device, formats.clone());
+    if let Some(main_device) = main_device {
+        state.register_output_dmabuf_feedback(astera_core::OutputId(0), main_device, formats);
+    }
     let ipc = IpcServer::bind(&socket_name)?;
     let tracked_size = backend.window_size();
     let damage_tracker = OutputDamageTracker::new(tracked_size, 1.0, Transform::Flipped180);

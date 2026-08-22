@@ -53,6 +53,27 @@ fn center_insertion_pushes_surrounding_windows_outward() {
 }
 
 #[test]
+fn repeated_center_insertions_use_multiple_rays() {
+    let solver = RadialSolver::new(8);
+    let mut workspace = Workspace::new(WorkspaceId(1));
+    for id in 1..=4 {
+        insert(&solver, &mut workspace, id, Point::ORIGIN);
+    }
+
+    let centers = (1..=3)
+        .map(|id| workspace.tiled[&WindowId(id)].geometry.center())
+        .collect::<Vec<_>>();
+    assert!(centers.iter().any(|center| center.x < 0));
+    assert!(centers.iter().any(|center| center.x > 0));
+    assert!(centers.iter().any(|center| center.y != 0));
+    assert_eq!(
+        workspace.tiled[&WindowId(4)].geometry.center(),
+        Point::ORIGIN
+    );
+    assert!(workspace.tiled_windows_are_stable(8));
+}
+
+#[test]
 fn floating_and_fullscreen_never_participate_in_solver() {
     let solver = RadialSolver::new(8);
     let mut workspace = Workspace::new(WorkspaceId(1));
@@ -177,6 +198,83 @@ fn maximized_and_fullscreen_restore_stack_is_finite() {
 }
 
 #[test]
+fn minimized_windows_restore_their_exact_previous_mode() {
+    let solver = RadialSolver::new(8);
+    let mut workspace = Workspace::new(WorkspaceId(1));
+    let viewport = Size::new(800, 600);
+    insert(&solver, &mut workspace, 1, Point::ORIGIN);
+    let tiled = workspace.tiled[&WindowId(1)].geometry;
+
+    solver
+        .apply(
+            &mut workspace,
+            WindowTransaction::SetMode {
+                id: WindowId(1),
+                mode: WindowMode::Minimized,
+                viewport_size: viewport,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        workspace.window_mode(WindowId(1)),
+        Some(WindowMode::Minimized)
+    );
+    assert_eq!(workspace.focused_window, None);
+    assert!(workspace.focus_history.is_empty());
+    solver
+        .apply(
+            &mut workspace,
+            WindowTransaction::SetMode {
+                id: WindowId(1),
+                mode: WindowMode::Tiled,
+                viewport_size: viewport,
+            },
+        )
+        .unwrap();
+    assert_eq!(workspace.tiled[&WindowId(1)].geometry, tiled);
+
+    for mode in [
+        WindowMode::Floating,
+        WindowMode::Maximized,
+        WindowMode::Fullscreen,
+    ] {
+        solver
+            .apply(
+                &mut workspace,
+                WindowTransaction::SetMode {
+                    id: WindowId(1),
+                    mode,
+                    viewport_size: viewport,
+                },
+            )
+            .unwrap();
+        solver
+            .apply(
+                &mut workspace,
+                WindowTransaction::SetMode {
+                    id: WindowId(1),
+                    mode: WindowMode::Minimized,
+                    viewport_size: viewport,
+                },
+            )
+            .unwrap();
+        let restore = workspace.minimized[&WindowId(1)].restore_mode();
+        assert_eq!(restore, mode);
+        solver
+            .apply(
+                &mut workspace,
+                WindowTransaction::SetMode {
+                    id: WindowId(1),
+                    mode: restore,
+                    viewport_size: viewport,
+                },
+            )
+            .unwrap();
+        assert_eq!(workspace.window_mode(WindowId(1)), Some(mode));
+    }
+}
+
+#[test]
 fn maximized_is_excluded_from_solver_and_occupancy_conflicts_are_atomic() {
     let solver = RadialSolver::new(8);
     let mut workspace = Workspace::new(WorkspaceId(1));
@@ -243,6 +341,54 @@ fn finished_tiled_drag_snaps_to_nearby_edge_before_solving() {
         .unwrap();
     assert_eq!(workspace.tiled[&WindowId(2)].geometry.origin.x, 108);
     assert!(workspace.tiled_windows_are_stable(8));
+}
+
+#[test]
+fn tiled_resize_is_atomic_and_pushes_conflicts() {
+    let solver = RadialSolver::new(8);
+    let mut workspace = Workspace::new(WorkspaceId(1));
+    insert(&solver, &mut workspace, 1, Point::ORIGIN);
+    insert(&solver, &mut workspace, 2, Point::new(150, 0));
+
+    solver
+        .apply(
+            &mut workspace,
+            WindowTransaction::ResizeTiledFinished {
+                id: WindowId(1),
+                target: Rect::new(-50, -40, 220, 80),
+                seed_direction: Direction::RIGHT,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        workspace.tiled[&WindowId(1)].geometry.size,
+        Size::new(220, 80)
+    );
+    assert!(workspace.tiled[&WindowId(2)].geometry.origin.x >= 178);
+    assert!(workspace.tiled_windows_are_stable(8));
+}
+
+#[test]
+fn invalid_resize_rolls_back() {
+    let solver = RadialSolver::new(8);
+    let mut workspace = Workspace::new(WorkspaceId(1));
+    insert(&solver, &mut workspace, 1, Point::ORIGIN);
+    let before = workspace.clone();
+
+    assert_eq!(
+        solver.apply(
+            &mut workspace,
+            WindowTransaction::ResizeTiledFinished {
+                id: WindowId(1),
+                target: Rect::new(0, 0, 0, 80),
+                seed_direction: Direction::RIGHT,
+            },
+        ),
+        Err(LayoutError::InvalidSize)
+    );
+    assert_eq!(workspace.tiled, before.tiled);
+    assert_eq!(workspace.generation, before.generation);
 }
 
 #[test]

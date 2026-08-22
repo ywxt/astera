@@ -46,11 +46,7 @@ impl Astera {
 
     pub(crate) fn confirm_output_power(&mut self, output: OutputId, powered: bool) {
         self.output_power_modes.insert(output, powered);
-        if !powered {
-            // A successful KMS clear is itself a fail-closed lock presentation for this output.
-            let generation = self.locking_generation();
-            self.lock_frame_presented(output, generation);
-        }
+        self.session_output_powered(output, powered);
         if let Some(control) = self.output_power_controls.get(&output) {
             control.mode(if powered {
                 zwlr_output_power_v1::Mode::On

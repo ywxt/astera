@@ -41,7 +41,8 @@ use geometry::{
 use idle::{IdleEvent, IdleRuntime};
 use key_repeat::KeyRepeatState;
 use model::{
-    DragState, MappedInputMethodPopup, MappedLayer, MappedWindow, OutputRuntime, ProtocolState,
+    DragKind, DragState, MappedInputMethodPopup, MappedLayer, MappedWindow, OutputRuntime,
+    ProtocolState, ResizeEdges,
 };
 use output_power::OutputPowerGlobalData;
 use session_lock::{LockSurfaces, SessionState};
@@ -52,8 +53,8 @@ use astera_config::{
     WorkspaceSelector as BindingWorkspaceSelector,
 };
 use astera_core::{
-    Desktop, Output, OutputId, OutputTransform, Point, Size, WindowId, WindowMode,
-    WindowTransaction, WorkspaceId, WorkspaceTransaction,
+    Desktop, Output, OutputId, OutputTransform, Point, RestorePlacement, Size, WindowId,
+    WindowMode, WindowTransaction, WorkspaceId, WorkspaceTransaction,
 };
 use astera_ipc::{Command, ErrorCode, OutputSelector, Response, Success, WorkspaceSelector};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
@@ -98,7 +99,9 @@ use smithay::{
         backend::{ClientData, ClientId, DisconnectReason},
         protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
     },
-    utils::{IsAlive, Physical, Point as SmithayPoint, Serial},
+    utils::{
+        IsAlive, Logical, Physical, Point as SmithayPoint, Rectangle as SmithayRectangle, Serial,
+    },
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -106,7 +109,10 @@ use smithay::{
             with_states, with_surface_tree_downward,
         },
         cursor_shape::CursorShapeManagerState,
-        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
+        dmabuf::{
+            DmabufFeedback, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
+            SurfaceDmabufFeedbackState,
+        },
         fractional_scale::{
             FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
         },
@@ -126,6 +132,7 @@ use smithay::{
             SelectionHandler,
             data_device::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+                set_data_device_focus,
             },
         },
         session_lock::SessionLockManagerState,
@@ -134,8 +141,8 @@ use smithay::{
             WlrLayerShellHandler, WlrLayerShellState,
         },
         shell::xdg::{
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-            XdgToplevelSurfaceData,
+            PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface, XdgShellHandler,
+            XdgShellState, XdgToplevelSurfaceData,
             decoration::{XdgDecorationHandler, XdgDecorationState},
         },
         shm::{ShmHandler, ShmState},
@@ -158,6 +165,7 @@ pub struct Astera {
     active_output: OutputId,
     windows: Vec<MappedWindow>,
     layers: Vec<MappedLayer>,
+    on_demand_layer_focus: Option<u64>,
     input_method_popups: Vec<MappedInputMethodPopup>,
     input_method_claimed: bool,
     input_method_resource: Option<smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::ZwpInputMethodV2>,
@@ -165,6 +173,7 @@ pub struct Astera {
     next_layer_id: u64,
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
     cursor_image_status: smithay::input::pointer::CursorImageStatus,
+    dnd_icon: Option<WlSurface>,
     named_cursors: HashMap<(smithay::input::pointer::CursorIcon, u32), cursor::NamedCursor>,
     active_tablet_cursor: Option<smithay::backend::input::TabletToolDescriptor>,
     pointer_focus_origin: Option<(
@@ -204,6 +213,9 @@ pub struct Astera {
     output_configuration_supported: bool,
     pending_dmabufs: Vec<(Dmabuf, ImportNotifier)>,
     dmabuf_enabled: bool,
+    dmabuf_default_device: Option<u64>,
+    dmabuf_default_formats: Vec<Format>,
+    dmabuf_output_feedback: BTreeMap<OutputId, DmabufFeedback>,
     serial: u32,
     session_lock_manager: SessionLockManagerState,
     session_lock_advertised: Arc<AtomicBool>,
@@ -244,7 +256,14 @@ impl Astera {
     fn new_with_clock(display: &DisplayHandle, config: Config, clock: Arc<dyn Clock>) -> Self {
         let compositor_state = CompositorState::new::<Self>(display);
         display.create_global::<Self, smithay::reexports::wayland_protocols::ext::idle_notify::v1::server::ext_idle_notifier_v1::ExtIdleNotifierV1, _>(2, ());
-        let xdg_shell_state = XdgShellState::new::<Self>(display);
+        let xdg_shell_state = XdgShellState::new_with_capabilities::<Self>(
+            display,
+            [
+                xdg_toplevel::WmCapabilities::Fullscreen,
+                xdg_toplevel::WmCapabilities::Maximize,
+                xdg_toplevel::WmCapabilities::Minimize,
+            ],
+        );
         let xdg_decoration_state = XdgDecorationState::new::<Self>(display);
         let xdg_activation_state = XdgActivationState::new::<Self>(display);
         let layer_shell_state = WlrLayerShellState::new::<Self>(display);
@@ -382,6 +401,7 @@ impl Astera {
             active_output,
             windows: Vec::new(),
             layers: Vec::new(),
+            on_demand_layer_focus: None,
             input_method_popups: Vec::new(),
             input_method_claimed: false,
             input_method_resource: None,
@@ -391,6 +411,7 @@ impl Astera {
             cursor_image_status: smithay::input::pointer::CursorImageStatus::Named(
                 smithay::input::pointer::CursorIcon::Default,
             ),
+            dnd_icon: None,
             named_cursors: HashMap::from([(
                 (smithay::input::pointer::CursorIcon::Default, 120),
                 cursor::load_named_cursor(smithay::input::pointer::CursorIcon::Default, 120),
@@ -424,6 +445,9 @@ impl Astera {
             output_configuration_supported: true,
             pending_dmabufs: Vec::new(),
             dmabuf_enabled: false,
+            dmabuf_default_device: None,
+            dmabuf_default_formats: Vec::new(),
+            dmabuf_output_feedback: BTreeMap::new(),
             serial: 1,
             session_lock_manager,
             session_lock_advertised,
@@ -522,6 +546,7 @@ impl Astera {
             .output_runtime
             .remove(&output)
             .expect("desktop output has a Wayland runtime");
+        self.dmabuf_output_feedback.remove(&output);
         let empty = smithay::backend::renderer::element::RenderElementStates::default();
         for surface in &runtime.presented_surfaces {
             with_states(surface, |states| {
@@ -1186,16 +1211,21 @@ impl Astera {
             && let Some((surface, _, window)) = self.surface_under(self.pointer_location)
         {
             if let Some(window) = window {
+                self.on_demand_layer_focus = None;
                 if self.desktop.find_window(window).is_ok()
                     && self.desktop.focus_window(window).is_ok()
                 {
                     self.mark_public_dirty();
                 }
                 self.sync_keyboard_focus();
-            } else if self.layer_accepts_keyboard(&surface) {
+            } else if let Some((layer, target, interactivity)) =
+                self.layer_keyboard_target(&surface)
+            {
+                self.on_demand_layer_focus =
+                    (interactivity == KeyboardInteractivity::OnDemand).then_some(layer);
                 let keyboard = self.keyboard.clone();
                 let serial = self.next_serial();
-                keyboard.set_focus(self, Some(surface), serial);
+                keyboard.set_focus(self, Some(target), serial);
             }
         }
         // Scene-changing IPC/workspace actions may have changed the surface below a stationary
@@ -1245,7 +1275,10 @@ impl Astera {
         let Some((_, _, _, mode)) = self.visual_geometry(window) else {
             return;
         };
-        if matches!(mode, WindowMode::Maximized | WindowMode::Fullscreen) {
+        if matches!(
+            mode,
+            WindowMode::Maximized | WindowMode::Fullscreen | WindowMode::Minimized
+        ) {
             return;
         }
         let workspace_id = self.desktop.find_window(window).unwrap();
@@ -1255,15 +1288,23 @@ impl Astera {
         let start = match mode {
             WindowMode::Tiled => workspace.tiled[&window].geometry.origin,
             WindowMode::Floating => workspace.floating[&window].viewport.rect.origin,
-            WindowMode::Maximized | WindowMode::Fullscreen => unreachable!(),
+            WindowMode::Maximized | WindowMode::Fullscreen | WindowMode::Minimized => {
+                unreachable!()
+            }
         };
+        let size = workspace.window_size(window).unwrap();
+        let start = astera_core::Rect::new(start.x, start.y, size.width, size.height);
         self.drag = Some(DragState {
             window,
             mode,
+            kind: DragKind::Move,
             grab_offset: (
                 self.pointer_location.x - origin.x,
                 self.pointer_location.y - origin.y,
             ),
+            pointer_start: (self.pointer_location.x, self.pointer_location.y),
+            min_size: Size::new(1, 1),
+            max_size: Size::new(i64::MAX, i64::MAX),
             target: start,
             start,
         });
@@ -1274,18 +1315,109 @@ impl Astera {
         self.sync_keyboard_focus();
     }
 
-    fn layer_accepts_keyboard(&self, surface: &WlSurface) -> bool {
-        self.layers.iter().any(|mapped| {
-            if !mapped.mapped || mapped.surface.wl_surface() != surface {
-                return false;
+    fn begin_resize(&mut self, window: WindowId, edges: ResizeEdges) {
+        let Some((origin, _, _, mode)) = self.visual_geometry(window) else {
+            return;
+        };
+        if matches!(
+            mode,
+            WindowMode::Maximized | WindowMode::Fullscreen | WindowMode::Minimized
+        ) {
+            return;
+        }
+        let Ok(workspace_id) = self.desktop.find_window(window) else {
+            return;
+        };
+        let workspace = self.desktop.workspace(workspace_id).unwrap();
+        let start = match mode {
+            WindowMode::Tiled => workspace.tiled[&window].geometry,
+            WindowMode::Floating => workspace.floating[&window].viewport.rect,
+            WindowMode::Maximized | WindowMode::Fullscreen | WindowMode::Minimized => {
+                unreachable!()
             }
-            let state = with_states(surface, |states| {
+        };
+        let mapped = self
+            .windows
+            .iter()
+            .find(|mapped| mapped.id == window)
+            .unwrap();
+        let (min_size, max_size) = with_states(mapped.surface.wl_surface(), |states| {
+            let cached = *states.cached_state.get::<SurfaceCachedState>().current();
+            let min_width = i64::from(cached.min_size.w.max(1));
+            let min_height = i64::from(cached.min_size.h.max(1));
+            (
+                Size::new(min_width, min_height),
+                Size::new(
+                    if cached.max_size.w > 0 {
+                        i64::from(cached.max_size.w).max(min_width)
+                    } else {
+                        i64::MAX
+                    },
+                    if cached.max_size.h > 0 {
+                        i64::from(cached.max_size.h).max(min_height)
+                    } else {
+                        i64::MAX
+                    },
+                ),
+            )
+        });
+        self.drag = Some(DragState {
+            window,
+            mode,
+            kind: DragKind::Resize(edges),
+            grab_offset: (
+                self.pointer_location.x - origin.x as f64,
+                self.pointer_location.y - origin.y as f64,
+            ),
+            pointer_start: (self.pointer_location.x, self.pointer_location.y),
+            min_size,
+            max_size,
+            target: start,
+            start,
+        });
+        if self.desktop.focus_window(window).is_ok() {
+            self.mark_public_dirty();
+        }
+        self.sync_keyboard_focus();
+        self.configure_resize_preview(window, start.size, true);
+    }
+
+    fn configure_resize_preview(&self, window: WindowId, size: Size, resizing: bool) {
+        let Some(mapped) = self.windows.iter().find(|mapped| mapped.id == window) else {
+            return;
+        };
+        mapped.surface.with_pending_state(|state| {
+            state.size = Some((saturating_i32(size.width), saturating_i32(size.height)).into());
+            if resizing {
+                state.states.set(xdg_toplevel::State::Resizing);
+            } else {
+                state.states.unset(xdg_toplevel::State::Resizing);
+            }
+        });
+        mapped.surface.send_pending_configure();
+    }
+
+    fn layer_keyboard_target(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<(u64, WlSurface, KeyboardInteractivity)> {
+        self.layers.iter().find_map(|mapped| {
+            if !mapped.mapped || !surface_tree_contains(mapped.surface.wl_surface(), surface) {
+                return None;
+            }
+            let state = with_states(mapped.surface.wl_surface(), |states| {
                 *states
                     .cached_state
                     .get::<LayerSurfaceCachedState>()
                     .current()
             });
-            state.keyboard_interactivity != KeyboardInteractivity::None
+            (state.keyboard_interactivity != KeyboardInteractivity::None).then(|| {
+                (
+                    mapped.id,
+                    mapped.surface.wl_surface().clone(),
+                    state.keyboard_interactivity,
+                )
+            })
         })
     }
 
@@ -1293,70 +1425,102 @@ impl Astera {
         let Some(mut drag) = self.drag else {
             return;
         };
-        let viewport_x = location.x - drag.grab_offset.0;
-        let viewport_y = location.y - drag.grab_offset.1;
-        drag.target = if drag.mode == WindowMode::Floating {
-            Point::new(viewport_x.round() as i64, viewport_y.round() as i64)
-        } else {
-            let output = &self.desktop.outputs[&self.active_output];
-            let workspace = self
-                .desktop
-                .workspace_for_output(self.active_output)
-                .unwrap();
-            let left =
-                workspace.camera.center.x as f64 - output.output.logical_size.width as f64 / 2.0;
-            let top =
-                workspace.camera.center.y as f64 - output.output.logical_size.height as f64 / 2.0;
-            Point::new(
-                (left + viewport_x).round() as i64,
-                (top + viewport_y).round() as i64,
-            )
+        drag.target = match drag.kind {
+            DragKind::Move => {
+                let viewport_x = location.x - drag.grab_offset.0;
+                let viewport_y = location.y - drag.grab_offset.1;
+                let origin = if drag.mode == WindowMode::Floating {
+                    Point::new(viewport_x.round() as i64, viewport_y.round() as i64)
+                } else {
+                    let output = &self.desktop.outputs[&self.active_output];
+                    let workspace = self
+                        .desktop
+                        .workspace_for_output(self.active_output)
+                        .unwrap();
+                    let left = workspace.camera.center.x as f64
+                        - output.output.logical_size.width as f64 / 2.0;
+                    let top = workspace.camera.center.y as f64
+                        - output.output.logical_size.height as f64 / 2.0;
+                    Point::new(
+                        (left + viewport_x).round() as i64,
+                        (top + viewport_y).round() as i64,
+                    )
+                };
+                astera_core::Rect {
+                    origin,
+                    size: drag.start.size,
+                }
+            }
+            DragKind::Resize(edges) => resized_rect(
+                drag.start,
+                drag.pointer_start,
+                location,
+                edges,
+                drag.min_size,
+                drag.max_size,
+            ),
         };
         self.drag = Some(drag);
+        if matches!(drag.kind, DragKind::Resize(_)) {
+            self.configure_resize_preview(drag.window, drag.target.size, true);
+        }
+        // The preview geometry is already authoritative for rendering. Reactive popups must be
+        // constrained against that same moving/resizing parent, not wait for the drag transaction.
+        self.reconstrain_reactive_popups();
     }
 
     fn finish_drag(&mut self) {
         let Some(drag) = self.drag.take() else {
             return;
         };
+        if self.pointer.is_grabbed() {
+            let pointer = self.pointer.clone();
+            let serial = self.next_serial();
+            pointer.unset_grab(self, serial, 0);
+        }
         let Ok(workspace) = self.desktop.find_window(drag.window) else {
             return;
         };
         let viewport_size = self.desktop.outputs[&self.active_output]
             .output
             .logical_size;
-        let transaction = match drag.mode {
-            WindowMode::Tiled => WindowTransaction::MoveTiledFinished {
+        let direction = astera_core::Direction::between(
+            drag.start.center(),
+            drag.target.center(),
+            self.desktop
+                .workspace(workspace)
+                .unwrap()
+                .layout_direction_hint,
+        );
+        let transaction = match (drag.mode, drag.kind) {
+            (WindowMode::Tiled, DragKind::Move) => WindowTransaction::MoveTiledFinished {
+                id: drag.window,
+                target: drag.target.origin,
+                seed_direction: direction,
+            },
+            (WindowMode::Floating, DragKind::Move) => WindowTransaction::MoveFloating {
                 id: drag.window,
                 target: drag.target,
-                seed_direction: astera_core::Direction::between(
-                    drag.start,
-                    drag.target,
-                    self.desktop
-                        .workspace(workspace)
-                        .unwrap()
-                        .layout_direction_hint,
-                ),
+                viewport_size,
             },
-            WindowMode::Floating => {
-                let size = self.desktop.workspace(workspace).unwrap().floating[&drag.window]
-                    .viewport
-                    .rect
-                    .size;
-                WindowTransaction::MoveFloating {
-                    id: drag.window,
-                    target: astera_core::Rect {
-                        origin: drag.target,
-                        size,
-                    },
-                    viewport_size,
-                }
-            }
-            WindowMode::Maximized | WindowMode::Fullscreen => return,
+            (WindowMode::Tiled, DragKind::Resize(_)) => WindowTransaction::ResizeTiledFinished {
+                id: drag.window,
+                target: drag.target,
+                seed_direction: direction,
+            },
+            (WindowMode::Floating, DragKind::Resize(_)) => WindowTransaction::ResizeFloating {
+                id: drag.window,
+                target: drag.target,
+                viewport_size,
+            },
+            (WindowMode::Maximized | WindowMode::Fullscreen | WindowMode::Minimized, _) => return,
         };
         if let Err(error) = self.desktop.apply_window(workspace, transaction) {
             tracing::warn!(%error, window = ?drag.window, "drag transaction failed");
         } else {
+            if matches!(drag.kind, DragKind::Resize(_)) {
+                self.configure_resize_preview(drag.window, drag.target.size, false);
+            }
             self.mark_public_dirty();
             tracing::info!(
                 window = ?drag.window,
@@ -1367,6 +1531,21 @@ impl Astera {
                 "compositor drag committed"
             );
         }
+    }
+
+    pub(super) fn cancel_drag(&mut self) {
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        if matches!(drag.kind, DragKind::Resize(_)) {
+            self.configure_resize_preview(drag.window, drag.start.size, false);
+        }
+        if self.pointer.is_grabbed() {
+            let pointer = self.pointer.clone();
+            let serial = self.next_serial();
+            pointer.unset_grab(self, serial, 0);
+        }
+        self.mark_render_dirty();
     }
 
     fn handle_binding(
@@ -1594,6 +1773,7 @@ impl Astera {
             Some(WindowMode::Tiled | WindowMode::Maximized | WindowMode::Fullscreen) => {
                 Ok(WindowMode::Floating)
             }
+            Some(WindowMode::Minimized) => Err(anyhow!("minimized window must be restored first")),
             None => Err(anyhow!("focused window has no mode")),
         }
     }
@@ -1614,6 +1794,7 @@ impl Astera {
             Some(WindowMode::Tiled | WindowMode::Floating | WindowMode::Maximized) => {
                 Ok(WindowMode::Fullscreen)
             }
+            Some(WindowMode::Minimized) => Err(anyhow!("minimized window must be restored first")),
             None => Err(anyhow!("focused window has no mode")),
         }
     }
@@ -1751,12 +1932,31 @@ impl Astera {
             tracing::error!(?id, %error, "could not map toplevel");
             return;
         }
+        let initial_mode = self.windows[index].initial_mode.take();
+        if let Some(mode) = initial_mode
+            && let Err(error) = self.desktop.apply_window(
+                workspace_id,
+                WindowTransaction::SetMode {
+                    id,
+                    mode,
+                    viewport_size: self.desktop.outputs[&self.active_output]
+                        .output
+                        .logical_size,
+                },
+            )
+        {
+            tracing::warn!(?id, ?mode, %error, "could not apply initial toplevel mode");
+        }
         self.windows[index].mapped = true;
         self.mark_public_dirty();
         self.windows[index].surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
         });
-        self.windows[index].surface.send_pending_configure();
+        if let Some(mode) = initial_mode {
+            self.configure_window_mode(id, mode);
+        } else {
+            self.windows[index].surface.send_pending_configure();
+        }
         tracing::info!(window = ?id, workspace = ?workspace_id, output = ?self.active_output, "toplevel mapped");
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
@@ -1776,7 +1976,7 @@ impl Astera {
         self.windows[index].mapped = false;
         self.mark_public_dirty();
         if self.drag.is_some_and(|drag| drag.window == id) {
-            self.drag = None;
+            self.cancel_drag();
         }
         tracing::info!(window = ?id, "toplevel unmapped");
         self.refresh_visible_scales();
@@ -1785,6 +1985,10 @@ impl Astera {
 
     pub fn remove_dead_windows(&mut self) {
         self.popup_manager.cleanup();
+        if self.dnd_icon.as_ref().is_some_and(|icon| !icon.alive()) {
+            self.dnd_icon = None;
+            self.mark_render_dirty();
+        }
         let layer_count = self.layers.len();
         self.layers.retain(|mapped| mapped.surface.alive());
         let dead: Vec<_> = self
@@ -1814,6 +2018,66 @@ impl Astera {
     }
 }
 
+fn resized_rect(
+    start: astera_core::Rect,
+    pointer_start: (f64, f64),
+    pointer: SmithayPoint<f64, smithay::utils::Logical>,
+    edges: ResizeEdges,
+    min_size: Size,
+    max_size: Size,
+) -> astera_core::Rect {
+    let dx = (pointer.x - pointer_start.0).round() as i64;
+    let dy = (pointer.y - pointer_start.1).round() as i64;
+    let right = start.origin.x.saturating_add(start.size.width);
+    let bottom = start.origin.y.saturating_add(start.size.height);
+    let mut left = start.origin.x;
+    let mut top = start.origin.y;
+    let mut new_right = right;
+    let mut new_bottom = bottom;
+    if edges.left {
+        left = start
+            .origin
+            .x
+            .saturating_add(dx)
+            .min(right.saturating_sub(1));
+    }
+    if edges.right {
+        new_right = right.saturating_add(dx).max(left.saturating_add(1));
+    }
+    if edges.top {
+        top = start
+            .origin
+            .y
+            .saturating_add(dy)
+            .min(bottom.saturating_sub(1));
+    }
+    if edges.bottom {
+        new_bottom = bottom.saturating_add(dy).max(top.saturating_add(1));
+    }
+    let width = new_right
+        .saturating_sub(left)
+        .clamp(min_size.width.max(1), max_size.width.max(min_size.width));
+    let height = new_bottom
+        .saturating_sub(top)
+        .clamp(min_size.height.max(1), max_size.height.max(min_size.height));
+    if edges.left {
+        left = right.saturating_sub(width);
+    } else {
+        new_right = left.saturating_add(width);
+    }
+    if edges.top {
+        top = bottom.saturating_sub(height);
+    } else {
+        new_bottom = top.saturating_add(height);
+    }
+    astera_core::Rect::new(
+        left,
+        top,
+        new_right.saturating_sub(left).max(1),
+        new_bottom.saturating_sub(top).max(1),
+    )
+}
+
 mod command;
 
 mod protocol;
@@ -1828,6 +2092,18 @@ fn extend_surface_tree(surfaces: &mut HashSet<WlSurface>, root: &WlSurface) {
         },
         |_, _, &()| true,
     );
+}
+
+fn surface_tree_contains(root: &WlSurface, wanted: &WlSurface) -> bool {
+    let found = std::cell::Cell::new(false);
+    with_surface_tree_downward(
+        root,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |surface, _, &()| found.set(found.get() || surface == wanted),
+        |_, _, &()| !found.get(),
+    );
+    found.get()
 }
 
 #[derive(Default)]

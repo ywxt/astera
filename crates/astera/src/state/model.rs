@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use astera_core::{OutputId, Point, WindowId, WindowMode};
+use astera_core::{OutputId, Point, Rect, Size, WindowId, WindowMode};
 use smithay::{
     desktop::{LayerSurface, PopupManager},
     input::{
@@ -75,6 +75,9 @@ pub(super) struct MappedWindow {
     pub(super) surface: ToplevelSurface,
     /// Role existence and mapping are distinct: only a committed non-null buffer is mapped.
     pub(super) mapped: bool,
+    /// Mode requested before the first non-null buffer commit. XDG permits clients to request
+    /// maximize/fullscreen before the surface has entered the desktop model.
+    pub(super) initial_mode: Option<WindowMode>,
     /// Set when an activation was denied; cleared once the window legitimately receives focus.
     pub(super) urgent: bool,
 }
@@ -83,12 +86,30 @@ pub(super) struct MappedWindow {
 pub(super) struct DragState {
     pub(super) window: WindowId,
     pub(super) mode: WindowMode,
+    pub(super) kind: DragKind,
     /// Pointer-to-window offset captured at grab time to prevent the window from jumping.
     pub(super) grab_offset: (f64, f64),
     /// Latest candidate position; tiled geometry is committed only when the grab ends.
-    pub(super) target: Point,
-    /// Original position used to seed the radial solver with a movement direction.
-    pub(super) start: Point,
+    pub(super) pointer_start: (f64, f64),
+    pub(super) min_size: Size,
+    pub(super) max_size: Size,
+    pub(super) target: Rect,
+    /// Original geometry used for resize and to seed the radial solver.
+    pub(super) start: Rect,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DragKind {
+    Move,
+    Resize(ResizeEdges),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ResizeEdges {
+    pub(super) top: bool,
+    pub(super) bottom: bool,
+    pub(super) left: bool,
+    pub(super) right: bool,
 }
 
 #[derive(Clone, Debug)]

@@ -1,4 +1,6 @@
-use astera_core::{FullscreenRestorePlacement, RestorePlacement, WindowMode};
+use astera_core::{
+    FullscreenRestorePlacement, MinimizedRestorePlacement, RestorePlacement, WindowMode,
+};
 use astera_ipc::wire::v1::{
     Anchor as PublicAnchor, BaseRestore as PublicBaseRestore, CameraSnapshot, ConfigSnapshot,
     DesktopSnapshot, ExclusiveContribution, FullscreenRestore as PublicFullscreenRestore,
@@ -118,6 +120,16 @@ impl Astera {
                     WindowPlacement::Fullscreen {
                         restore: fullscreen_restore(&fullscreen.restore),
                     },
+                    location.output,
+                ));
+            }
+            for minimized in workspace.minimized.values() {
+                let (mode, placement) = public_minimized(&minimized.restore);
+                windows.push(self.window_snapshot(
+                    workspace.id,
+                    minimized.window,
+                    mode,
+                    placement,
                     location.output,
                 ));
             }
@@ -312,6 +324,35 @@ fn fullscreen_restore(restore: &FullscreenRestorePlacement) -> PublicFullscreenR
     }
 }
 
+fn public_minimized(restore: &MinimizedRestorePlacement) -> (WindowMode, WindowPlacement) {
+    match restore {
+        MinimizedRestorePlacement::Tiled { world_rect } => (
+            WindowMode::Tiled,
+            WindowPlacement::Tiled {
+                world_geometry: (*world_rect).into(),
+            },
+        ),
+        MinimizedRestorePlacement::Floating { viewport } => (
+            WindowMode::Floating,
+            WindowPlacement::Floating {
+                viewport_geometry: viewport.rect.into(),
+            },
+        ),
+        MinimizedRestorePlacement::Maximized { restore } => (
+            WindowMode::Maximized,
+            WindowPlacement::Maximized {
+                restore: public_restore(restore),
+            },
+        ),
+        MinimizedRestorePlacement::Fullscreen { restore } => (
+            WindowMode::Fullscreen,
+            WindowPlacement::Fullscreen {
+                restore: fullscreen_restore(restore),
+            },
+        ),
+    }
+}
+
 fn public_layer(layer: Layer) -> PublicLayer {
     match layer {
         Layer::Background => PublicLayer::Background,
@@ -457,6 +498,50 @@ mod tests {
             window.visible_geometry, None,
             "persistent placement does not imply that a surface is currently rendered"
         );
+    }
+
+    #[test]
+    fn snapshot_keeps_minimized_windows_addressable_but_invisible() {
+        let display = Display::<Astera>::new().unwrap();
+        let mut state = Astera::new(&display.handle(), astera_config::Config::default());
+        let workspace = state
+            .desktop
+            .active_workspace_id(astera_core::OutputId(0))
+            .unwrap();
+        let window = astera_core::WindowId(77);
+        state
+            .desktop
+            .apply_window(
+                workspace,
+                astera_core::WindowTransaction::InsertTiled {
+                    id: window,
+                    size: astera_core::Size::new(640, 480),
+                    anchor: astera_core::Point::ORIGIN,
+                    seed_direction: astera_core::Direction::RIGHT,
+                },
+            )
+            .unwrap();
+        state
+            .desktop
+            .apply_window(
+                workspace,
+                astera_core::WindowTransaction::SetMode {
+                    id: window,
+                    mode: WindowMode::Minimized,
+                    viewport_size: astera_core::Size::new(1280, 720),
+                },
+            )
+            .unwrap();
+
+        let snapshot = state.public_snapshot();
+        let window = snapshot
+            .windows
+            .iter()
+            .find(|candidate| candidate.id.0 == 77)
+            .unwrap();
+        assert_eq!(window.mode, astera_ipc::wire::v1::WindowMode::Tiled);
+        assert!(window.visible_geometry.is_none());
+        assert!(matches!(window.placement, WindowPlacement::Tiled { .. }));
     }
 
     #[test]

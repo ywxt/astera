@@ -4,8 +4,8 @@ use thiserror::Error;
 
 use crate::{
     Direction, FloatingPlacement, FullscreenPlacement, FullscreenRestorePlacement,
-    MaximizedPlacement, Point, Rect, RestorePlacement, Size, TiledWindow, WindowId, WindowMode,
-    Workspace,
+    MaximizedPlacement, MinimizedPlacement, MinimizedRestorePlacement, Point, Rect,
+    RestorePlacement, Size, TiledWindow, WindowId, WindowMode, Workspace,
 };
 
 #[derive(Clone, Debug)]
@@ -22,6 +22,16 @@ pub enum WindowTransaction {
         seed_direction: Direction,
     },
     MoveFloating {
+        id: WindowId,
+        target: Rect,
+        viewport_size: Size,
+    },
+    ResizeTiledFinished {
+        id: WindowId,
+        target: Rect,
+        seed_direction: Direction,
+    },
+    ResizeFloating {
         id: WindowId,
         target: Rect,
         viewport_size: Size,
@@ -230,6 +240,60 @@ impl RadialSolver {
                     }],
                 ))
             }
+            WindowTransaction::ResizeTiledFinished {
+                id,
+                target,
+                seed_direction,
+            } => {
+                if !target.size.is_valid() {
+                    return Err(LayoutError::InvalidSize);
+                }
+                let window = workspace
+                    .tiled
+                    .get_mut(&id)
+                    .ok_or(LayoutError::UnknownWindow(id))?;
+                let from = window.geometry.origin;
+                window.geometry = target;
+                workspace.layout_direction_hint = seed_direction.normalized();
+                workspace.focus(id);
+                Ok((
+                    Some(id),
+                    seed_direction,
+                    vec![Movement {
+                        window: id,
+                        from,
+                        to: target.origin,
+                    }],
+                ))
+            }
+            WindowTransaction::ResizeFloating {
+                id,
+                target,
+                viewport_size,
+            } => {
+                if !target.size.is_valid() {
+                    return Err(LayoutError::InvalidSize);
+                }
+                let placement = workspace
+                    .floating
+                    .get_mut(&id)
+                    .ok_or(LayoutError::UnknownWindow(id))?;
+                let from = placement.viewport.rect.origin;
+                placement.viewport.rect = clamp_to_viewport(target, viewport_size);
+                placement.viewport.normalized_center =
+                    crate::NormalizedPoint::from_rect(placement.viewport.rect, viewport_size);
+                let to = placement.viewport.rect.origin;
+                workspace.focus(id);
+                Ok((
+                    None,
+                    workspace.layout_direction_hint,
+                    vec![Movement {
+                        window: id,
+                        from,
+                        to,
+                    }],
+                ))
+            }
             WindowTransaction::SetMode {
                 id,
                 mode,
@@ -238,6 +302,7 @@ impl RadialSolver {
             WindowTransaction::Remove { id } => {
                 let removed = workspace.tiled.remove(&id).is_some()
                     || workspace.floating.remove(&id).is_some()
+                    || workspace.minimized.remove(&id).is_some()
                     || workspace
                         .maximized
                         .as_ref()
@@ -311,6 +376,32 @@ impl RadialSolver {
         if current == target {
             return Ok((None, workspace.layout_direction_hint, Vec::new()));
         }
+        if target == WindowMode::Minimized {
+            let restore = match current {
+                WindowMode::Tiled => MinimizedRestorePlacement::Tiled {
+                    world_rect: workspace.tiled.remove(&id).unwrap().geometry,
+                },
+                WindowMode::Floating => MinimizedRestorePlacement::Floating {
+                    viewport: workspace.floating.remove(&id).unwrap().viewport,
+                },
+                WindowMode::Maximized => MinimizedRestorePlacement::Maximized {
+                    restore: workspace.maximized.take().unwrap().restore,
+                },
+                WindowMode::Fullscreen => MinimizedRestorePlacement::Fullscreen {
+                    restore: workspace.fullscreen.take().unwrap().restore,
+                },
+                WindowMode::Minimized => unreachable!(),
+            };
+            workspace.minimized.insert(
+                id,
+                MinimizedPlacement {
+                    window: id,
+                    restore,
+                },
+            );
+            workspace.remove_focus(id);
+            return Ok((None, workspace.layout_direction_hint, Vec::new()));
+        }
         if target == WindowMode::Fullscreen {
             if let Some(fullscreen) = &workspace.fullscreen {
                 return Err(LayoutError::FullscreenOccupied(fullscreen.window));
@@ -324,6 +415,18 @@ impl RadialSolver {
                 },
                 WindowMode::Maximized => FullscreenRestorePlacement::Maximized {
                     restore: workspace.maximized.take().unwrap().restore,
+                },
+                WindowMode::Minimized => match workspace.minimized.remove(&id).unwrap().restore {
+                    MinimizedRestorePlacement::Tiled { world_rect } => {
+                        FullscreenRestorePlacement::Tiled { world_rect }
+                    }
+                    MinimizedRestorePlacement::Floating { viewport } => {
+                        FullscreenRestorePlacement::Floating { viewport }
+                    }
+                    MinimizedRestorePlacement::Maximized { restore } => {
+                        FullscreenRestorePlacement::Maximized { restore }
+                    }
+                    MinimizedRestorePlacement::Fullscreen { restore } => restore,
                 },
                 WindowMode::Fullscreen => unreachable!(),
             };
@@ -355,6 +458,24 @@ impl RadialSolver {
                     }
                     FullscreenRestorePlacement::Maximized { restore } => restore,
                 },
+                WindowMode::Minimized => match workspace.minimized.remove(&id).unwrap().restore {
+                    MinimizedRestorePlacement::Tiled { world_rect } => {
+                        RestorePlacement::Tiled { world_rect }
+                    }
+                    MinimizedRestorePlacement::Floating { viewport } => {
+                        RestorePlacement::Floating { viewport }
+                    }
+                    MinimizedRestorePlacement::Maximized { restore } => restore,
+                    MinimizedRestorePlacement::Fullscreen { restore } => match restore {
+                        FullscreenRestorePlacement::Tiled { world_rect } => {
+                            RestorePlacement::Tiled { world_rect }
+                        }
+                        FullscreenRestorePlacement::Floating { viewport } => {
+                            RestorePlacement::Floating { viewport }
+                        }
+                        FullscreenRestorePlacement::Maximized { restore } => restore,
+                    },
+                },
                 WindowMode::Maximized => unreachable!(),
             };
             workspace.maximized = Some(MaximizedPlacement {
@@ -382,6 +503,24 @@ impl RadialSolver {
                     RestorePlacement::Floating { viewport }
                 }
                 FullscreenRestorePlacement::Maximized { restore } => restore,
+            },
+            WindowMode::Minimized => match workspace.minimized.remove(&id).unwrap().restore {
+                MinimizedRestorePlacement::Tiled { world_rect } => {
+                    RestorePlacement::Tiled { world_rect }
+                }
+                MinimizedRestorePlacement::Floating { viewport } => {
+                    RestorePlacement::Floating { viewport }
+                }
+                MinimizedRestorePlacement::Maximized { restore } => restore,
+                MinimizedRestorePlacement::Fullscreen { restore } => match restore {
+                    FullscreenRestorePlacement::Tiled { world_rect } => {
+                        RestorePlacement::Tiled { world_rect }
+                    }
+                    FullscreenRestorePlacement::Floating { viewport } => {
+                        RestorePlacement::Floating { viewport }
+                    }
+                    FullscreenRestorePlacement::Maximized { restore } => restore,
+                },
             },
         };
 
@@ -428,7 +567,9 @@ impl RadialSolver {
                 );
                 None
             }
-            WindowMode::Maximized | WindowMode::Fullscreen => unreachable!(),
+            WindowMode::Maximized | WindowMode::Fullscreen | WindowMode::Minimized => {
+                unreachable!()
+            }
         };
         workspace.focus(id);
         Ok((source, workspace.layout_direction_hint, Vec::new()))
@@ -462,7 +603,11 @@ impl RadialSolver {
                 return Err(LayoutError::DidNotConverge(operations));
             }
             let original = workspace.tiled[&id].geometry;
-            let direction = Direction::between(source_rect.center(), original.center(), fallback);
+            let direction = if source_rect.center() == original.center() {
+                self.least_occupied_direction(workspace, source, id, fallback)
+            } else {
+                Direction::between(source_rect.center(), original.center(), fallback)
+            };
             let obstacles: Vec<_> = locked
                 .iter()
                 .map(|locked_id| workspace.tiled[locked_id].geometry)
@@ -480,6 +625,78 @@ impl RadialSolver {
             self.enqueue_conflicts(workspace, id, &locked, &mut queued, &mut queue);
         }
         Ok(movements)
+    }
+
+    fn least_occupied_direction(
+        &self,
+        workspace: &Workspace,
+        source: WindowId,
+        moving: WindowId,
+        fallback: Direction,
+    ) -> Direction {
+        let origin = workspace.tiled[&source].geometry.center();
+        let occupied = workspace
+            .tiled
+            .values()
+            .filter(|window| window.id != source && window.id != moving)
+            .filter_map(|window| {
+                let center = window.geometry.center();
+                (center != origin).then(|| {
+                    Direction::new(
+                        (i128::from(center.x) - i128::from(origin.x)) as f64,
+                        (i128::from(center.y) - i128::from(origin.y)) as f64,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if occupied.is_empty() {
+            return fallback.normalized();
+        }
+
+        // Rotate the layout hint in 45-degree steps and choose the ray whose closest occupied
+        // direction is furthest away.  Candidate order provides a stable tie-break, so identical
+        // transactions always produce an identical layout.
+        let fallback = fallback.normalized();
+        const OCTANTS: [(f64, f64); 8] = [
+            (1.0, 0.0),
+            (
+                std::f64::consts::FRAC_1_SQRT_2,
+                std::f64::consts::FRAC_1_SQRT_2,
+            ),
+            (0.0, 1.0),
+            (
+                -std::f64::consts::FRAC_1_SQRT_2,
+                std::f64::consts::FRAC_1_SQRT_2,
+            ),
+            (-1.0, 0.0),
+            (
+                -std::f64::consts::FRAC_1_SQRT_2,
+                -std::f64::consts::FRAC_1_SQRT_2,
+            ),
+            (0.0, -1.0),
+            (
+                std::f64::consts::FRAC_1_SQRT_2,
+                -std::f64::consts::FRAC_1_SQRT_2,
+            ),
+        ];
+        OCTANTS
+            .into_iter()
+            .map(|(cos, sin)| {
+                Direction::new(
+                    fallback.x * cos - fallback.y * sin,
+                    fallback.x * sin + fallback.y * cos,
+                )
+            })
+            .min_by(|left, right| {
+                let crowding = |candidate: &Direction| {
+                    occupied
+                        .iter()
+                        .map(|direction| candidate.x * direction.x + candidate.y * direction.y)
+                        .fold(f64::NEG_INFINITY, f64::max)
+                };
+                crowding(left).total_cmp(&crowding(right))
+            })
+            .unwrap_or(fallback)
     }
 
     fn enqueue_conflicts(

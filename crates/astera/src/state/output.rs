@@ -53,19 +53,77 @@ impl Astera {
         if let Some(cursor) = self.cursor_surface_for_output(output) {
             update_tree(&cursor);
         }
+        if let Some((icon, _, _)) = self.dnd_icon_render_source(output) {
+            update_tree(&icon);
+        }
         if let Some(runtime) = self.output_runtime.get_mut(&output) {
             runtime.presented_surfaces = presented;
         }
         self.refresh_idle_inhibition();
     }
 
-    pub fn enable_dmabuf(&mut self, formats: impl IntoIterator<Item = Format>) {
+    pub fn enable_dmabuf(
+        &mut self,
+        main_device: Option<u64>,
+        formats: impl IntoIterator<Item = Format>,
+    ) {
         if self.dmabuf_enabled {
             return;
         }
         let display = self.display.clone();
-        self.dmabuf_state.create_global::<Self>(&display, formats);
+        let formats = formats.into_iter().collect::<Vec<_>>();
+        if let Some(main_device) = main_device {
+            match smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
+                main_device,
+                formats.iter().copied(),
+            )
+            .build()
+            {
+                Ok(feedback) => {
+                    self.dmabuf_state
+                        .create_global_with_default_feedback::<Self>(&display, &feedback);
+                    self.dmabuf_default_device = Some(main_device);
+                    self.dmabuf_default_formats = formats.clone();
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not build linux-dmabuf v4 feedback; advertising v3");
+                    self.dmabuf_state
+                        .create_global::<Self>(&display, formats.iter().copied());
+                }
+            }
+        } else {
+            tracing::warn!("renderer has no DRM render node; advertising linux-dmabuf v3");
+            self.dmabuf_state
+                .create_global::<Self>(&display, formats.iter().copied());
+        }
         self.dmabuf_enabled = true;
+    }
+
+    pub fn register_output_dmabuf_feedback(
+        &mut self,
+        output: OutputId,
+        target_device: u64,
+        formats: impl IntoIterator<Item = Format>,
+    ) {
+        let Some(main_device) = self.dmabuf_default_device else {
+            return;
+        };
+        let mut builder = smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
+            main_device,
+            self.dmabuf_default_formats.iter().copied(),
+        );
+        if target_device != main_device {
+            builder = builder.add_preference_tranche(target_device, None, formats);
+        }
+        match builder.build() {
+            Ok(feedback) => {
+                self.dmabuf_output_feedback.insert(output, feedback);
+                self.refresh_visible_scales();
+            }
+            Err(error) => {
+                tracing::warn!(?output, %error, "could not build per-output dmabuf feedback");
+            }
+        }
     }
 
     pub fn validate_dmabuf_imports<R: ImportDma>(&mut self, renderer: &mut R) {
@@ -75,6 +133,16 @@ impl Astera {
             } else {
                 notifier.failed();
             }
+        }
+    }
+
+    pub fn has_pending_dmabuf_imports(&self) -> bool {
+        !self.pending_dmabufs.is_empty()
+    }
+
+    pub fn fail_pending_dmabuf_imports(&mut self) {
+        for (_, notifier) in self.pending_dmabufs.drain(..) {
+            notifier.failed();
         }
     }
 
@@ -316,6 +384,7 @@ impl Astera {
     }
 
     pub(super) fn refresh_visible_scales(&mut self) {
+        self.reconstrain_reactive_popups();
         // A workspace is exclusive to one output, so each entered surface has one authoritative
         // fractional scale. Subsurfaces and popups still need explicit enter/leave propagation.
         let scenes: BTreeMap<_, _> = self
@@ -333,6 +402,9 @@ impl Astera {
                 if let Some(cursor) = self.cursor_surface_for_output(output) {
                     extend_surface_tree(&mut visible, &cursor);
                 }
+                if let Some((icon, _, _)) = self.dnd_icon_render_source(output) {
+                    extend_surface_tree(&mut visible, &icon);
+                }
                 for root in roots {
                     for (popup, _) in PopupManager::popups_for_surface(&root) {
                         extend_surface_tree(&mut visible, popup.wl_surface());
@@ -343,6 +415,7 @@ impl Astera {
             })
             .collect();
         for (output, (scale, visible)) in scenes {
+            let dmabuf_feedback = self.dmabuf_output_feedback.get(&output).cloned();
             let runtime = self
                 .output_runtime
                 .get_mut(&output)
@@ -360,6 +433,12 @@ impl Astera {
                     with_fractional_scale(states, |fractional| {
                         fractional.set_preferred_scale(scale);
                     });
+                    if let Some(feedback) = dmabuf_feedback.as_ref()
+                        && let Some(surface_feedback) =
+                            SurfaceDmabufFeedbackState::from_states(states)
+                    {
+                        surface_feedback.set_feedback(feedback);
+                    }
                 });
             }
             let departed = runtime

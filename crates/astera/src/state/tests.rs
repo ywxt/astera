@@ -1,4 +1,6 @@
 use std::{
+    io::{Read, Write},
+    os::fd::AsFd,
     os::unix::net::UnixStream,
     sync::Arc,
     sync::mpsc,
@@ -12,8 +14,11 @@ use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
     globals::registry_queue_init,
     protocol::{
-        wl_callback::WlCallback, wl_compositor::WlCompositor, wl_output::WlOutput,
-        wl_pointer::WlPointer, wl_registry::WlRegistry, wl_seat::WlSeat, wl_surface::WlSurface,
+        wl_buffer::WlBuffer, wl_callback::WlCallback, wl_compositor::WlCompositor,
+        wl_data_device::WlDataDevice, wl_data_device_manager::WlDataDeviceManager,
+        wl_data_offer::WlDataOffer, wl_data_source::WlDataSource, wl_output::WlOutput,
+        wl_pointer::WlPointer, wl_registry::WlRegistry, wl_seat::WlSeat, wl_shm::WlShm,
+        wl_shm_pool::WlShmPool, wl_surface::WlSurface,
     },
 };
 use wayland_protocols::ext::idle_notify::v1::client::{
@@ -21,6 +26,9 @@ use wayland_protocols::ext::idle_notify::v1::client::{
 };
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1::ExtSessionLockManagerV1, ext_session_lock_v1::ExtSessionLockV1,
+};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
 };
 use wayland_protocols::wp::{
     cursor_shape::v1::client::{
@@ -112,6 +120,12 @@ delegate_noop!(TestClient: ignore WlCallback);
 delegate_noop!(TestClient: ignore WlSeat);
 delegate_noop!(TestClient: ignore WlOutput);
 delegate_noop!(TestClient: ignore WlPointer);
+delegate_noop!(TestClient: ignore WlShm);
+delegate_noop!(TestClient: ignore WlShmPool);
+delegate_noop!(TestClient: ignore WlBuffer);
+delegate_noop!(TestClient: ignore WlDataDeviceManager);
+delegate_noop!(TestClient: ignore WlDataOffer);
+delegate_noop!(TestClient: ignore WlDataSource);
 delegate_noop!(TestClient: ignore XdgToplevel);
 delegate_noop!(TestClient: ignore XdgPopup);
 delegate_noop!(TestClient: ignore XdgPositioner);
@@ -152,6 +166,104 @@ delegate_noop!(TestClient: ignore ZwpInputMethodManagerV2);
 delegate_noop!(TestClient: ignore ZwpInputMethodV2);
 delegate_noop!(TestClient: ignore ZwpVirtualKeyboardManagerV1);
 delegate_noop!(TestClient: ignore ZwpVirtualKeyboardV1);
+delegate_noop!(TestClient: ignore ZwpLinuxDmabufV1);
+
+impl Dispatch<ZwpLinuxDmabufFeedbackV1, (mpsc::Sender<()>, mpsc::Sender<Vec<u8>>)> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpLinuxDmabufFeedbackV1,
+        event: wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::Event,
+        feedback: &(mpsc::Sender<()>, mpsc::Sender<Vec<u8>>),
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::Event;
+        match event {
+            Event::Done => {
+                let _ = feedback.0.send(());
+            }
+            Event::TrancheTargetDevice { device } => {
+                let _ = feedback.1.send(device);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlDataSource, (Vec<u8>, mpsc::Sender<()>)> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlDataSource,
+        event: wayland_client::protocol::wl_data_source::Event,
+        payload: &(Vec<u8>, mpsc::Sender<()>),
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_data_source::Event::Send { fd, .. } = event {
+            let mut file = std::fs::File::from(fd);
+            file.write_all(&payload.0).unwrap();
+            let _ = payload.1.send(());
+        }
+    }
+}
+
+impl Dispatch<ZwpInputMethodV2, mpsc::Sender<()>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpInputMethodV2,
+        event: wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::Event,
+        unavailable: &mpsc::Sender<()>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if matches!(
+            event,
+            wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::Event::Unavailable
+        ) {
+            let _ = unavailable.send(());
+        }
+    }
+}
+
+impl Dispatch<
+    wayland_protocols::ext::session_lock::v1::client::ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+    mpsc::Sender<(u32, u32, u32)>,
+> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &wayland_protocols::ext::session_lock::v1::client::ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+        event: wayland_protocols::ext::session_lock::v1::client::ext_session_lock_surface_v1::Event,
+        serials: &mpsc::Sender<(u32, u32, u32)>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if let wayland_protocols::ext::session_lock::v1::client::ext_session_lock_surface_v1::Event::Configure { serial, width, height } = event {
+            let _ = serials.send((serial, width, height));
+        }
+    }
+}
+
+impl Dispatch<WlDataDevice, mpsc::Sender<()>> for TestClient {
+    wayland_client::event_created_child!(TestClient, WlDataDevice, [
+        0 => (WlDataOffer, ())
+    ]);
+
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlDataDevice,
+        event: wayland_client::protocol::wl_data_device::Event,
+        selection: &mpsc::Sender<()>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if matches!(
+            event,
+            wayland_client::protocol::wl_data_device::Event::Selection { id: Some(_) }
+        ) {
+            let _ = selection.send(());
+        }
+    }
+}
 
 impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
     fn event(
@@ -310,6 +422,241 @@ fn privileged_input_globals_are_hidden_from_ordinary_clients() {
 }
 
 #[test]
+fn dmabuf_with_a_render_node_advertises_version_four_feedback() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    state.enable_dmabuf(
+        Some(1),
+        [smithay::backend::allocator::Format {
+            code: smithay::backend::allocator::Fourcc::Argb8888,
+            modifier: smithay::backend::allocator::Modifier::Linear,
+        }],
+    );
+    state.register_output_dmabuf_feedback(
+        OutputId(0),
+        2,
+        [smithay::backend::allocator::Format {
+            code: smithay::backend::allocator::Fourcc::Abgr8888,
+            modifier: smithay::backend::allocator::Modifier::Linear,
+        }],
+    );
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let Ok(dmabuf) = globals.bind::<ZwpLinuxDmabufV1, _, _>(&queue, 4..=4, ()) else {
+            result_tx.send(false).unwrap();
+            return;
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let (target_tx, target_rx) = mpsc::channel();
+        let surface = compositor.create_surface(&queue, ());
+        let _feedback = dmabuf.get_surface_feedback(&surface, &queue, (done_tx, target_tx));
+        connection.flush().unwrap();
+        let connected = events.roundtrip(&mut TestClient).is_ok();
+        let target_device = 2u64.to_ne_bytes();
+        result_tx
+            .send(
+                connected
+                    && done_rx.try_recv().is_ok()
+                    && target_rx.try_iter().any(|device| device == target_device),
+            )
+            .unwrap();
+    });
+    let mut advertised = None;
+    dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
+        Ok(value) => {
+            advertised = Some(value);
+            true
+        }
+        Err(_) => false,
+    });
+    assert_eq!(advertised, Some(true));
+    client.join().unwrap();
+}
+
+#[test]
+fn second_input_method_is_unavailable_without_disconnect() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::trusted_input()))
+        .unwrap();
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let manager = globals
+            .bind::<ZwpInputMethodManagerV2, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let _first = manager.get_input_method(&seat, &queue, ());
+        let (unavailable_tx, unavailable_rx) = mpsc::channel();
+        let _second = manager.get_input_method(&seat, &queue, unavailable_tx);
+        connection.flush().unwrap();
+        let connected = events.roundtrip(&mut TestClient).is_ok();
+        result_tx
+            .send((connected, unavailable_rx.try_recv().is_ok()))
+            .unwrap();
+    });
+
+    let mut result = None;
+    dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
+        Ok(value) => {
+            result = Some(value);
+            true
+        }
+        Err(_) => false,
+    });
+    assert_eq!(result, Some((true, true)));
+    client.join().unwrap();
+}
+
+#[test]
+fn focused_client_receives_clipboard_selection_offer() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (offer_tx, offer_rx) = mpsc::channel();
+    let (continue_tx, continue_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let data_manager = globals
+            .bind::<WlDataDeviceManager, _, _>(&queue, 1..=3, ())
+            .unwrap();
+        let (selection_tx, selection_rx) = mpsc::channel();
+        let _device = data_manager.get_data_device(&seat, &queue, selection_tx);
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        surface.commit();
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        continue_rx.recv().unwrap();
+        while selection_rx.try_recv().is_err() {
+            events.blocking_dispatch(&mut TestClient).unwrap();
+        }
+        offer_tx.send(()).unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    state.map_toplevel(0);
+    smithay::wayland::selection::data_device::set_data_device_selection::<Astera>(
+        &display.handle(),
+        &state.seat,
+        vec!["text/plain;charset=utf-8".into()],
+        (),
+    );
+    display.flush_clients().unwrap();
+    continue_tx.send(()).unwrap();
+    offer_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("focused data device did not receive the clipboard selection");
+    client.join().unwrap();
+}
+
+#[test]
+fn clipboard_selection_transfers_requested_mime_bytes() {
+    const PAYLOAD: &[u8] = b"astera clipboard payload";
+
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (serial_tx, serial_rx) = mpsc::sync_channel(0);
+    let (selection_tx, selection_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let manager = globals
+            .bind::<WlDataDeviceManager, _, _>(&queue, 1..=3, ())
+            .unwrap();
+        let device = manager.get_data_device(&seat, &queue, mpsc::channel().0);
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let source = manager.create_data_source(&queue, (PAYLOAD.to_vec(), sent_tx));
+        source.offer("text/plain;charset=utf-8".into());
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        surface.commit();
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        device.set_selection(Some(&source), serial_rx.recv().unwrap());
+        connection.flush().unwrap();
+        while sent_rx.try_recv().is_err() {
+            events.blocking_dispatch(&mut TestClient).unwrap();
+        }
+        selection_tx.send(()).unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    state.map_toplevel(0);
+    let serial = state.next_serial();
+    let keyboard = state.keyboard.clone();
+    let focused = state.windows[0].surface.wl_surface().clone();
+    keyboard.set_focus(&mut state, Some(focused), serial);
+    serial_tx.send(serial.into()).unwrap();
+
+    let (read_fd, write_fd) = rustix::pipe::pipe().unwrap();
+    let mut requested = false;
+    dispatch_until(&mut display, &mut state, |state| {
+        if requested {
+            return selection_rx.try_recv().is_ok();
+        }
+        requested = smithay::wayland::selection::data_device::request_data_device_client_selection::<Astera>(
+            &state.seat,
+            "text/plain;charset=utf-8".into(),
+            write_fd.try_clone().unwrap(),
+        )
+        .is_ok();
+        false
+    });
+    drop(write_fd);
+    let mut bytes = Vec::new();
+    std::fs::File::from(read_fd)
+        .read_to_end(&mut bytes)
+        .unwrap();
+    assert_eq!(bytes, PAYLOAD);
+    client.join().unwrap();
+}
+
+#[test]
 fn session_lock_is_fail_closed_before_confirmation_and_after_disconnect() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
@@ -353,8 +700,13 @@ fn session_lock_is_fail_closed_before_confirmation_and_after_disconnect() {
     assert!(matches!(state.session_state, SessionState::Locking { .. }));
     state.lock_frame_presented(OutputId(0), None);
     assert!(matches!(state.session_state, SessionState::Locking { .. }));
+    state.session_output_connected(OutputId(1));
+    state.confirm_output_power(OutputId(1), false);
+    state.confirm_output_power(OutputId(1), true);
     let generation = state.locking_generation();
     state.lock_frame_presented(OutputId(0), generation);
+    assert!(matches!(state.session_state, SessionState::Locking { .. }));
+    state.lock_frame_presented(OutputId(1), generation);
     assert!(matches!(state.session_state, SessionState::Locked { .. }));
     client.join().unwrap();
     for _ in 0..8 {
@@ -362,6 +714,89 @@ fn session_lock_is_fail_closed_before_confirmation_and_after_disconnect() {
     }
     assert!(state.session_is_locked());
     assert!(state.render_roots().is_empty());
+}
+
+#[test]
+fn session_lock_surface_allows_damage_only_commits() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let output = globals.bind::<WlOutput, _, _>(&queue, 1..=4, ()).unwrap();
+        let shm = globals.bind::<WlShm, _, _>(&queue, 1..=1, ()).unwrap();
+        let manager = globals
+            .bind::<ExtSessionLockManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let lock = manager.lock(&queue, ());
+        let surface = compositor.create_surface(&queue, ());
+        let (configure_tx, configure_rx) = mpsc::channel();
+        let lock_surface = lock.get_lock_surface(&surface, &output, &queue, configure_tx);
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        let (serial, width, height) = loop {
+            if let Ok(configure) = configure_rx.try_recv() {
+                break configure;
+            }
+            events.blocking_dispatch(&mut TestClient).unwrap();
+        };
+        lock_surface.ack_configure(serial);
+        let stride = i32::try_from(width.saturating_mul(4)).unwrap();
+        let length = u64::try_from(stride).unwrap() * u64::from(height);
+        let fd =
+            rustix::fs::memfd_create("astera-lock-test", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+        rustix::fs::ftruncate(&fd, length).unwrap();
+        let pool = shm.create_pool(fd.as_fd(), i32::try_from(length).unwrap(), &queue, ());
+        let buffer = pool.create_buffer(
+            0,
+            i32::try_from(width).unwrap(),
+            i32::try_from(height).unwrap(),
+            stride,
+            wayland_client::protocol::wl_shm::Format::Argb8888,
+            &queue,
+            (),
+        );
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        // No attach here: this valid commit retains the buffer from the preceding commit.
+        surface.damage_buffer(0, 0, 1, 1);
+        surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+        result_tx
+            .send(events.roundtrip(&mut TestClient).is_ok())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        !state.lock_surfaces.is_empty()
+    });
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    let mut result = None;
+    dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
+        Ok(value) => {
+            result = Some(value);
+            true
+        }
+        Err(_) => false,
+    });
+    assert_eq!(result, Some(true));
+    client.join().unwrap();
 }
 
 #[test]
@@ -376,6 +811,8 @@ fn decoration_and_activation_globals_are_advertised() {
         .unwrap();
 
     let (requested_tx, requested_rx) = mpsc::sync_channel(0);
+    let (destroy_surface_tx, destroy_surface_rx) = mpsc::sync_channel(0);
+    let (surface_destroyed_tx, surface_destroyed_rx) = mpsc::sync_channel(0);
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     let client = thread::spawn(move || {
         let connection = Connection::from_socket(client_socket).unwrap();
@@ -457,6 +894,13 @@ fn decoration_and_activation_globals_are_advertised() {
         surface.commit();
         connection.flush().unwrap();
         requested_tx.send(()).unwrap();
+        destroy_surface_rx.recv().unwrap();
+        decoration.destroy();
+        toplevel.destroy();
+        xdg_surface.destroy();
+        surface.destroy();
+        connection.flush().unwrap();
+        surface_destroyed_tx.send(()).unwrap();
         done_rx.recv().unwrap();
     });
 
@@ -533,6 +977,17 @@ fn decoration_and_activation_globals_are_advertised() {
     state.request_activation(token.clone(), data, target);
     assert!(state.windows[0].urgent);
     assert!(state.xdg_activation_state.data_for_token(&token).is_none());
+    destroy_surface_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        surface_destroyed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        state.idle_inhibitors.is_empty()
+    });
+    assert!(
+        state.idle_inhibitors.is_empty(),
+        "idle inhibitors must stop affecting compositor state when their surface is destroyed"
+    );
     done_tx.send(()).unwrap();
     client.join().unwrap();
 }
@@ -540,7 +995,8 @@ fn decoration_and_activation_globals_are_advertised() {
 #[test]
 fn layer_exclusive_zone_reduces_usable_viewport() {
     use wayland_protocols_wlr::layer_shell::v1::client::{
-        zwlr_layer_shell_v1::Layer, zwlr_layer_surface_v1::Anchor,
+        zwlr_layer_shell_v1::Layer,
+        zwlr_layer_surface_v1::{Anchor, KeyboardInteractivity},
     };
 
     let mut display = Display::<Astera>::new().unwrap();
@@ -561,6 +1017,8 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
         .insert_client(server_socket, Arc::new(ClientState::default()))
         .unwrap();
     let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (destroy_popup_tx, destroy_popup_rx) = mpsc::sync_channel(0);
+    let (popup_destroyed_tx, popup_destroyed_rx) = mpsc::sync_channel(0);
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     let client = thread::spawn(move || {
         let connection = Connection::from_socket(client_socket).unwrap();
@@ -588,17 +1046,28 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
         layer.set_size(0, 32);
         layer.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right);
         layer.set_exclusive_zone(32);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
         surface.commit();
 
         let popup_surface = compositor.create_surface(&queue, ());
         let popup_xdg_surface = xdg.get_xdg_surface(&popup_surface, &queue, ());
         let positioner = xdg.create_positioner(&queue, ());
         positioner.set_size(200, 120);
-        positioner.set_anchor_rect(0, 0, 1, 1);
-        let _popup = popup_xdg_surface.get_popup(None, &positioner, &queue, ());
+        positioner.set_anchor_rect(1270, 20, 1, 1);
+        positioner.set_constraint_adjustment(
+            wayland_protocols::xdg::shell::client::xdg_positioner::ConstraintAdjustment::SlideX
+                | wayland_protocols::xdg::shell::client::xdg_positioner::ConstraintAdjustment::SlideY,
+        );
+        positioner.set_reactive();
+        let popup = popup_xdg_surface.get_popup(None, &positioner, &queue, ());
+        layer.get_popup(&popup);
         popup_surface.commit();
         connection.flush().unwrap();
         committed_tx.send(()).unwrap();
+        destroy_popup_rx.recv().unwrap();
+        popup.destroy();
+        connection.flush().unwrap();
+        popup_destroyed_tx.send(()).unwrap();
         done_rx.recv().unwrap();
     });
     dispatch_until(&mut display, &mut state, |_| {
@@ -611,6 +1080,58 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
     });
     let usable = state.usable_rect(OutputId(0)).unwrap();
     assert_eq!(usable, astera_core::Rect::new(0, 32, 1280, 688));
+    dispatch_until(&mut display, &mut state, |state| {
+        state.layers.first().is_some_and(|layer| {
+            PopupManager::popups_for_surface(layer.surface.wl_surface())
+                .next()
+                .is_some()
+        })
+    });
+    let layer_root = state.layers[0].surface.wl_surface();
+    let (popup, _) = PopupManager::popups_for_surface(layer_root)
+        .next()
+        .expect("layer popup should be tracked");
+    let PopupKind::Xdg(popup) = popup else {
+        panic!("layer-shell only accepts XDG popups");
+    };
+    let geometry = popup.with_pending_state(|pending| pending.geometry);
+    assert_eq!(geometry.loc, (1080, 0).into());
+    assert_eq!(geometry.size, (200, 120).into());
+    state
+        .configure_output(
+            OutputId(0),
+            Size::new(1000, 720),
+            Size::new(1000, 720),
+            Scale120::ONE,
+            OutputTransform::Normal,
+        )
+        .unwrap();
+    let geometry = popup.with_pending_state(|pending| pending.geometry);
+    assert_eq!(geometry.loc, (800, 0).into());
+    state.layers[0].mapped = true;
+    state.on_demand_layer_focus = Some(state.layers[0].id);
+    state.sync_keyboard_focus();
+    let layer_surface = state.layers[0].surface.wl_surface().clone();
+    assert_eq!(state.keyboard.current_focus(), Some(layer_surface.clone()));
+    state.sync_keyboard_focus();
+    assert_eq!(state.keyboard.current_focus(), Some(layer_surface));
+    state.layers[0].mapped = false;
+    state.sync_keyboard_focus();
+    assert_eq!(state.on_demand_layer_focus, None);
+    let generation = state.render_generation();
+    destroy_popup_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        popup_destroyed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        PopupManager::popups_for_surface(state.layers[0].surface.wl_surface())
+            .next()
+            .is_none()
+    });
+    assert!(
+        state.render_generation() > generation,
+        "destroying a popup must schedule repaint of its former pixels"
+    );
     assert!(
         state.publish_public_state().iter().any(|event| matches!(
             event.event,
@@ -664,6 +1185,23 @@ fn uncommitted_toplevel_does_not_map_and_role_destroy_cleans_up() {
 
     dispatch_until(&mut display, &mut state, |_| mapped_rx.try_recv().is_ok());
     dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    let capabilities = state.windows[0].surface.current_state().capabilities;
+    assert_eq!(capabilities.capabilities().count(), 3);
+    assert!(
+        capabilities
+            .capabilities()
+            .any(|capability| *capability == xdg_toplevel::WmCapabilities::Maximize)
+    );
+    assert!(
+        capabilities
+            .capabilities()
+            .any(|capability| *capability == xdg_toplevel::WmCapabilities::Fullscreen)
+    );
+    assert!(
+        capabilities
+            .capabilities()
+            .any(|capability| *capability == xdg_toplevel::WmCapabilities::Minimize)
+    );
     let role_window = state.windows[0].id;
     assert!(!state.windows[0].mapped);
     assert_eq!(
@@ -676,6 +1214,109 @@ fn uncommitted_toplevel_does_not_map_and_role_destroy_cleans_up() {
     });
     dispatch_until(&mut display, &mut state, |state| state.windows.is_empty());
     surface_destroy_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn initial_toplevel_mode_requests_are_retained_until_mapping() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (step_tx, step_rx) = mpsc::sync_channel(0);
+    let (continue_tx, continue_rx) = mpsc::sync_channel(0);
+
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, _events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = _events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+
+        toplevel.set_maximized();
+        connection.flush().unwrap();
+        step_tx.send(1).unwrap();
+        continue_rx.recv().unwrap();
+
+        toplevel.unset_maximized();
+        toplevel.set_fullscreen(None);
+        connection.flush().unwrap();
+        step_tx.send(2).unwrap();
+        continue_rx.recv().unwrap();
+
+        toplevel.set_minimized();
+        connection.flush().unwrap();
+        step_tx.send(3).unwrap();
+        continue_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| step_rx.try_recv() == Ok(1));
+    dispatch_until(&mut display, &mut state, |state| {
+        state
+            .windows
+            .first()
+            .is_some_and(|window| window.initial_mode == Some(WindowMode::Maximized))
+    });
+    assert!(!state.windows[0].mapped);
+    continue_tx.send(()).unwrap();
+
+    dispatch_until(&mut display, &mut state, |_| step_rx.try_recv() == Ok(2));
+    dispatch_until(&mut display, &mut state, |state| {
+        state
+            .windows
+            .first()
+            .is_some_and(|window| window.initial_mode == Some(WindowMode::Fullscreen))
+    });
+    assert!(!state.windows[0].mapped);
+    let window = state.windows[0].id;
+    state.map_toplevel(0);
+    let workspace = state.desktop.find_window(window).unwrap();
+    assert_eq!(
+        state
+            .desktop
+            .workspace(workspace)
+            .unwrap()
+            .window_mode(window),
+        Some(WindowMode::Fullscreen)
+    );
+    assert_eq!(state.windows[0].initial_mode, None);
+    continue_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| step_rx.try_recv() == Ok(3));
+    dispatch_until(&mut display, &mut state, |state| {
+        state
+            .desktop
+            .workspace(workspace)
+            .unwrap()
+            .window_mode(window)
+            == Some(WindowMode::Minimized)
+    });
+    assert_eq!(
+        state
+            .desktop
+            .workspace(workspace)
+            .unwrap()
+            .window_mode(window),
+        Some(WindowMode::Minimized)
+    );
+    assert_eq!(state.visual_geometry(window), None);
+    state.desktop.focus_window(window).unwrap();
+    assert_eq!(
+        state
+            .desktop
+            .workspace(workspace)
+            .unwrap()
+            .window_mode(window),
+        Some(WindowMode::Fullscreen)
+    );
+    continue_tx.send(()).unwrap();
     client.join().unwrap();
 }
 
@@ -713,6 +1354,23 @@ fn frame_callback_snapshot_does_not_relock_surface_tree_state() {
         committed_rx.try_recv().is_ok()
     });
     dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    let surface = state.windows[0].surface.wl_surface().clone();
+    state.pointer_location = (12.5, 30.0).into();
+    let seat = state.seat.clone();
+    <Astera as ClientDndGrabHandler>::started(
+        &mut state,
+        None,
+        Some(surface.clone()),
+        seat.clone(),
+    );
+    let (icon, location, scale) = state.dnd_icon_render_source(OutputId(0)).unwrap();
+    assert_eq!(icon, surface);
+    assert_eq!(location, (13, 30).into());
+    assert_eq!(scale, 1.0);
+    assert!(state.dnd_icon_render_source(OutputId(99)).is_none());
+    <Astera as ClientDndGrabHandler>::dropped(&mut state, None, false, seat);
+    assert!(state.dnd_icon_render_source(OutputId(0)).is_none());
+
     let surface = state.windows[0].surface.wl_surface().clone();
     let (snapshot_tx, snapshot_rx) = mpsc::sync_channel(0);
     thread::spawn(move || {
@@ -778,6 +1436,40 @@ fn compositor_time_can_be_advanced_without_sleeping() {
     assert_eq!(state.clock.now(), start);
     clock.advance(Duration::from_millis(300));
     assert_eq!(state.clock.now(), start + Duration::from_millis(300));
+}
+
+#[test]
+fn interactive_resize_preserves_opposite_edge_and_client_limits() {
+    let start = astera_core::Rect::new(100, 100, 400, 300);
+    let top_left = resized_rect(
+        start,
+        (100.0, 100.0),
+        SmithayPoint::from((450.0, 350.0)),
+        ResizeEdges {
+            top: true,
+            bottom: false,
+            left: true,
+            right: false,
+        },
+        Size::new(200, 160),
+        Size::new(600, 500),
+    );
+    assert_eq!(top_left, astera_core::Rect::new(300, 240, 200, 160));
+
+    let bottom_right = resized_rect(
+        start,
+        (500.0, 400.0),
+        SmithayPoint::from((900.0, 900.0)),
+        ResizeEdges {
+            top: false,
+            bottom: true,
+            left: false,
+            right: true,
+        },
+        Size::new(200, 160),
+        Size::new(600, 500),
+    );
+    assert_eq!(bottom_right, astera_core::Rect::new(100, 100, 600, 500));
 }
 
 #[test]
@@ -886,9 +1578,13 @@ fn pointer_crosses_outputs_but_compositor_drag_stays_local() {
     state.drag = Some(DragState {
         window: WindowId(999),
         mode: WindowMode::Floating,
+        kind: DragKind::Move,
         grab_offset: (0.0, 0.0),
-        target: Point::ORIGIN,
-        start: Point::ORIGIN,
+        pointer_start: (0.0, 0.0),
+        min_size: Size::new(1, 1),
+        max_size: Size::new(i64::MAX, i64::MAX),
+        target: astera_core::Rect::new(0, 0, 100, 100),
+        start: astera_core::Rect::new(0, 0, 100, 100),
     });
     let location = state.relative_pointer_location(20.0, 0.0);
     assert_eq!(state.active_output, OutputId(0));
