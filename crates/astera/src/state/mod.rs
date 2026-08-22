@@ -41,8 +41,8 @@ use geometry::{
 use idle::{IdleEvent, IdleRuntime};
 use key_repeat::KeyRepeatState;
 use model::{
-    DragKind, DragState, MappedInputMethodPopup, MappedLayer, MappedWindow, OutputRuntime,
-    ProtocolState, ResizeEdges,
+    ActivePointerGesture, DragKind, DragState, MappedInputMethodPopup, MappedLayer, MappedWindow,
+    OutputRuntime, ProtocolState, ResizeEdges,
 };
 use output_power::OutputPowerGlobalData;
 use session_lock::{LockSurfaces, SessionState};
@@ -89,7 +89,7 @@ use smithay::{
             GestureHoldEndEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
             GesturePinchUpdateEvent as SmithayGesturePinchUpdateEvent, GestureSwipeBeginEvent,
             GestureSwipeEndEvent, GestureSwipeUpdateEvent as SmithayGestureSwipeUpdateEvent,
-            MotionEvent,
+            MotionEvent, PointerTarget,
         },
         touch::{DownEvent, MotionEvent as SmithayTouchMotionEvent, UpEvent},
     },
@@ -172,6 +172,7 @@ pub struct Astera {
     next_window_id: u64,
     next_layer_id: u64,
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
+    active_pointer_gesture: Option<ActivePointerGesture>,
     cursor_image_status: smithay::input::pointer::CursorImageStatus,
     dnd_icon: Option<WlSurface>,
     named_cursors: HashMap<(smithay::input::pointer::CursorIcon, u32), cursor::NamedCursor>,
@@ -412,6 +413,7 @@ impl Astera {
             next_window_id: 1,
             next_layer_id: 1,
             pointer_location: (0.0, 0.0).into(),
+            active_pointer_gesture: None,
             cursor_image_status: smithay::input::pointer::CursorImageStatus::Named(
                 smithay::input::pointer::CursorIcon::Default,
             ),
@@ -727,20 +729,17 @@ impl Astera {
             InputEvent::PointerMotion { event } => self.handle_relative_pointer_motion(event),
             InputEvent::GestureSwipeBegin { event } => {
                 self.handle_absolute_pointer_motion(self.pointer_location, event.time_msec());
-                let pointer = self.pointer.clone();
-                let serial = self.next_serial();
-                pointer.gesture_swipe_begin(
-                    self,
-                    &GestureSwipeBeginEvent {
-                        serial,
-                        time: event.time_msec(),
-                        fingers: event.fingers(),
-                    },
-                );
+                self.start_swipe_gesture(event.time_msec(), event.fingers());
             }
             InputEvent::GestureSwipeUpdate { event } => {
-                let pointer = self.pointer.clone();
-                pointer.gesture_swipe_update(
+                let Some(ActivePointerGesture::Swipe(surface)) =
+                    self.active_pointer_gesture.as_ref().cloned()
+                else {
+                    return;
+                };
+                let seat = self.seat.clone();
+                surface.gesture_swipe_update(
+                    &seat,
                     self,
                     &SmithayGestureSwipeUpdateEvent {
                         time: event.time_msec(),
@@ -749,9 +748,14 @@ impl Astera {
                 );
             }
             InputEvent::GestureSwipeEnd { event } => {
-                let pointer = self.pointer.clone();
+                let Some(ActivePointerGesture::Swipe(surface)) = self.active_pointer_gesture.take()
+                else {
+                    return;
+                };
                 let serial = self.next_serial();
-                pointer.gesture_swipe_end(
+                let seat = self.seat.clone();
+                surface.gesture_swipe_end(
+                    &seat,
                     self,
                     &GestureSwipeEndEvent {
                         serial,
@@ -761,10 +765,16 @@ impl Astera {
                 );
             }
             InputEvent::GesturePinchBegin { event } => {
+                self.cancel_pointer_gesture(event.time_msec());
                 self.handle_absolute_pointer_motion(self.pointer_location, event.time_msec());
                 let pointer = self.pointer.clone();
+                let Some(surface) = pointer.current_focus() else {
+                    return;
+                };
                 let serial = self.next_serial();
-                pointer.gesture_pinch_begin(
+                let seat = self.seat.clone();
+                surface.gesture_pinch_begin(
+                    &seat,
                     self,
                     &GesturePinchBeginEvent {
                         serial,
@@ -772,10 +782,17 @@ impl Astera {
                         fingers: event.fingers(),
                     },
                 );
+                self.active_pointer_gesture = Some(ActivePointerGesture::Pinch(surface));
             }
             InputEvent::GesturePinchUpdate { event } => {
-                let pointer = self.pointer.clone();
-                pointer.gesture_pinch_update(
+                let Some(ActivePointerGesture::Pinch(surface)) =
+                    self.active_pointer_gesture.as_ref().cloned()
+                else {
+                    return;
+                };
+                let seat = self.seat.clone();
+                surface.gesture_pinch_update(
+                    &seat,
                     self,
                     &SmithayGesturePinchUpdateEvent {
                         time: event.time_msec(),
@@ -786,9 +803,14 @@ impl Astera {
                 );
             }
             InputEvent::GesturePinchEnd { event } => {
-                let pointer = self.pointer.clone();
+                let Some(ActivePointerGesture::Pinch(surface)) = self.active_pointer_gesture.take()
+                else {
+                    return;
+                };
                 let serial = self.next_serial();
-                pointer.gesture_pinch_end(
+                let seat = self.seat.clone();
+                surface.gesture_pinch_end(
+                    &seat,
                     self,
                     &GesturePinchEndEvent {
                         serial,
@@ -798,10 +820,16 @@ impl Astera {
                 );
             }
             InputEvent::GestureHoldBegin { event } => {
+                self.cancel_pointer_gesture(event.time_msec());
                 self.handle_absolute_pointer_motion(self.pointer_location, event.time_msec());
                 let pointer = self.pointer.clone();
+                let Some(surface) = pointer.current_focus() else {
+                    return;
+                };
                 let serial = self.next_serial();
-                pointer.gesture_hold_begin(
+                let seat = self.seat.clone();
+                surface.gesture_hold_begin(
+                    &seat,
                     self,
                     &GestureHoldBeginEvent {
                         serial,
@@ -809,11 +837,17 @@ impl Astera {
                         fingers: event.fingers(),
                     },
                 );
+                self.active_pointer_gesture = Some(ActivePointerGesture::Hold(surface));
             }
             InputEvent::GestureHoldEnd { event } => {
-                let pointer = self.pointer.clone();
+                let Some(ActivePointerGesture::Hold(surface)) = self.active_pointer_gesture.take()
+                else {
+                    return;
+                };
                 let serial = self.next_serial();
-                pointer.gesture_hold_end(
+                let seat = self.seat.clone();
+                surface.gesture_hold_end(
+                    &seat,
                     self,
                     &GestureHoldEndEvent {
                         serial,
@@ -987,8 +1021,70 @@ impl Astera {
     }
 
     pub(super) fn cancel_surface_bound_input(&mut self) {
+        self.cancel_pointer_gesture(0);
         self.cancel_touch_sequences();
         self.cancel_tablet_focus(0);
+    }
+
+    fn cancel_pointer_gesture(&mut self, time: u32) {
+        let Some(gesture) = self.active_pointer_gesture.take() else {
+            return;
+        };
+        let surface = gesture.surface().clone();
+        if !surface.alive() {
+            return;
+        }
+        let serial = self.next_serial();
+        let seat = self.seat.clone();
+        match gesture {
+            ActivePointerGesture::Swipe(_) => surface.gesture_swipe_end(
+                &seat,
+                self,
+                &GestureSwipeEndEvent {
+                    serial,
+                    time,
+                    cancelled: true,
+                },
+            ),
+            ActivePointerGesture::Pinch(_) => surface.gesture_pinch_end(
+                &seat,
+                self,
+                &GesturePinchEndEvent {
+                    serial,
+                    time,
+                    cancelled: true,
+                },
+            ),
+            ActivePointerGesture::Hold(_) => surface.gesture_hold_end(
+                &seat,
+                self,
+                &GestureHoldEndEvent {
+                    serial,
+                    time,
+                    cancelled: true,
+                },
+            ),
+        }
+    }
+
+    fn start_swipe_gesture(&mut self, time: u32, fingers: u32) {
+        self.cancel_pointer_gesture(time);
+        let pointer = self.pointer.clone();
+        let Some(surface) = pointer.current_focus() else {
+            return;
+        };
+        let serial = self.next_serial();
+        let seat = self.seat.clone();
+        surface.gesture_swipe_begin(
+            &seat,
+            self,
+            &GestureSwipeBeginEvent {
+                serial,
+                time,
+                fingers,
+            },
+        );
+        self.active_pointer_gesture = Some(ActivePointerGesture::Swipe(surface));
     }
 
     fn handle_pointer_motion(

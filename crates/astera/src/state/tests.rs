@@ -1468,6 +1468,70 @@ fn disconnected_xdg_client_is_removed_without_explicit_destroy() {
 }
 
 #[test]
+fn pointer_gesture_keeps_its_begin_surface_until_cancelled() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        for _ in 0..2 {
+            let surface = compositor.create_surface(&queue, ());
+            let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+            let _toplevel = xdg_surface.get_toplevel(&queue, ());
+            surface.commit();
+        }
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 2);
+    let first = state.windows[0].surface.wl_surface().clone();
+    let second = state.windows[1].surface.wl_surface().clone();
+    let pointer = state.pointer.clone();
+    pointer.motion(
+        &mut state,
+        Some((first.clone(), (0.0, 0.0).into())),
+        &MotionEvent {
+            location: (1.0, 1.0).into(),
+            serial: 1.into(),
+            time: 1,
+        },
+    );
+    state.start_swipe_gesture(2, 3);
+    pointer.motion(
+        &mut state,
+        Some((second, (0.0, 0.0).into())),
+        &MotionEvent {
+            location: (2.0, 2.0).into(),
+            serial: 2.into(),
+            time: 3,
+        },
+    );
+    assert!(matches!(
+        state.active_pointer_gesture.as_ref(),
+        Some(ActivePointerGesture::Swipe(surface)) if surface == &first
+    ));
+    state.cancel_pointer_gesture(4);
+    assert!(state.active_pointer_gesture.is_none());
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
 fn compositor_time_can_be_advanced_without_sleeping() {
     let display = Display::<Astera>::new().unwrap();
     let start = Instant::now();

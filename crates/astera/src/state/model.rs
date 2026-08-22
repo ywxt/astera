@@ -126,6 +126,21 @@ pub(super) struct MappedInputMethodPopup {
     pub(super) surface: InputMethodPopupSurface,
 }
 
+#[derive(Clone, Debug)]
+pub(super) enum ActivePointerGesture {
+    Swipe(WlSurface),
+    Pinch(WlSurface),
+    Hold(WlSurface),
+}
+
+impl ActivePointerGesture {
+    pub(super) fn surface(&self) -> &WlSurface {
+        match self {
+            Self::Swipe(surface) | Self::Pinch(surface) | Self::Hold(surface) => surface,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct OutputRuntime {
     /// Smithay protocol object corresponding to the core model's stable OutputId.

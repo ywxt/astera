@@ -804,6 +804,7 @@ impl XdgShellHandler for Astera {
     }
 
     fn popup_destroyed(&mut self, _surface: PopupSurface) {
+        self.cancel_pointer_gesture(0);
         self.popup_manager.cleanup();
         self.mark_render_dirty();
         self.refresh_visible_scales();
