@@ -86,7 +86,7 @@ impl Astera {
         }
     }
 
-    fn deactivate_pointer_constraint(&mut self, surface: &WlSurface) {
+    pub(super) fn deactivate_pointer_constraint(&mut self, surface: &WlSurface) {
         let pointer = self.pointer.clone();
         with_pointer_constraint(surface, &pointer, |constraint| {
             if let Some(constraint) = constraint.filter(|constraint| constraint.is_active()) {

@@ -445,6 +445,7 @@ impl WlrLayerShellHandler for Astera {
         tracing::debug!("layer surface destroyed");
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
+        self.handle_pointer_motion(self.pointer_location, 0);
     }
 }
 
@@ -813,6 +814,7 @@ impl XdgShellHandler for Astera {
         self.mark_public_dirty();
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
+        self.handle_pointer_motion(self.pointer_location, 0);
     }
 
     fn popup_destroyed(&mut self, _surface: PopupSurface) {

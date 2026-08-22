@@ -590,6 +590,7 @@ impl Astera {
         self.refresh_requested_dmabuf_feedbacks();
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
+        self.handle_pointer_motion(self.pointer_location, 0);
         self.mark_public_dirty();
         Ok(())
     }
@@ -1114,6 +1115,15 @@ impl Astera {
         }
         let focus = self.surface_under(location);
         let pointer = self.pointer.clone();
+        if let Some(previous) = pointer.current_focus()
+            && focus.as_ref().is_none_or(|(next, _, _)| *next != previous)
+        {
+            // Constraints are surface-focus scoped. Scene changes can move or hide a surface
+            // beneath a stationary pointer, so end its old constraint before sending wl_pointer
+            // leave/enter. Otherwise a locked pointer can remain attached to an invisible surface
+            // and suppress every future motion event.
+            self.deactivate_pointer_constraint(&previous);
+        }
         let serial = self.next_serial();
         let focus_origin = focus.as_ref().map(|(surface, origin, window)| {
             let scale = window
@@ -2095,6 +2105,7 @@ impl Astera {
         tracing::info!(window = ?id, "toplevel unmapped");
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
+        self.handle_pointer_motion(self.pointer_location, 0);
     }
 
     pub fn remove_dead_windows(&mut self) {
@@ -2112,7 +2123,9 @@ impl Astera {
             .map(|mapped| mapped.id)
             .collect();
         self.windows.retain(|mapped| mapped.surface.alive());
-        if self.layers.len() != layer_count || !dead.is_empty() {
+        let scene_changed = self.layers.len() != layer_count || !dead.is_empty();
+        if scene_changed {
+            self.cancel_surface_bound_input();
             self.mark_public_dirty();
         }
         for id in dead {
@@ -2129,6 +2142,10 @@ impl Astera {
             }
         }
         self.refresh_visible_scales();
+        if scene_changed {
+            self.sync_keyboard_focus();
+            self.handle_pointer_motion(self.pointer_location, 0);
+        }
     }
 }
 

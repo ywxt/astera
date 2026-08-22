@@ -66,6 +66,12 @@ impl Astera {
                 self.configure_fullscreen_windows();
                 self.refresh_visible_scales();
                 self.sync_keyboard_focus();
+                if !returns_state {
+                    // Commands may move the scene without physical pointer input. Re-hit-test the
+                    // stationary pointer so focus-scoped constraints and axis targeting follow the
+                    // new scene immediately.
+                    self.handle_pointer_motion(self.pointer_location, 0);
+                }
                 if returns_state {
                     Response::Success(Success::State {
                         sequence,

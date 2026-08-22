@@ -1543,6 +1543,79 @@ fn disconnected_xdg_client_is_removed_without_explicit_destroy() {
 }
 
 #[test]
+fn pointer_constraint_deactivates_when_scene_rehit_test_removes_focus() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let pointer = seat.get_pointer(&queue, ());
+        let constraints = globals
+            .bind::<ZwpPointerConstraintsV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let _locked = constraints.lock_pointer(
+            &surface,
+            &pointer,
+            None,
+            zwp_pointer_constraints_v1::Lifetime::Persistent,
+            &queue,
+            (),
+        );
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    let surface = state.windows[0].surface.wl_surface().clone();
+    let pointer = state.pointer.clone();
+    pointer.motion(
+        &mut state,
+        Some((surface.clone(), (0.0, 0.0).into())),
+        &MotionEvent {
+            location: (1.0, 1.0).into(),
+            serial: 1.into(),
+            time: 1,
+        },
+    );
+    state.pointer_focus_origin = Some((surface.clone(), (0.0, 0.0).into(), 1.0));
+    smithay::wayland::pointer_constraints::with_pointer_constraint(
+        &surface,
+        &pointer,
+        |constraint| constraint.unwrap().activate(),
+    );
+    assert!(matches!(
+        state.active_pointer_constraint(),
+        Some(pointer_constraints::ActivePointerConstraint::Locked)
+    ));
+
+    // The surface has no mapped scene node, which models a workspace switch/unmap before any
+    // physical motion. Re-hit-testing must emit unlocked and clear the stale pointer focus.
+    state.handle_pointer_motion((1.0, 1.0).into(), 2);
+    assert!(state.active_pointer_constraint().is_none());
+    assert!(pointer.current_focus().is_none());
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
 fn pointer_gesture_keeps_its_begin_surface_until_cancelled() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
