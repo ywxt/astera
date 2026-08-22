@@ -44,6 +44,27 @@ impl ActivationTracker {
                 clock.now(),
             )
     }
+
+    pub(super) fn authorizes_input(
+        &mut self,
+        serial: Serial,
+        client: &ClientId,
+        now: std::time::Instant,
+    ) -> bool {
+        input_capability_is_valid(&mut self.inputs, serial, client, now)
+    }
+}
+
+fn input_capability_is_valid<C: PartialEq>(
+    inputs: &mut VecDeque<(Serial, C, std::time::Instant)>,
+    serial: Serial,
+    client: &C,
+    now: std::time::Instant,
+) -> bool {
+    inputs.retain(|(_, _, issued)| now.saturating_duration_since(*issued) <= ACTIVATION_TIMEOUT);
+    inputs
+        .iter()
+        .any(|(known, recipient, _)| *known == serial && recipient == client)
 }
 
 fn capability_is_valid<C: PartialEq>(
@@ -100,5 +121,36 @@ mod tests {
         let mut inputs = VecDeque::from([(7.into(), 1_u8, old)]);
         assert!(!capability_is_valid(&mut inputs, 7.into(), &1, old, now,));
         assert!(inputs.is_empty());
+    }
+
+    #[test]
+    fn input_authorization_requires_a_recent_serial_for_the_same_client() {
+        let now = Instant::now();
+        let mut inputs = VecDeque::from([(11.into(), "focused", now)]);
+
+        assert!(input_capability_is_valid(
+            &mut inputs,
+            11.into(),
+            &"focused",
+            now,
+        ));
+        assert!(!input_capability_is_valid(
+            &mut inputs,
+            12.into(),
+            &"focused",
+            now,
+        ));
+        assert!(!input_capability_is_valid(
+            &mut inputs,
+            11.into(),
+            &"other",
+            now,
+        ));
+        assert!(!input_capability_is_valid(
+            &mut inputs,
+            11.into(),
+            &"focused",
+            now + ACTIVATION_TIMEOUT + Duration::from_millis(1),
+        ));
     }
 }

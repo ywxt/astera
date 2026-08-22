@@ -332,6 +332,24 @@ impl Dispatch<XdgSurface, ()> for TestClient {
     }
 }
 
+impl Dispatch<XdgPopup, mpsc::Sender<()>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &XdgPopup,
+        event: wayland_protocols::xdg::shell::client::xdg_popup::Event,
+        dismissed: &mpsc::Sender<()>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if matches!(
+            event,
+            wayland_protocols::xdg::shell::client::xdg_popup::Event::PopupDone
+        ) {
+            let _ = dismissed.send(());
+        }
+    }
+}
+
 fn dispatch_until(
     display: &mut Display<Astera>,
     state: &mut Astera,
@@ -1180,6 +1198,63 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
         "layer commits must invalidate public state"
     );
     done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn popup_grab_with_unissued_serial_is_immediately_dismissed() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (requested_tx, requested_rx) = mpsc::sync_channel(0);
+    let (dismissed_tx, dismissed_rx) = mpsc::channel();
+
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+
+        let parent_surface = compositor.create_surface(&queue, ());
+        let parent_xdg = shell.get_xdg_surface(&parent_surface, &queue, ());
+        let _parent = parent_xdg.get_toplevel(&queue, ());
+        parent_surface.commit();
+
+        let positioner = shell.create_positioner(&queue, ());
+        positioner.set_size(64, 32);
+        positioner.set_anchor_rect(0, 0, 1, 1);
+        let popup_surface = compositor.create_surface(&queue, ());
+        let popup_xdg = shell.get_xdg_surface(&popup_surface, &queue, ());
+        let _popup = popup_xdg.get_popup(Some(&parent_xdg), &positioner, &queue, dismissed_tx);
+        _popup.grab(&seat, 0xfeed_beef);
+        connection.flush().unwrap();
+        requested_tx.send(()).unwrap();
+
+        for _ in 0..10_000 {
+            events.blocking_dispatch(&mut TestClient).unwrap();
+            if dismissed_rx.try_recv().is_ok() {
+                return;
+            }
+        }
+        panic!("compositor did not dismiss popup with an unissued grab serial");
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        requested_rx.try_recv().is_ok()
+    });
+    while !client.is_finished() {
+        display.dispatch_clients(&mut state).unwrap();
+        display.flush_clients().unwrap();
+        thread::yield_now();
+    }
     client.join().unwrap();
 }
 

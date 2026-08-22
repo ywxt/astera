@@ -754,11 +754,23 @@ impl XdgShellHandler for Astera {
         }
     }
 
-    fn grab(&mut self, surface: PopupSurface, _seat: wl_seat::WlSeat, serial: Serial) {
+    fn grab(&mut self, surface: PopupSurface, seat_resource: wl_seat::WlSeat, serial: Serial) {
         let popup = PopupKind::from(surface);
         let Ok(root) = find_popup_root_surface(&popup) else {
             return;
         };
+        let authorized = self.seat.owns(&seat_resource)
+            && root.client().is_some_and(|client| {
+                self.activation_tracker
+                    .authorizes_input(serial, &client.id(), self.clock.now())
+            });
+        if !authorized {
+            // xdg-shell requires denied grabs to be dismissed immediately. In particular, never
+            // install a compositor grab for a guessed, expired, foreign-client, or foreign-seat
+            // serial: input serials are capabilities, not arbitrary sequence numbers.
+            let _ = PopupManager::dismiss_popup(&root, &popup);
+            return;
+        }
         let seat = self.seat.clone();
         let Ok(grab) = self
             .popup_manager

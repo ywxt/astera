@@ -876,6 +876,10 @@ impl Astera {
                     .surface_under(location)
                     .map(|(surface, origin, _)| (surface, origin));
                 self.active_output = previous_output;
+                let recipient = focus
+                    .as_ref()
+                    .and_then(|(surface, _)| surface.client())
+                    .map(|client| client.id());
                 let touch = self.touch.clone();
                 let serial = self.next_serial();
                 touch.down(
@@ -888,6 +892,10 @@ impl Astera {
                         time: event.time_msec(),
                     },
                 );
+                if let Some(recipient) = recipient {
+                    self.activation_tracker
+                        .remember(serial, recipient, self.clock.now());
+                }
             }
             InputEvent::TouchMotion { event } => {
                 let key = (event.device().id(), i32::from(event.slot()));
