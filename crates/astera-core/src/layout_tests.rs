@@ -31,6 +31,28 @@ fn same_center_pushes_old_window_in_seed_direction() {
 }
 
 #[test]
+fn center_insertion_pushes_surrounding_windows_outward() {
+    let solver = RadialSolver::new(8);
+    let mut workspace = Workspace::new(WorkspaceId(1));
+    insert(&solver, &mut workspace, 1, Point::new(-40, 0));
+    insert(&solver, &mut workspace, 2, Point::new(40, 0));
+
+    let before_left = workspace.tiled[&WindowId(1)].geometry.center();
+    let before_right = workspace.tiled[&WindowId(2)].geometry.center();
+    insert(&solver, &mut workspace, 3, Point::ORIGIN);
+
+    let left = workspace.tiled[&WindowId(1)].geometry.center();
+    let right = workspace.tiled[&WindowId(2)].geometry.center();
+    assert!(left.x < before_left.x);
+    assert!(right.x > before_right.x);
+    assert_eq!(
+        workspace.tiled[&WindowId(3)].geometry.center(),
+        Point::ORIGIN
+    );
+    assert!(workspace.tiled_windows_are_stable(8));
+}
+
+#[test]
 fn floating_and_fullscreen_never_participate_in_solver() {
     let solver = RadialSolver::new(8);
     let mut workspace = Workspace::new(WorkspaceId(1));

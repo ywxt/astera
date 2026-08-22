@@ -1,6 +1,2 @@
-/target
-*.swp
-*.swo
-.agents
-.claude
-
+/.direnv/
+/target/

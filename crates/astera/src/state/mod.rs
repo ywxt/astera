@@ -1736,11 +1736,11 @@ impl Astera {
         };
         let id = self.windows[index].id;
         let workspace = self.desktop.workspace(workspace_id).unwrap();
-        let anchor = workspace
-            .focused_window
-            .and_then(|focused| workspace.tiled.get(&focused))
-            .map(|window| window.geometry.center())
-            .unwrap_or(Point::ORIGIN);
+        // New toplevels occupy the center of the currently visible world.  The radial solver then
+        // displaces every conflicting tiled window away from that point.  Anchoring to the
+        // previously focused window made insertion depend on focus mode and could even place a
+        // window at the world origin after the camera had moved.
+        let anchor = workspace.camera.center;
         let transaction = WindowTransaction::InsertTiled {
             id,
             size: DEFAULT_WINDOW_SIZE,
