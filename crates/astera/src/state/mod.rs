@@ -213,9 +213,13 @@ pub struct Astera {
     output_configuration_supported: bool,
     pending_dmabufs: Vec<(Dmabuf, ImportNotifier)>,
     dmabuf_enabled: bool,
+    dmabuf_global: Option<DmabufGlobal>,
     dmabuf_default_device: Option<u64>,
     dmabuf_default_formats: Vec<Format>,
+    dmabuf_devices: BTreeMap<u64, Vec<Format>>,
+    dmabuf_output_devices: BTreeMap<OutputId, u64>,
     dmabuf_output_feedback: BTreeMap<OutputId, DmabufFeedback>,
+    dmabuf_feedback_surfaces: HashSet<WlSurface>,
     serial: u32,
     session_lock_manager: SessionLockManagerState,
     session_lock_advertised: Arc<AtomicBool>,
@@ -445,9 +449,13 @@ impl Astera {
             output_configuration_supported: true,
             pending_dmabufs: Vec::new(),
             dmabuf_enabled: false,
+            dmabuf_global: None,
             dmabuf_default_device: None,
             dmabuf_default_formats: Vec::new(),
+            dmabuf_devices: BTreeMap::new(),
+            dmabuf_output_devices: BTreeMap::new(),
             dmabuf_output_feedback: BTreeMap::new(),
+            dmabuf_feedback_surfaces: HashSet::new(),
             serial: 1,
             session_lock_manager,
             session_lock_advertised,
@@ -546,6 +554,7 @@ impl Astera {
             .output_runtime
             .remove(&output)
             .expect("desktop output has a Wayland runtime");
+        self.dmabuf_output_devices.remove(&output);
         self.dmabuf_output_feedback.remove(&output);
         let empty = smithay::backend::renderer::element::RenderElementStates::default();
         for surface in &runtime.presented_surfaces {
@@ -576,6 +585,7 @@ impl Astera {
         }
         self.reflow_outputs();
         tracing::info!(?output, ?event, "output disconnected");
+        self.refresh_requested_dmabuf_feedbacks();
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
         self.mark_public_dirty();

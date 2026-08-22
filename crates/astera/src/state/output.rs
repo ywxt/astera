@@ -67,11 +67,19 @@ impl Astera {
         main_device: Option<u64>,
         formats: impl IntoIterator<Item = Format>,
     ) {
+        let formats = formats.into_iter().collect::<Vec<_>>();
+        if let Some(main_device) = main_device {
+            self.dmabuf_devices.insert(main_device, formats.clone());
+        }
         if self.dmabuf_enabled {
+            if self.dmabuf_default_device.is_none()
+                && let Some(main_device) = main_device
+            {
+                self.rebase_dmabuf_feedback(main_device);
+            }
             return;
         }
         let display = self.display.clone();
-        let formats = formats.into_iter().collect::<Vec<_>>();
         if let Some(main_device) = main_device {
             match smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
                 main_device,
@@ -80,21 +88,27 @@ impl Astera {
             .build()
             {
                 Ok(feedback) => {
-                    self.dmabuf_state
-                        .create_global_with_default_feedback::<Self>(&display, &feedback);
+                    self.dmabuf_global = Some(
+                        self.dmabuf_state
+                            .create_global_with_default_feedback::<Self>(&display, &feedback),
+                    );
                     self.dmabuf_default_device = Some(main_device);
                     self.dmabuf_default_formats = formats.clone();
                 }
                 Err(error) => {
                     tracing::warn!(%error, "could not build linux-dmabuf v4 feedback; advertising v3");
-                    self.dmabuf_state
-                        .create_global::<Self>(&display, formats.iter().copied());
+                    self.dmabuf_global = Some(
+                        self.dmabuf_state
+                            .create_global::<Self>(&display, formats.iter().copied()),
+                    );
                 }
             }
         } else {
             tracing::warn!("renderer has no DRM render node; advertising linux-dmabuf v3");
-            self.dmabuf_state
-                .create_global::<Self>(&display, formats.iter().copied());
+            self.dmabuf_global = Some(
+                self.dmabuf_state
+                    .create_global::<Self>(&display, formats.iter().copied()),
+            );
         }
         self.dmabuf_enabled = true;
     }
@@ -105,7 +119,94 @@ impl Astera {
         target_device: u64,
         formats: impl IntoIterator<Item = Format>,
     ) {
+        let formats = formats.into_iter().collect::<Vec<_>>();
+        self.dmabuf_devices
+            .entry(target_device)
+            .or_insert_with(|| formats.clone());
+        self.dmabuf_output_devices.insert(output, target_device);
+        self.rebuild_output_dmabuf_feedback(output);
+        self.refresh_requested_dmabuf_feedbacks();
+        self.refresh_visible_scales();
+    }
+
+    pub fn unregister_dmabuf_device(&mut self, device: u64) {
+        self.dmabuf_devices.remove(&device);
+        self.dmabuf_output_devices
+            .retain(|_, target| *target != device);
+        self.dmabuf_output_feedback
+            .retain(|output, _| self.dmabuf_output_devices.contains_key(output));
+        if self.dmabuf_default_device == Some(device) {
+            if let Some(replacement) = self.dmabuf_devices.keys().next().copied() {
+                self.rebase_dmabuf_feedback(replacement);
+            } else {
+                self.dmabuf_default_device = None;
+                self.dmabuf_default_formats.clear();
+                self.dmabuf_output_feedback.clear();
+            }
+        }
+        self.refresh_requested_dmabuf_feedbacks();
+        self.refresh_visible_scales();
+    }
+
+    fn rebase_dmabuf_feedback(&mut self, main_device: u64) {
+        let Some(formats) = self.dmabuf_devices.get(&main_device).cloned() else {
+            return;
+        };
+        let Ok(feedback) = smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
+            main_device,
+            formats.iter().copied(),
+        )
+        .build() else {
+            tracing::warn!(main_device, "could not rebuild default dmabuf feedback");
+            return;
+        };
+        let Some(global) = self.dmabuf_global else {
+            return;
+        };
+        self.dmabuf_state.set_default_feedback(&global, &feedback);
+        self.dmabuf_default_device = Some(main_device);
+        self.dmabuf_default_formats = formats;
+        self.dmabuf_output_feedback.clear();
+        let outputs = self
+            .dmabuf_output_devices
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for output in outputs {
+            self.rebuild_output_dmabuf_feedback(output);
+        }
+        self.refresh_requested_dmabuf_feedbacks();
+        self.refresh_visible_scales();
+    }
+
+    pub(super) fn refresh_requested_dmabuf_feedbacks(&mut self) {
+        self.dmabuf_feedback_surfaces
+            .retain(smithay::utils::IsAlive::alive);
+        let updates = self
+            .dmabuf_feedback_surfaces
+            .iter()
+            .filter_map(|surface| {
+                self.dmabuf_feedback_for_surface(surface)
+                    .map(|feedback| (surface.clone(), feedback))
+            })
+            .collect::<Vec<_>>();
+        for (surface, feedback) in updates {
+            with_states(&surface, |states| {
+                if let Some(surface_feedback) = SurfaceDmabufFeedbackState::from_states(states) {
+                    surface_feedback.set_feedback(&feedback);
+                }
+            });
+        }
+    }
+
+    fn rebuild_output_dmabuf_feedback(&mut self, output: OutputId) {
         let Some(main_device) = self.dmabuf_default_device else {
+            return;
+        };
+        let Some(target_device) = self.dmabuf_output_devices.get(&output).copied() else {
+            return;
+        };
+        let Some(formats) = self.dmabuf_devices.get(&target_device).cloned() else {
             return;
         };
         let mut builder = smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
@@ -113,12 +214,11 @@ impl Astera {
             self.dmabuf_default_formats.iter().copied(),
         );
         if target_device != main_device {
-            builder = builder.add_preference_tranche(target_device, None, formats);
+            builder = builder.add_preference_tranche(target_device, None, formats.iter().copied());
         }
         match builder.build() {
             Ok(feedback) => {
                 self.dmabuf_output_feedback.insert(output, feedback);
-                self.refresh_visible_scales();
             }
             Err(error) => {
                 tracing::warn!(?output, %error, "could not build per-output dmabuf feedback");

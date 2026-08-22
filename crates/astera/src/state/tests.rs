@@ -168,12 +168,25 @@ delegate_noop!(TestClient: ignore ZwpVirtualKeyboardManagerV1);
 delegate_noop!(TestClient: ignore ZwpVirtualKeyboardV1);
 delegate_noop!(TestClient: ignore ZwpLinuxDmabufV1);
 
-impl Dispatch<ZwpLinuxDmabufFeedbackV1, (mpsc::Sender<()>, mpsc::Sender<Vec<u8>>)> for TestClient {
+impl
+    Dispatch<
+        ZwpLinuxDmabufFeedbackV1,
+        (
+            mpsc::Sender<()>,
+            mpsc::Sender<Vec<u8>>,
+            mpsc::Sender<Vec<u8>>,
+        ),
+    > for TestClient
+{
     fn event(
         _state: &mut Self,
         _proxy: &ZwpLinuxDmabufFeedbackV1,
         event: wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::Event,
-        feedback: &(mpsc::Sender<()>, mpsc::Sender<Vec<u8>>),
+        feedback: &(
+            mpsc::Sender<()>,
+            mpsc::Sender<Vec<u8>>,
+            mpsc::Sender<Vec<u8>>,
+        ),
         _connection: &Connection,
         _queue: &QueueHandle<Self>,
     ) {
@@ -184,6 +197,9 @@ impl Dispatch<ZwpLinuxDmabufFeedbackV1, (mpsc::Sender<()>, mpsc::Sender<Vec<u8>>
             }
             Event::TrancheTargetDevice { device } => {
                 let _ = feedback.1.send(device);
+            }
+            Event::MainDevice { device } => {
+                let _ = feedback.2.send(device);
             }
             _ => {}
         }
@@ -445,6 +461,8 @@ fn dmabuf_with_a_render_node_advertises_version_four_feedback() {
         .handle()
         .insert_client(server_socket, Arc::new(ClientState::default()))
         .unwrap();
+    let (initial_tx, initial_rx) = mpsc::sync_channel(0);
+    let (rebase_tx, rebase_rx) = mpsc::sync_channel(0);
     let (result_tx, result_rx) = mpsc::sync_channel(0);
     let client = thread::spawn(move || {
         let connection = Connection::from_socket(client_socket).unwrap();
@@ -459,19 +477,41 @@ fn dmabuf_with_a_render_node_advertises_version_four_feedback() {
         };
         let (done_tx, done_rx) = mpsc::channel();
         let (target_tx, target_rx) = mpsc::channel();
+        let (main_tx, main_rx) = mpsc::channel();
         let surface = compositor.create_surface(&queue, ());
-        let _feedback = dmabuf.get_surface_feedback(&surface, &queue, (done_tx, target_tx));
+        let _feedback =
+            dmabuf.get_surface_feedback(&surface, &queue, (done_tx, target_tx, main_tx));
         connection.flush().unwrap();
         let connected = events.roundtrip(&mut TestClient).is_ok();
         let target_device = 2u64.to_ne_bytes();
+        let initial_ok = connected
+            && done_rx.try_recv().is_ok()
+            && target_rx.try_iter().any(|device| device == target_device)
+            && main_rx
+                .try_iter()
+                .any(|device| device == 1u64.to_ne_bytes());
+        initial_tx.send(initial_ok).unwrap();
+        rebase_rx.recv().unwrap();
+        let connected = events.roundtrip(&mut TestClient).is_ok();
         result_tx
             .send(
                 connected
                     && done_rx.try_recv().is_ok()
-                    && target_rx.try_iter().any(|device| device == target_device),
+                    && main_rx.try_iter().any(|device| device == target_device),
             )
             .unwrap();
     });
+    let mut initial = None;
+    dispatch_until(&mut display, &mut state, |_| match initial_rx.try_recv() {
+        Ok(value) => {
+            initial = Some(value);
+            true
+        }
+        Err(_) => false,
+    });
+    assert_eq!(initial, Some(true));
+    state.unregister_dmabuf_device(1);
+    rebase_tx.send(()).unwrap();
     let mut advertised = None;
     dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
         Ok(value) => {

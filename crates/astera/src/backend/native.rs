@@ -722,6 +722,9 @@ impl NativeLoop {
             }
             self.scheduler.remove_output(output);
         }
+        // Rebase feedback after Desktop has selected replacement outputs so unmapped surfaces
+        // using the active-output fallback receive the new main device as well.
+        self.state.unregister_dmabuf_device(node.dev_id());
         if let Some(device) = self.devices.remove(&node) {
             self.handle.remove(device.registration);
             self.gpus.as_mut().remove_node(&node);

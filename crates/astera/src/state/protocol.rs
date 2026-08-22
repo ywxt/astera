@@ -173,6 +173,16 @@ impl DmabufHandler for Astera {
         surface: &WlSurface,
         _global: &DmabufGlobal,
     ) -> Option<DmabufFeedback> {
+        self.dmabuf_feedback_surfaces.insert(surface.clone());
+        self.dmabuf_feedback_for_surface(surface)
+    }
+}
+
+impl Astera {
+    pub(super) fn dmabuf_feedback_for_surface(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<DmabufFeedback> {
         let output = self
             .output_runtime
             .iter()
@@ -329,6 +339,7 @@ impl CompositorHandler for Astera {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
+        self.dmabuf_feedback_surfaces.remove(surface);
         let was_visible = self
             .output_runtime
             .values()
