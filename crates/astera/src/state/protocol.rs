@@ -1370,7 +1370,9 @@ impl smithay::reexports::wayland_server::Dispatch<
             request,
             smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_v1::Request::Key { .. }
         ) {
-            let events = state.idle_runtime.activity(0, state.clock.now());
+            let events = state
+                .idle_runtime
+                .activity(state.idle_seat_key(), state.clock.now());
             state.send_idle_events(events);
         }
         <VirtualKeyboardManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(

@@ -622,7 +622,9 @@ impl Astera {
                 | InputEvent::TabletToolButton { .. }
         );
         if is_activity {
-            let events = self.idle_runtime.activity(0, self.clock.now());
+            let events = self
+                .idle_runtime
+                .activity(self.idle_seat_key(), self.clock.now());
             self.send_idle_events(events);
         }
         // Device lifecycle must remain correct while headless; otherwise unplugging the last

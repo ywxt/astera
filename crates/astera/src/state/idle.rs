@@ -1,3 +1,4 @@
+use smithay::input::{Seat, SeatHandler};
 use smithay::reexports::{
     wayland_protocols::ext::idle_notify::v1::server::{
         ext_idle_notification_v1::{self, ExtIdleNotificationV1},
@@ -10,12 +11,17 @@ use smithay::reexports::{
 use smithay::utils::IsAlive;
 use std::{
     collections::BTreeMap,
+    hash::{DefaultHasher, Hash, Hasher},
     time::{Duration, Instant},
 };
 
 use super::Astera;
 
 impl Astera {
+    pub(super) fn idle_seat_key(&self) -> u64 {
+        seat_key(&self.seat)
+    }
+
     pub(super) fn refresh_idle_inhibition(&mut self) {
         use smithay::{
             desktop::utils::surface_primary_scanout_output, wayland::compositor::with_states,
@@ -86,17 +92,13 @@ impl Dispatch<ExtIdleNotifierV1, ()> for Astera {
         _: &DisplayHandle,
         data: &mut DataInit<'_, Self>,
     ) {
-        let (new, timeout, ignore) = match request {
-            ext_idle_notifier_v1::Request::GetIdleNotification {
-                id,
-                timeout,
-                seat: _,
-            } => (id, timeout, false),
-            ext_idle_notifier_v1::Request::GetInputIdleNotification {
-                id,
-                timeout,
-                seat: _,
-            } => (id, timeout, true),
+        let (new, timeout, seat, ignore) = match request {
+            ext_idle_notifier_v1::Request::GetIdleNotification { id, timeout, seat } => {
+                (id, timeout, seat, false)
+            }
+            ext_idle_notifier_v1::Request::GetInputIdleNotification { id, timeout, seat } => {
+                (id, timeout, seat, true)
+            }
             ext_idle_notifier_v1::Request::Destroy => return,
             _ => return,
         };
@@ -104,14 +106,28 @@ impl Dispatch<ExtIdleNotifierV1, ()> for Astera {
         state.next_idle_notification = id.wrapping_add(1).max(1);
         let resource = data.init(new, IdleNotificationData { id });
         state.idle_notifications.insert(id, resource);
+        // Multiple wl_seat resources may represent the same Smithay seat. Hash the underlying
+        // Seat handle rather than the protocol object ID so every binding shares one activity
+        // timeline, while timers for distinct seats remain isolated.
+        let Some(seat) = Seat::<Astera>::from_resource(&seat).map(|seat| seat_key(&seat)) else {
+            // A wl_seat not created by SeatState cannot receive activity through Astera. Keep the
+            // already-created notification inert instead of aliasing it to a real seat.
+            return;
+        };
         state.idle_runtime.insert(
             id,
-            0,
+            seat,
             Duration::from_millis(u64::from(timeout)),
             ignore,
             state.clock.now(),
         );
     }
+}
+
+fn seat_key<D: SeatHandler>(seat: &Seat<D>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    seat.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl Dispatch<ExtIdleNotificationV1, IdleNotificationData> for Astera {
@@ -268,6 +284,27 @@ mod tests {
         assert_eq!(
             idle.activity(4, now + Duration::from_secs(2)),
             vec![IdleEvent::Idled(3), IdleEvent::Resumed(3)]
+        );
+    }
+
+    #[test]
+    fn activity_only_resets_timers_for_the_matching_seat() {
+        let now = Instant::now();
+        let mut idle = IdleRuntime::default();
+        idle.insert(1, 10, Duration::from_secs(1), false, now);
+        idle.insert(2, 20, Duration::from_secs(1), false, now);
+        assert_eq!(
+            idle.process_due(now + Duration::from_secs(1)),
+            vec![IdleEvent::Idled(1), IdleEvent::Idled(2)]
+        );
+        assert_eq!(
+            idle.activity(10, now + Duration::from_secs(2)),
+            vec![IdleEvent::Resumed(1)]
+        );
+        assert!(idle.process_due(now + Duration::from_secs(2)).is_empty());
+        assert_eq!(
+            idle.activity(20, now + Duration::from_secs(2)),
+            vec![IdleEvent::Resumed(2)]
         );
     }
 }
