@@ -210,22 +210,20 @@ impl IdleRuntime {
             return Vec::new();
         }
         self.inhibited = inhibited;
-        let mut events = Vec::new();
-        for (id, timer) in &mut self.timers {
+        for timer in self.timers.values_mut() {
             if timer.ignore_inhibitor {
                 continue;
             }
             if inhibited {
+                // The idle-inhibit protocol explicitly says a newly established inhibitor is not
+                // honored when the system is already idle. Keep that state until genuine input
+                // activity resumes this seat; the inhibitor then suppresses the next deadline.
                 timer.deadline = None;
-                if timer.idle {
-                    timer.idle = false;
-                    events.push(IdleEvent::Resumed(*id));
-                }
             } else {
                 timer.deadline = Some(now + timer.timeout);
             }
         }
-        events
+        Vec::new()
     }
 
     pub(super) fn process_due(&mut self, now: Instant) -> Vec<IdleEvent> {
@@ -257,6 +255,28 @@ mod tests {
         assert!(idle.process_due(now + Duration::from_secs(20)).is_empty());
         idle.set_inhibited(false, now + Duration::from_secs(20));
         assert_eq!(idle.deadline(), Some(now + Duration::from_secs(25)));
+    }
+
+    #[test]
+    fn inhibitor_created_while_idle_waits_for_real_activity_to_resume() {
+        let now = Instant::now();
+        let mut idle = IdleRuntime::default();
+        idle.insert(1, 5, Duration::from_secs(1), false, now);
+        assert_eq!(
+            idle.process_due(now + Duration::from_secs(1)),
+            vec![IdleEvent::Idled(1)]
+        );
+
+        assert!(
+            idle.set_inhibited(true, now + Duration::from_secs(2))
+                .is_empty(),
+            "creating an inhibitor must not synthesize input activity"
+        );
+        assert_eq!(
+            idle.activity(5, now + Duration::from_secs(3)),
+            vec![IdleEvent::Resumed(1)]
+        );
+        assert_eq!(idle.deadline(), None);
     }
 
     #[test]
