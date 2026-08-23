@@ -31,6 +31,10 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
 };
 use wayland_protocols::wp::{
+    alpha_modifier::v1::client::{
+        wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1,
+        wp_alpha_modifier_v1::WpAlphaModifierV1,
+    },
     cursor_shape::v1::client::{
         wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
         wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
@@ -187,6 +191,8 @@ delegate_noop!(TestClient: ignore ZwpPrimarySelectionDeviceV1);
 delegate_noop!(TestClient: ignore ZwpPrimarySelectionOfferV1);
 delegate_noop!(TestClient: ignore ZwpPrimarySelectionSourceV1);
 delegate_noop!(TestClient: ignore WpSinglePixelBufferManagerV1);
+delegate_noop!(TestClient: ignore WpAlphaModifierV1);
+delegate_noop!(TestClient: ignore WpAlphaModifierSurfaceV1);
 
 impl Dispatch<ZxdgOutputV1, mpsc::Sender<(i32, i32)>> for TestClient {
     fn event(
@@ -1362,6 +1368,57 @@ fn single_pixel_buffer_maps_an_xdg_toplevel() {
     dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
     dispatch_until(&mut display, &mut state, |_| mapped_rx.try_recv().is_ok());
     dispatch_until(&mut display, &mut state, |state| state.windows[0].mapped);
+    client.join().unwrap();
+}
+
+#[test]
+fn alpha_modifier_is_double_buffered_with_surface_commit() {
+    const FACTOR: u32 = u32::MAX / 3;
+
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let manager = globals
+            .bind::<WpAlphaModifierV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        let modifier = manager.get_surface(&surface, &queue, ());
+        modifier.set_multiplier(FACTOR);
+        surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    let multiplier = with_states(state.windows[0].surface.wl_surface(), |states| {
+        states
+            .cached_state
+            .get::<smithay::wayland::alpha_modifier::AlphaModifierSurfaceCachedState>()
+            .current()
+            .multiplier()
+    });
+    assert_eq!(multiplier, Some(FACTOR));
+    done_tx.send(()).unwrap();
     client.join().unwrap();
 }
 

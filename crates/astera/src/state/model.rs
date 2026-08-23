@@ -12,6 +12,7 @@ use smithay::{
         DisplayHandle, backend::GlobalId, protocol::wl_surface::WlSurface,
     },
     wayland::{
+        alpha_modifier::AlphaModifierState,
         compositor::CompositorState,
         cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufState,
@@ -64,6 +65,7 @@ pub struct ProtocolState {
     pub(super) data_device_state: DataDeviceState,
     pub(super) primary_selection_state: PrimarySelectionState,
     pub(super) _single_pixel_buffer_state: SinglePixelBufferState,
+    pub(super) _alpha_modifier_state: AlphaModifierState,
     pub(super) dmabuf_state: DmabufState,
     pub(super) popup_manager: PopupManager,
     pub(super) seat: Seat<Astera>,
