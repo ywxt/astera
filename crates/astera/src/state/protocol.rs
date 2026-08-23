@@ -40,6 +40,12 @@ impl XdgDecorationHandler for Astera {
     }
 }
 
+impl XdgDialogHandler for Astera {
+    fn modal_changed(&mut self, _toplevel: ToplevelSurface, _is_modal: bool) {
+        self.mark_public_dirty();
+    }
+}
+
 impl XdgActivationHandler for Astera {
     fn activation_state(&mut self) -> &mut XdgActivationState {
         &mut self.xdg_activation_state
@@ -1695,6 +1701,7 @@ impl ForeignToplevelListHandler for Astera {
 delegate_xdg_shell!(Astera);
 delegate_foreign_toplevel_list!(Astera);
 delegate_xdg_decoration!(Astera);
+delegate_xdg_dialog!(Astera);
 delegate_xdg_activation!(Astera);
 delegate_idle_inhibit!(Astera);
 delegate_keyboard_shortcuts_inhibit!(Astera);

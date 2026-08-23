@@ -27,7 +27,10 @@ use smithay::{
         selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
         shell::{
             wlr_layer::{Layer, WlrLayerShellState},
-            xdg::{ToplevelSurface, XdgShellState, decoration::XdgDecorationState},
+            xdg::{
+                ToplevelSurface, XdgShellState, decoration::XdgDecorationState,
+                dialog::XdgDialogState,
+            },
         },
         shm::ShmState,
         single_pixel_buffer::SinglePixelBufferState,
@@ -70,6 +73,7 @@ pub struct ProtocolState {
     pub(super) _alpha_modifier_state: AlphaModifierState,
     pub(super) foreign_toplevel_list_state: ForeignToplevelListState,
     pub(super) _content_type_state: ContentTypeState,
+    pub(super) _xdg_dialog_state: XdgDialogState,
     pub(super) dmabuf_state: DmabufState,
     pub(super) popup_manager: PopupManager,
     pub(super) seat: Seat<Astera>,

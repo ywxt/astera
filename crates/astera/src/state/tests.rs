@@ -102,6 +102,7 @@ use wayland_protocols::xdg::{
         zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
         zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
     },
+    dialog::v1::client::{xdg_dialog_v1::XdgDialogV1, xdg_wm_dialog_v1::XdgWmDialogV1},
 };
 use wayland_protocols_misc::zwp_input_method_v2::client::{
     zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
@@ -202,6 +203,8 @@ delegate_noop!(TestClient: ignore WpAlphaModifierV1);
 delegate_noop!(TestClient: ignore WpAlphaModifierSurfaceV1);
 delegate_noop!(TestClient: ignore WpContentTypeManagerV1);
 delegate_noop!(TestClient: ignore WpContentTypeV1);
+delegate_noop!(TestClient: ignore XdgWmDialogV1);
+delegate_noop!(TestClient: ignore XdgDialogV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
 
 impl Dispatch<ExtForeignToplevelListV1, ()> for TestClient {
@@ -1552,6 +1555,77 @@ fn content_type_is_double_buffered_and_can_be_recreated() {
     dispatch_until(&mut display, &mut state, |state| {
         content_type(state) == Type::None
     });
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn xdg_dialog_tracks_modal_parent_and_can_be_recreated() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (modal_tx, modal_rx) = mpsc::sync_channel(0);
+    let (destroy_tx, destroy_rx) = mpsc::sync_channel(0);
+    let (destroyed_tx, destroyed_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let dialogs = globals
+            .bind::<XdgWmDialogV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let parent_surface = compositor.create_surface(&queue, ());
+        let parent_xdg = shell.get_xdg_surface(&parent_surface, &queue, ());
+        let parent = parent_xdg.get_toplevel(&queue, ());
+        let child_surface = compositor.create_surface(&queue, ());
+        let child_xdg = shell.get_xdg_surface(&child_surface, &queue, ());
+        let child = child_xdg.get_toplevel(&queue, ());
+        child.set_parent(Some(&parent));
+        let dialog = dialogs.get_xdg_dialog(&child, &queue, ());
+        dialog.set_modal();
+        connection.flush().unwrap();
+        modal_tx.send(()).unwrap();
+
+        destroy_rx.recv().unwrap();
+        dialog.destroy();
+        let replacement = dialogs.get_xdg_dialog(&child, &queue, ());
+        replacement.destroy();
+        connection.flush().unwrap();
+        destroyed_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| modal_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 2);
+    let dialog_state = |state: &Astera| {
+        with_states(state.windows[1].surface.wl_surface(), |states| {
+            let attributes = states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .unwrap()
+                .lock()
+                .unwrap();
+            (attributes.modal, attributes.parent.clone())
+        })
+    };
+    let (modal, parent) = dialog_state(&state);
+    assert!(modal);
+    assert_eq!(parent, Some(state.windows[0].surface.wl_surface().clone()));
+
+    destroy_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        destroyed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| !dialog_state(state).0);
     done_tx.send(()).unwrap();
     client.join().unwrap();
 }
