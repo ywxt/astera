@@ -39,6 +39,9 @@ use wayland_protocols::wp::{
         wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1,
         wp_alpha_modifier_v1::WpAlphaModifierV1,
     },
+    commit_timing::v1::client::{
+        wp_commit_timer_v1::WpCommitTimerV1, wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
+    },
     content_type::v1::client::{
         wp_content_type_manager_v1::WpContentTypeManagerV1, wp_content_type_v1::WpContentTypeV1,
     },
@@ -208,6 +211,8 @@ delegate_noop!(TestClient: ignore XdgWmDialogV1);
 delegate_noop!(TestClient: ignore XdgDialogV1);
 delegate_noop!(TestClient: ignore WpFifoManagerV1);
 delegate_noop!(TestClient: ignore WpFifoV1);
+delegate_noop!(TestClient: ignore WpCommitTimingManagerV1);
+delegate_noop!(TestClient: ignore WpCommitTimerV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
 
 impl Dispatch<ExtForeignToplevelListV1, ()> for TestClient {
@@ -1655,6 +1660,128 @@ fn fifo_wait_blocks_surface_state_until_presented_barrier_signals() {
     });
     assert!(barrier.is_signaled());
     done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn commit_timing_blocks_state_until_monotonic_deadline() {
+    use smithay::{
+        reexports::wayland_protocols::wp::content_type::v1::server::wp_content_type_v1::Type,
+        utils::{Monotonic, Time},
+        wayland::{commit_timing::Timestamp, content_type::ContentTypeSurfaceCachedState},
+    };
+
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let target_seconds = u64::try_from(now.tv_sec).unwrap() + 1;
+    let target_nanos = u32::try_from(now.tv_nsec).unwrap();
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let timing = globals
+            .bind::<WpCommitTimingManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let content_manager = globals
+            .bind::<WpContentTypeManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        let timer = timing.get_timer(&surface, &queue, ());
+        let content = content_manager.get_surface_content_type(&surface, &queue, ());
+        content.set_content_type(
+            wayland_protocols::wp::content_type::v1::client::wp_content_type_v1::Type::Video,
+        );
+        timer.set_timestamp(
+            (target_seconds >> 32) as u32,
+            target_seconds as u32,
+            target_nanos,
+        );
+        surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    let surface = state.windows[0].surface.wl_surface().clone();
+    let content_type =
+        |surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
+            with_states(surface, |states| {
+                *states
+                    .cached_state
+                    .get::<ContentTypeSurfaceCachedState>()
+                    .current()
+                    .content_type()
+            })
+        };
+    assert_eq!(content_type(&surface), Type::None);
+    let deadline = state
+        .next_timer_deadline()
+        .expect("blocked commit must arm the event-loop timer");
+    assert!(deadline > std::time::Instant::now());
+
+    let target = Time::<Monotonic>::from(Duration::new(target_seconds, target_nanos));
+    state.signal_commit_timers_until(Timestamp::from(target));
+    assert_eq!(content_type(&surface), Type::Video);
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn commit_timing_rejects_invalid_nanoseconds() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let timing = globals
+            .bind::<WpCommitTimingManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let timer = timing.get_timer(&surface, &queue, ());
+        timer.set_timestamp(0, 1, 1_000_000_000);
+        connection.flush().unwrap();
+        result_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    let mut rejected = None;
+    dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
+        Ok(result) => {
+            rejected = Some(result);
+            true
+        }
+        Err(_) => false,
+    });
+    assert_eq!(rejected, Some(true));
     client.join().unwrap();
 }
 

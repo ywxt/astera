@@ -13,6 +13,7 @@ use smithay::{
     },
     wayland::{
         alpha_modifier::AlphaModifierState,
+        commit_timing::CommitTimingManagerState,
         compositor::CompositorState,
         content_type::ContentTypeState,
         cursor_shape::CursorShapeManagerState,
@@ -76,6 +77,7 @@ pub struct ProtocolState {
     pub(super) _content_type_state: ContentTypeState,
     pub(super) _xdg_dialog_state: XdgDialogState,
     pub(super) _fifo_manager_state: FifoManagerState,
+    pub(super) _commit_timing_manager_state: CommitTimingManagerState,
     pub(super) dmabuf_state: DmabufState,
     pub(super) popup_manager: PopupManager,
     pub(super) seat: Seat<Astera>,

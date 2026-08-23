@@ -136,6 +136,7 @@ impl WinitLoop {
         self.ipc.expire(now);
         self.state.poll_config();
         self.state.process_key_repeats();
+        self.state.process_commit_timers();
         self.state.process_idle_timers();
         self.state.remove_dead_windows();
         // Import replies are protocol progress, not visual damage. Process them even when the

@@ -1452,6 +1452,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
             runtime.begin_shutdown();
         }
         runtime.state.process_key_repeats();
+        runtime.state.process_commit_timers();
         runtime.state.process_idle_timers();
         runtime.state.remove_dead_windows();
         runtime.poll_non_exportable_fences(now);

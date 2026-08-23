@@ -108,6 +108,7 @@ use smithay::{
     wayland::{
         alpha_modifier::AlphaModifierState,
         buffer::BufferHandler,
+        commit_timing::CommitTimingManagerState,
         compositor::{
             CompositorClientState, CompositorHandler, CompositorState, TraversalAction,
             with_states, with_surface_tree_downward,
@@ -266,6 +267,7 @@ pub struct Astera {
     last_primary_selection_serial: Option<Serial>,
     pending_fifo_barriers:
         BTreeMap<OutputId, Vec<crate::backend::render::PresentedFifoBarrier>>,
+    commit_timer_surfaces: HashSet<WlSurface>,
 }
 
 impl Deref for Astera {
@@ -443,6 +445,7 @@ impl Astera {
         let content_type_state = ContentTypeState::new::<Self>(display);
         let xdg_dialog_state = XdgDialogState::new::<Self>(display);
         let fifo_manager_state = FifoManagerState::new::<Self>(display);
+        let commit_timing_manager_state = CommitTimingManagerState::new::<Self>(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -488,6 +491,7 @@ impl Astera {
                 _content_type_state: content_type_state,
                 _xdg_dialog_state: xdg_dialog_state,
                 _fifo_manager_state: fifo_manager_state,
+                _commit_timing_manager_state: commit_timing_manager_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
@@ -586,6 +590,7 @@ impl Astera {
             last_selection_serial: None,
             last_primary_selection_serial: None,
             pending_fifo_barriers: BTreeMap::new(),
+            commit_timer_surfaces: HashSet::new(),
         }
     }
 
@@ -1954,10 +1959,80 @@ impl Astera {
         [
             self.next_visual_timer_deadline(),
             self.idle_runtime.deadline(),
+            self.next_commit_timer_deadline(),
         ]
         .into_iter()
         .flatten()
         .min()
+    }
+
+    fn next_commit_timer_deadline(&self) -> Option<std::time::Instant> {
+        use smithay::{
+            utils::{Clock as SmithayClock, Monotonic, Time},
+            wayland::commit_timing::{CommitTimerBarrierStateUserData, Timestamp},
+        };
+
+        let timestamp = self
+            .commit_timer_surfaces
+            .iter()
+            .filter_map(|surface| {
+                with_states(surface, |states| {
+                    states
+                        .data_map
+                        .get::<CommitTimerBarrierStateUserData>()
+                        .and_then(|barriers| barriers.lock().ok()?.next_deadline())
+                })
+            })
+            .min()?;
+        let monotonic_now = SmithayClock::<Monotonic>::new().now();
+        let target: Time<Monotonic> = Timestamp::into(timestamp);
+        let instant_now = std::time::Instant::now();
+        let remaining = Time::elapsed(&monotonic_now, target);
+        Some(
+            instant_now
+                .checked_add(remaining)
+                .unwrap_or(instant_now + std::time::Duration::from_secs(24 * 60 * 60)),
+        )
+    }
+
+    fn signal_commit_timers_until(&mut self, deadline: smithay::wayland::commit_timing::Timestamp) {
+        use smithay::wayland::commit_timing::CommitTimerBarrierStateUserData;
+
+        let surfaces = self
+            .commit_timer_surfaces
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut clients = Vec::new();
+        for surface in surfaces {
+            let signaled = with_states(&surface, |states| {
+                states
+                    .data_map
+                    .get::<CommitTimerBarrierStateUserData>()
+                    .and_then(|barriers| barriers.lock().ok())
+                    .is_some_and(|mut barriers| barriers.signal_until(deadline))
+            });
+            if signaled && let Some(client) = surface.client() {
+                clients.push(client);
+            }
+        }
+        let display = self.display.clone();
+        let mut notified = HashSet::new();
+        for client in clients {
+            if !notified.insert(client.id()) {
+                continue;
+            }
+            if let Some(client_state) = client.get_data::<ClientState>() {
+                client_state
+                    .compositor_state
+                    .blocker_cleared(self, &display);
+            }
+        }
+    }
+
+    pub fn process_commit_timers(&mut self) {
+        let now = smithay::utils::Clock::<smithay::utils::Monotonic>::new().now();
+        self.signal_commit_timers_until(now.into());
     }
 
     pub fn next_visual_timer_deadline(&self) -> Option<std::time::Instant> {

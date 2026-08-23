@@ -404,6 +404,7 @@ impl CompositorHandler for Astera {
 
     fn destroyed(&mut self, surface: &WlSurface) {
         self.dmabuf_feedback_surfaces.remove(surface);
+        self.commit_timer_surfaces.remove(surface);
         let was_visible = self
             .output_runtime
             .values()
@@ -1375,6 +1376,62 @@ impl SelectionHandler for Astera {
     type SelectionUserData = ();
 }
 
+impl
+    smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
+        bool,
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
+        request: smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::Request,
+        data: &bool,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::Request;
+        if let Request::GetTimer { surface, .. } = &request {
+            state.commit_timer_surfaces.insert(surface.clone());
+        }
+        <CommitTimingManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, resource, request, data, display, data_init,
+        );
+    }
+}
+
+impl
+    smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timer_v1::WpCommitTimerV1,
+        smithay::reexports::wayland_server::Weak<WlSurface>,
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timer_v1::WpCommitTimerV1,
+        request: smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timer_v1::Request,
+        data: &smithay::reexports::wayland_server::Weak<WlSurface>,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timer_v1::{Error, Request};
+        if let Request::SetTimestamp { tv_nsec, .. } = &request
+            && *tv_nsec >= 1_000_000_000
+        {
+            resource.post_error(
+                Error::InvalidTimestamp as u32,
+                "commit timestamp nanoseconds must be below one billion".to_string(),
+            );
+            return;
+        }
+        <CommitTimingManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, resource, request, data, display, data_init,
+        );
+    }
+}
+
 impl DataDeviceHandler for Astera {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
@@ -2061,3 +2118,6 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
     smithay::wayland::selection::primary_selection::PrimarySourceUserData
 ] => smithay::wayland::selection::primary_selection::PrimarySelectionState);
 delegate_dmabuf!(Astera);
+smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::WpCommitTimingManagerV1: bool
+] => smithay::wayland::commit_timing::CommitTimingManagerState);
