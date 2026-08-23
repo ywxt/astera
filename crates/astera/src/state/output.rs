@@ -1,6 +1,148 @@
 use super::*;
+use smithay::reexports::{
+    wayland_protocols::xdg::xdg_output::zv1::server::{
+        zxdg_output_manager_v1::{self, ZxdgOutputManagerV1},
+        zxdg_output_v1::{self, ZxdgOutputV1},
+    },
+    wayland_server::{DataInit, Dispatch, GlobalDispatch, New, backend::ClientId},
+};
+
+#[derive(Debug)]
+pub(super) struct AsteraXdgOutputData {
+    output: Option<OutputId>,
+}
+
+impl GlobalDispatch<ZxdgOutputManagerV1, ()> for Astera {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<ZxdgOutputManagerV1>,
+        _global: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<ZxdgOutputManagerV1, ()> for Astera {
+    fn request(
+        state: &mut Self,
+        _client: &Client,
+        _manager: &ZxdgOutputManagerV1,
+        request: zxdg_output_manager_v1::Request,
+        _data: &(),
+        _handle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            zxdg_output_manager_v1::Request::GetXdgOutput { id, output } => {
+                let output_id = SmithayOutput::from_resource(&output).and_then(|requested| {
+                    state
+                        .output_runtime
+                        .iter()
+                        .find_map(|(id, runtime)| (runtime.wayland == requested).then_some(*id))
+                });
+                let xdg_output = data_init.init(id, AsteraXdgOutputData { output: output_id });
+                if let Some(output_id) = output_id {
+                    state
+                        .xdg_outputs
+                        .entry(output_id)
+                        .or_default()
+                        .push(xdg_output.clone());
+                    state.send_xdg_output_state(output_id, &xdg_output, true);
+                    // For xdg-output v3, wl_output.done is the transaction boundary. Older
+                    // versions additionally receive zxdg_output_v1.done below.
+                    output.done();
+                }
+            }
+            zxdg_output_manager_v1::Request::Destroy => {}
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Dispatch<ZxdgOutputV1, AsteraXdgOutputData> for Astera {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _output: &ZxdgOutputV1,
+        request: zxdg_output_v1::Request,
+        _data: &AsteraXdgOutputData,
+        _handle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            zxdg_output_v1::Request::Destroy => {}
+            _ => unreachable!(),
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        output: &ZxdgOutputV1,
+        data: &AsteraXdgOutputData,
+    ) {
+        if let Some(output_id) = data.output
+            && let Some(instances) = state.xdg_outputs.get_mut(&output_id)
+        {
+            instances.retain(|instance| instance != output && instance.is_alive());
+            if instances.is_empty() {
+                state.xdg_outputs.remove(&output_id);
+            }
+        }
+    }
+}
 
 impl Astera {
+    fn send_xdg_output_state(&self, output: OutputId, instance: &ZxdgOutputV1, initial: bool) {
+        let Some(runtime) = self.output_runtime.get(&output) else {
+            return;
+        };
+        let Some(core) = self.desktop.output(output) else {
+            return;
+        };
+        let client_scale = instance
+            .client()
+            .map(|client| self.client_compositor_state(&client).client_scale())
+            .unwrap_or(1.0);
+        let client_coordinate =
+            |value: i64| saturating_i32((value as f64 * client_scale).round() as i64);
+        instance.logical_position(
+            client_coordinate(runtime.location.x),
+            client_coordinate(runtime.location.y),
+        );
+        instance.logical_size(
+            client_coordinate(core.logical_size.width),
+            client_coordinate(core.logical_size.height),
+        );
+        if initial && instance.version() >= 2 {
+            instance.name(core.stable_key.clone());
+            instance.description(format!("Astera output {}", core.stable_key));
+        }
+        if instance.version() < 3 {
+            instance.done();
+        }
+    }
+
+    fn prepare_xdg_output_update(&mut self, output: OutputId) {
+        let instances = self
+            .xdg_outputs
+            .get(&output)
+            .into_iter()
+            .flatten()
+            .filter(|instance| instance.is_alive())
+            .cloned()
+            .collect::<Vec<_>>();
+        for instance in instances {
+            self.send_xdg_output_state(output, &instance, false);
+        }
+        if let Some(instances) = self.xdg_outputs.get_mut(&output) {
+            instances.retain(Resource::is_alive);
+        }
+    }
+
     pub fn update_primary_scanout_output(
         &mut self,
         output: OutputId,
@@ -431,6 +573,8 @@ impl Astera {
                 .into(),
             refresh: 60_000,
         };
+        // xdg-output v3 state must precede the wl_output.done emitted by Smithay below.
+        self.prepare_xdg_output_update(output);
         let runtime = self
             .output_runtime
             .get(&output)
@@ -465,11 +609,17 @@ impl Astera {
             })
             .collect::<Vec<_>>();
         for (output, location) in placements {
+            // Update Astera's authoritative location before sending xdg-output state, then let
+            // Smithay's wl_output change provide the v3 transaction boundary.
+            self.output_runtime
+                .get_mut(&output)
+                .expect("desktop output has a Wayland runtime")
+                .location = location;
+            self.prepare_xdg_output_update(output);
             let runtime = self
                 .output_runtime
                 .get_mut(&output)
                 .expect("desktop output has a Wayland runtime");
-            runtime.location = location;
             runtime.wayland.change_current_state(
                 None,
                 None,

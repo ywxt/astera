@@ -74,7 +74,7 @@ use smithay::{
     },
     delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
     delegate_fractional_scale, delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit,
-    delegate_layer_shell, delegate_output, delegate_pointer_constraints, delegate_pointer_gestures,
+    delegate_layer_shell, delegate_pointer_constraints, delegate_pointer_gestures,
     delegate_relative_pointer, delegate_seat, delegate_shm, delegate_tablet_manager,
     delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
@@ -161,6 +161,7 @@ const DEFAULT_WINDOW_SIZE: Size = Size::new(800, 600);
 pub struct Astera {
     protocol: ProtocolState,
     output_runtime: BTreeMap<OutputId, OutputRuntime>,
+    xdg_outputs: BTreeMap<OutputId, Vec<smithay::reexports::wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_v1::ZxdgOutputV1>>,
     desktop: Desktop,
     active_output: OutputId,
     windows: Vec<MappedWindow>,
@@ -311,7 +312,8 @@ impl Astera {
         );
         let relative_pointer_state = RelativePointerManagerState::new::<Self>(display);
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(display);
-        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(display);
+        let output_manager_state = OutputManagerState::new();
+        display.create_global::<Self, smithay::reexports::wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1, _>(3, ());
         let wayland_output = SmithayOutput::new(
             "ASTERA-NESTED-1".into(),
             PhysicalProperties {
@@ -402,6 +404,7 @@ impl Astera {
                     location: Point::ORIGIN,
                 },
             )]),
+            xdg_outputs: BTreeMap::new(),
             desktop,
             active_output,
             windows: Vec::new(),
@@ -556,6 +559,7 @@ impl Astera {
             .output_runtime
             .remove(&output)
             .expect("desktop output has a Wayland runtime");
+        self.xdg_outputs.remove(&output);
         self.dmabuf_output_devices.remove(&output);
         self.dmabuf_output_feedback.remove(&output);
         let empty = smithay::backend::renderer::element::RenderElementStates::default();

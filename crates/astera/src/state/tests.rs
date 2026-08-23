@@ -73,6 +73,9 @@ use wayland_protocols::xdg::shell::client::{
     xdg_popup::XdgPopup, xdg_positioner::XdgPositioner, xdg_surface::XdgSurface,
     xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
 };
+use wayland_protocols::xdg::xdg_output::zv1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1, zxdg_output_v1::ZxdgOutputV1,
+};
 use wayland_protocols::xdg::{
     activation::v1::client::{
         xdg_activation_token_v1::XdgActivationTokenV1, xdg_activation_v1::XdgActivationV1,
@@ -129,6 +132,7 @@ delegate_noop!(TestClient: ignore WlDataSource);
 delegate_noop!(TestClient: ignore XdgToplevel);
 delegate_noop!(TestClient: ignore XdgPopup);
 delegate_noop!(TestClient: ignore XdgPositioner);
+delegate_noop!(TestClient: ignore ZxdgOutputManagerV1);
 delegate_noop!(TestClient: ignore WpViewporter);
 delegate_noop!(TestClient: ignore WpViewport);
 delegate_noop!(TestClient: ignore WpFractionalScaleManagerV1);
@@ -167,6 +171,25 @@ delegate_noop!(TestClient: ignore ZwpInputMethodV2);
 delegate_noop!(TestClient: ignore ZwpVirtualKeyboardManagerV1);
 delegate_noop!(TestClient: ignore ZwpVirtualKeyboardV1);
 delegate_noop!(TestClient: ignore ZwpLinuxDmabufV1);
+
+impl Dispatch<ZxdgOutputV1, mpsc::Sender<(i32, i32)>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZxdgOutputV1,
+        event: wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::Event,
+        sizes: &mpsc::Sender<(i32, i32)>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if let wayland_protocols::xdg::xdg_output::zv1::client::zxdg_output_v1::Event::LogicalSize {
+            width,
+            height,
+        } = event
+        {
+            let _ = sizes.send((width, height));
+        }
+    }
+}
 
 impl
     Dispatch<
@@ -1771,6 +1794,63 @@ fn hotplug_moves_disconnected_workspaces_to_primary() {
             .output,
         Some(OutputId(1))
     );
+}
+
+#[test]
+fn xdg_output_reports_authoritative_logical_size() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (sizes_tx, sizes_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (stop_tx, stop_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let output = globals.bind::<WlOutput, _, _>(&queue, 1..=4, ()).unwrap();
+        let manager = globals
+            .bind::<ZxdgOutputManagerV1, _, _>(&queue, 1..=3, ())
+            .unwrap();
+        let _xdg_output = manager.get_xdg_output(&output, &queue, sizes_tx);
+        events.roundtrip(&mut TestClient).unwrap();
+        ready_tx.send(()).unwrap();
+        loop {
+            events.blocking_dispatch(&mut TestClient).unwrap();
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+        }
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    assert_eq!(sizes_rx.recv().unwrap(), (1280, 720));
+
+    // This logical viewport intentionally cannot be derived from mode / native scale. The
+    // compositor model remains authoritative and xdg-output must report it verbatim.
+    state
+        .configure_output(
+            OutputId(0),
+            Size::new(3000, 2000),
+            Size::new(1700, 1000),
+            Scale120(180),
+            OutputTransform::Rotate90,
+        )
+        .unwrap();
+    display.flush_clients().unwrap();
+    assert_eq!(
+        sizes_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+        (1700, 1000)
+    );
+    stop_tx.send(()).unwrap();
+    // Wake the blocking client dispatch with one more valid output transaction.
+    state.reflow_outputs();
+    display.flush_clients().unwrap();
+    client.join().unwrap();
 }
 
 #[test]

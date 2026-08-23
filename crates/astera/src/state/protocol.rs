@@ -1403,7 +1403,14 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
 delegate_layer_shell!(Astera);
 delegate_fractional_scale!(Astera);
 delegate_viewporter!(Astera);
-delegate_output!(Astera);
+smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
+    smithay::reexports::wayland_server::protocol::wl_output::WlOutput:
+    smithay::wayland::output::WlOutputData
+] => smithay::wayland::output::OutputManagerState);
+smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
+    smithay::reexports::wayland_server::protocol::wl_output::WlOutput:
+    smithay::wayland::output::OutputUserData
+] => smithay::wayland::output::OutputManagerState);
 delegate_compositor!(Astera);
 delegate_shm!(Astera);
 delegate_seat!(Astera);
