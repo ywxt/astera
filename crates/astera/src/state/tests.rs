@@ -67,6 +67,7 @@ use wayland_protocols::wp::{
         zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
         zwp_relative_pointer_v1::ZwpRelativePointerV1,
     },
+    single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
     tablet::zv2::client::{
         zwp_tablet_manager_v2::ZwpTabletManagerV2, zwp_tablet_seat_v2::ZwpTabletSeatV2,
     },
@@ -185,6 +186,7 @@ delegate_noop!(TestClient: ignore ZwpPrimarySelectionDeviceManagerV1);
 delegate_noop!(TestClient: ignore ZwpPrimarySelectionDeviceV1);
 delegate_noop!(TestClient: ignore ZwpPrimarySelectionOfferV1);
 delegate_noop!(TestClient: ignore ZwpPrimarySelectionSourceV1);
+delegate_noop!(TestClient: ignore WpSinglePixelBufferManagerV1);
 
 impl Dispatch<ZxdgOutputV1, mpsc::Sender<(i32, i32)>> for TestClient {
     fn event(
@@ -1314,6 +1316,52 @@ fn session_lock_surface_allows_damage_only_commits() {
         Err(_) => false,
     });
     assert_eq!(result, Some(true));
+    client.join().unwrap();
+}
+
+#[test]
+fn single_pixel_buffer_maps_an_xdg_toplevel() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (role_tx, role_rx) = mpsc::sync_channel(0);
+    let (mapped_tx, mapped_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let manager = globals
+            .bind::<WpSinglePixelBufferManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        surface.commit();
+        connection.flush().unwrap();
+        role_tx.send(()).unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+
+        let buffer =
+            manager.create_u32_rgba_buffer(u32::MAX, 0, u32::MAX / 2, u32::MAX, &queue, ());
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, 1, 1);
+        surface.commit();
+        connection.flush().unwrap();
+        mapped_tx.send(()).unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| role_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    dispatch_until(&mut display, &mut state, |_| mapped_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows[0].mapped);
     client.join().unwrap();
 }
 

@@ -1970,6 +1970,7 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
 ] => smithay::wayland::output::OutputManagerState);
 delegate_compositor!(Astera);
 delegate_shm!(Astera);
+delegate_single_pixel_buffer!(Astera);
 delegate_seat!(Astera);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
     smithay::reexports::wayland_server::protocol::wl_data_device_manager::WlDataDeviceManager: ()
