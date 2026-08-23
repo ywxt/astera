@@ -1334,6 +1334,11 @@ impl smithay::reexports::wayland_server::Dispatch<
             }
         } else if matches!(&request, Request::GetInputMethod { .. }) {
             state.input_method_claimed = true;
+            // Track the privileged connection at object creation time. It may otherwise enter a
+            // session lock before sending any request on the new input-method object, leaving no
+            // resource for the lock transition to revoke.
+            state.input_method_client = Some(client.clone());
+            state.input_method_manager_resource = Some(resource.clone());
         }
         <InputMethodManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
             state, client, resource, request, data, display, data_init,
@@ -1395,6 +1400,14 @@ impl smithay::reexports::wayland_server::Dispatch<
         data: &smithay::wayland::input_method::InputMethodUserData<Self>,
     ) {
         state.input_method_claimed = false;
+        if state
+            .input_method_client
+            .as_ref()
+            .is_some_and(|claimed| claimed.id() == client)
+        {
+            state.input_method_client = None;
+            state.input_method_manager_resource = None;
+        }
         if state.input_method_resource.as_ref() == Some(resource) {
             state.input_method_resource = None;
         }

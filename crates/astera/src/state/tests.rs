@@ -628,6 +628,53 @@ fn second_input_method_is_unavailable_without_disconnect() {
 }
 
 #[test]
+fn session_lock_revokes_an_input_method_before_its_first_request() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::trusted_input()))
+        .unwrap();
+    let (created_tx, created_rx) = mpsc::sync_channel(0);
+    let (revoked_tx, revoked_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let manager = globals
+            .bind::<ZwpInputMethodManagerV2, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        // Do not issue any request on this object: the lock transition must still know which
+        // privileged client owns it and require a fresh connection after unlock.
+        let _input_method = manager.get_input_method(&seat, &queue, ());
+        connection.flush().unwrap();
+        created_tx.send(()).unwrap();
+        let disconnected = events.roundtrip(&mut TestClient).is_err();
+        revoked_tx.send(disconnected).unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| created_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state.input_method_client.is_some()
+    });
+    state.secure_input_for_lock();
+    display.flush_clients().unwrap();
+    let mut revoked = false;
+    dispatch_until(&mut display, &mut state, |_| match revoked_rx.try_recv() {
+        Ok(value) => {
+            revoked = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(revoked);
+    assert!(state.input_method_client.is_none());
+    client.join().unwrap();
+}
+
+#[test]
 fn focused_client_receives_clipboard_selection_offer() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());

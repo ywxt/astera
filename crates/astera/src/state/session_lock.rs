@@ -245,7 +245,7 @@ impl Astera {
         }
     }
 
-    fn secure_input_for_lock(&mut self) {
+    pub(super) fn secure_input_for_lock(&mut self) {
         self.key_repeat.cancel_repeats();
         self.cancel_drag();
         // The data-device pointer grab is revoked below. Its role surface must disappear in the
@@ -254,8 +254,22 @@ impl Astera {
         // An input-method grab must not observe lock-screen keystrokes. End its privileged
         // connection explicitly so the supervised service knows it must reconnect after unlock;
         // silently unsetting Smithay's grab would leave the live protocol object permanently stale.
-        if let Some(input_method) = self.input_method_resource.take() {
-            input_method.post_error(0u32, "input method must reconnect after session lock");
+        self.input_method_resource = None;
+        let input_method_object_id = self
+            .input_method_manager_resource
+            .take()
+            .map(|manager| manager.id().protocol_id())
+            .unwrap_or(0);
+        if let Some(client) = self.input_method_client.take() {
+            client.kill(
+                &self.display,
+                smithay::reexports::wayland_server::backend::protocol::ProtocolError {
+                    code: 0,
+                    object_id: input_method_object_id,
+                    object_interface: "zwp_input_method_manager_v2".into(),
+                    message: "input method must reconnect after session lock".into(),
+                },
+            );
         }
         let serial = self.next_serial();
         let keyboard = self.keyboard.clone();
