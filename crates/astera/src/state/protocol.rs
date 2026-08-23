@@ -372,6 +372,7 @@ impl CompositorHandler for Astera {
         let was_pointer_visual = self.is_cursor_surface(surface);
         if self.dnd_icon.as_ref() == Some(surface) {
             self.dnd_icon = None;
+            self.dnd_touch_icon = None;
         }
         if matches!(
             &self.cursor_image_status,
@@ -1324,7 +1325,10 @@ impl
         data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
     ) {
         use smithay::reexports::wayland_server::protocol::wl_data_device::Request;
+        let mut touch_icon = None;
+        let mut update_touch_icon = false;
         if let Request::StartDrag { origin, serial, .. } = &request {
+            update_touch_icon = true;
             let serial = Serial::from(*serial);
             let pointer_authorized = implicit_grab_authorizes_origin(
                 state.pointer.has_grab(serial),
@@ -1351,6 +1355,17 @@ impl
                 );
                 return;
             }
+            touch_icon = if touch_authorized && !pointer_authorized {
+                state.touch.grab_start_data().and_then(|start| {
+                    state
+                        .touch_slots
+                        .values()
+                        .find(|(_, slot)| *slot == start.slot)
+                        .map(|(output, _)| (*output, start.slot, start.location))
+                })
+            } else {
+                None
+            };
         }
         if let Request::SetSelection { serial, .. } = &request {
             let serial = Serial::from(*serial);
@@ -1380,6 +1395,9 @@ impl
         <DataDeviceState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
             state, client, resource, request, data, display, data_init,
         );
+        if update_touch_icon {
+            state.dnd_touch_icon = state.dnd_icon.is_some().then_some(touch_icon).flatten();
+        }
     }
 
     fn destroyed(
@@ -1512,6 +1530,7 @@ impl ClientDndGrabHandler for Astera {
 
     fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
         self.dnd_icon = None;
+        self.dnd_touch_icon = None;
         self.mark_render_dirty();
         self.refresh_visible_scales();
     }

@@ -254,6 +254,7 @@ impl Astera {
         // The data-device pointer grab is revoked below. Its role surface must disappear in the
         // same frame and must never reappear after unlock if the client misses cancellation.
         self.dnd_icon = None;
+        self.dnd_touch_icon = None;
         // An input-method grab must not observe lock-screen keystrokes. End its privileged
         // connection explicitly so the supervised service knows it must reconnect after unlock;
         // silently unsetting Smithay's grab would leave the live protocol object permanently stale.

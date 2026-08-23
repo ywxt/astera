@@ -184,6 +184,11 @@ pub struct Astera {
     active_pointer_gesture: Option<ActivePointerGesture>,
     cursor_image_status: smithay::input::pointer::CursorImageStatus,
     dnd_icon: Option<WlSurface>,
+    dnd_touch_icon: Option<(
+        OutputId,
+        smithay::backend::input::TouchSlot,
+        SmithayPoint<f64, smithay::utils::Logical>,
+    )>,
     named_cursors: HashMap<(smithay::input::pointer::CursorIcon, u32), cursor::NamedCursor>,
     active_tablet_cursor: Option<smithay::backend::input::TabletToolDescriptor>,
     pointer_focus_origin: Option<(
@@ -433,6 +438,7 @@ impl Astera {
                 smithay::input::pointer::CursorIcon::Default,
             ),
             dnd_icon: None,
+            dnd_touch_icon: None,
             named_cursors: HashMap::from([(
                 (smithay::input::pointer::CursorIcon::Default, 120),
                 cursor::load_named_cursor(smithay::input::pointer::CursorIcon::Default, 120),
@@ -943,6 +949,13 @@ impl Astera {
                 {
                     self.update_drag(location);
                     return;
+                }
+                if self
+                    .dnd_touch_icon
+                    .is_some_and(|(_, slot, _)| slot == synthetic_slot)
+                {
+                    self.dnd_touch_icon = Some((output, synthetic_slot, location));
+                    self.mark_render_dirty();
                 }
                 let previous_output = self.active_output;
                 self.active_output = output;
@@ -2218,6 +2231,7 @@ impl Astera {
         self.popup_manager.cleanup();
         if self.dnd_icon.as_ref().is_some_and(|icon| !icon.alive()) {
             self.dnd_icon = None;
+            self.dnd_touch_icon = None;
             self.mark_render_dirty();
         }
         let layer_count = self.layers.len();

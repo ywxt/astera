@@ -2360,8 +2360,12 @@ fn frame_callback_snapshot_does_not_relock_surface_tree_state() {
     assert_eq!(location, (13, 30).into());
     assert_eq!(scale, 1.0);
     assert!(state.dnd_icon_render_source(OutputId(99)).is_none());
+    state.dnd_touch_icon = Some((OutputId(0), Some(7).into(), (48.0, 64.0).into()));
+    let (_, location, _) = state.dnd_icon_render_source(OutputId(0)).unwrap();
+    assert_eq!(location, (48, 64).into());
     <Astera as ClientDndGrabHandler>::dropped(&mut state, None, false, seat);
     assert!(state.dnd_icon_render_source(OutputId(0)).is_none());
+    assert!(state.dnd_touch_icon.is_none());
 
     let surface = state.windows[0].surface.wl_surface().clone();
     let (snapshot_tx, snapshot_rx) = mpsc::sync_channel(0);

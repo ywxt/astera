@@ -119,7 +119,18 @@ impl Astera {
         &self,
         output: OutputId,
     ) -> Option<(WlSurface, Point<i32, Physical>, f64)> {
-        if self.session_is_locked() || output != self.active_output {
+        let logical_location = if let Some((touch_output, _, location)) = self.dnd_touch_icon {
+            if output != touch_output {
+                return None;
+            }
+            location
+        } else {
+            if output != self.active_output {
+                return None;
+            }
+            self.pointer_location
+        };
+        if self.session_is_locked() {
             return None;
         }
         let surface = self.dnd_icon.as_ref()?.clone();
@@ -127,8 +138,8 @@ impl Astera {
         Some((
             surface,
             (
-                (self.pointer_location.x * scale).round() as i32,
-                (self.pointer_location.y * scale).round() as i32,
+                (logical_location.x * scale).round() as i32,
+                (logical_location.y * scale).round() as i32,
             )
                 .into(),
             scale,
