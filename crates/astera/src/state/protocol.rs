@@ -1376,6 +1376,12 @@ impl SelectionHandler for Astera {
     type SelectionUserData = ();
 }
 
+impl SecurityContextHandler for Astera {
+    fn context_created(&mut self, source: SecurityContextListenerSource, context: SecurityContext) {
+        self.pending_security_contexts.push((source, context));
+    }
+}
+
 impl
     smithay::reexports::wayland_server::Dispatch<
         smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
@@ -2118,6 +2124,7 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
     smithay::wayland::selection::primary_selection::PrimarySourceUserData
 ] => smithay::wayland::selection::primary_selection::PrimarySelectionState);
 delegate_dmabuf!(Astera);
+smithay::delegate_security_context!(Astera);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
     smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::WpCommitTimingManagerV1: bool
 ] => smithay::wayland::commit_timing::CommitTimingManagerState);

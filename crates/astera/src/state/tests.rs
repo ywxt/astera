@@ -1,7 +1,7 @@
 use std::{
     io::{Read, Write},
     os::fd::AsFd,
-    os::unix::net::UnixStream,
+    os::unix::net::{UnixListener, UnixStream},
     sync::Arc,
     sync::mpsc,
     thread,
@@ -81,6 +81,10 @@ use wayland_protocols::wp::{
     relative_pointer::zv1::client::{
         zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
         zwp_relative_pointer_v1::ZwpRelativePointerV1,
+    },
+    security_context::v1::client::{
+        wp_security_context_manager_v1::WpSecurityContextManagerV1,
+        wp_security_context_v1::WpSecurityContextV1,
     },
     single_pixel_buffer::v1::client::wp_single_pixel_buffer_manager_v1::WpSinglePixelBufferManagerV1,
     tablet::zv2::client::{
@@ -213,6 +217,8 @@ delegate_noop!(TestClient: ignore WpFifoManagerV1);
 delegate_noop!(TestClient: ignore WpFifoV1);
 delegate_noop!(TestClient: ignore WpCommitTimingManagerV1);
 delegate_noop!(TestClient: ignore WpCommitTimerV1);
+delegate_noop!(TestClient: ignore WpSecurityContextManagerV1);
+delegate_noop!(TestClient: ignore WpSecurityContextV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
 
 impl Dispatch<ExtForeignToplevelListV1, ()> for TestClient {
@@ -489,6 +495,106 @@ fn attach_one_pixel_buffer(
         (),
     );
     surface.attach(Some(&buffer), 0, 0);
+}
+
+#[test]
+fn security_context_accepts_sandboxed_clients_and_hides_its_manager() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    let creator = display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let creator_id = creator.id();
+    let socket_path = std::env::temp_dir().join(format!(
+        "astera-security-context-{}-{:?}.sock",
+        std::process::id(),
+        thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let (close_read, close_write) = rustix::pipe::pipe().unwrap();
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let creator_thread = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, event_queue) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = event_queue.handle();
+        let manager = globals
+            .bind::<WpSecurityContextManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let context = manager.create_listener(listener.as_fd(), close_read.as_fd(), &queue, ());
+        context.set_sandbox_engine("bubblewrap".into());
+        context.set_app_id("org.example.App".into());
+        context.set_instance_id("instance-7".into());
+        context.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+        drop(close_write);
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        !state.pending_security_contexts.is_empty()
+    });
+    let (source, context) = state.take_pending_security_contexts().pop().unwrap();
+    assert_eq!(context.sandbox_engine.as_deref(), Some("bubblewrap"));
+    assert_eq!(context.app_id.as_deref(), Some("org.example.App"));
+    assert_eq!(context.instance_id.as_deref(), Some("instance-7"));
+    assert_eq!(context.creator_client_id, creator_id);
+
+    let mut accept_loop =
+        smithay::reexports::calloop::EventLoop::<Vec<UnixStream>>::try_new().unwrap();
+    accept_loop
+        .handle()
+        .insert_source(source, |stream, _, accepted| accepted.push(stream))
+        .unwrap();
+    let sandbox_socket = UnixStream::connect(&socket_path).unwrap();
+    let mut accepted = Vec::new();
+    accept_loop
+        .dispatch(Some(Duration::from_millis(100)), &mut accepted)
+        .unwrap();
+    let sandbox_server_socket = accepted.pop().unwrap();
+    let sandbox_state = Arc::new(ClientState::sandboxed(context));
+    assert_eq!(
+        sandbox_state.security_context().unwrap().app_id.as_deref(),
+        Some("org.example.App")
+    );
+    display
+        .handle()
+        .insert_client(sandbox_server_socket, sandbox_state)
+        .unwrap();
+
+    let (visibility_tx, visibility_rx) = mpsc::sync_channel(0);
+    let sandbox = thread::spawn(move || {
+        let connection = Connection::from_socket(sandbox_socket).unwrap();
+        let (globals, event_queue) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = event_queue.handle();
+        visibility_tx
+            .send((
+                globals
+                    .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+                    .is_ok(),
+                globals
+                    .bind::<WpSecurityContextManagerV1, _, _>(&queue, 1..=1, ())
+                    .is_err(),
+            ))
+            .unwrap();
+    });
+    dispatch_until(&mut display, &mut state, |_| {
+        visibility_rx
+            .try_recv()
+            .is_ok_and(|visible| visible == (true, true))
+    });
+
+    sandbox.join().unwrap();
+    done_tx.send(()).unwrap();
+    creator_thread.join().unwrap();
+    std::fs::remove_file(socket_path).unwrap();
 }
 
 #[test]

@@ -45,6 +45,7 @@ use smithay::{
         wayland_server::Display,
     },
     utils::{DeviceFd, Physical, Point},
+    wayland::security_context::SecurityContext,
 };
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
@@ -110,6 +111,7 @@ enum NativeEvent {
         scanout: PreparedScanout,
     },
     WaylandClient(std::os::unix::net::UnixStream),
+    SandboxedClient(std::os::unix::net::UnixStream, SecurityContext),
     WaylandReady,
     IpcReady,
     ConfigChanged,
@@ -457,6 +459,18 @@ impl NativeLoop {
                     .insert_client(stream, Arc::new(ClientState::default()))?;
                 self.display.dispatch_clients(&mut self.state)?;
                 scene_changed = true;
+            }
+            NativeEvent::SandboxedClient(stream, context) => {
+                if let Err(error) = self
+                    .display
+                    .handle()
+                    .insert_client(stream, Arc::new(ClientState::sandboxed(context)))
+                {
+                    tracing::warn!(%error, "could not insert sandboxed Wayland client");
+                } else {
+                    self.display.dispatch_clients(&mut self.state)?;
+                    scene_changed = true;
+                }
             }
             NativeEvent::WaylandReady => {
                 self.wayland_ready_queued = false;
@@ -1454,6 +1468,14 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         runtime.state.process_key_repeats();
         runtime.state.process_commit_timers();
         runtime.state.process_idle_timers();
+        for (source, context) in runtime.state.take_pending_security_contexts() {
+            runtime
+                .handle
+                .insert_source(source, move |stream, _, runtime| {
+                    runtime.enqueue(NativeEvent::SandboxedClient(stream, context.clone()));
+                })
+                .map_err(|error| anyhow!(error.to_string()))?;
+        }
         runtime.state.remove_dead_windows();
         runtime.poll_non_exportable_fences(now);
         runtime.retire_software_presentations(now);

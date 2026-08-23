@@ -26,6 +26,7 @@ use smithay::{
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitState,
         output::OutputManagerState,
         pointer_gestures::PointerGesturesState,
+        security_context::SecurityContextState,
         selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
         shell::{
             wlr_layer::{Layer, WlrLayerShellState},
@@ -78,6 +79,7 @@ pub struct ProtocolState {
     pub(super) _xdg_dialog_state: XdgDialogState,
     pub(super) _fifo_manager_state: FifoManagerState,
     pub(super) _commit_timing_manager_state: CommitTimingManagerState,
+    pub(super) _security_context_state: SecurityContextState,
     pub(super) dmabuf_state: DmabufState,
     pub(super) popup_manager: PopupManager,
     pub(super) seat: Seat<Astera>,

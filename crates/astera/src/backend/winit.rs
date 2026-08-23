@@ -22,8 +22,12 @@ use smithay::{
         winit::{self, WinitEvent, WinitGraphicsBackend},
     },
     desktop::PopupManager,
-    reexports::{calloop::EventLoop, wayland_server::Display},
+    reexports::{
+        calloop::{EventLoop, LoopHandle},
+        wayland_server::Display,
+    },
     utils::{Physical, Point, Transform},
+    wayland::security_context::SecurityContext,
 };
 
 use crate::{
@@ -51,6 +55,7 @@ const FRAME_RETRY_MAX: Duration = Duration::from_secs(1);
 enum RuntimeEvent {
     Winit(WinitEvent),
     WaylandClient(std::os::unix::net::UnixStream),
+    SandboxedClient(std::os::unix::net::UnixStream, SecurityContext),
     WaylandReady,
     IpcReady,
     ConfigChanged,
@@ -58,6 +63,7 @@ enum RuntimeEvent {
 }
 
 struct WinitLoop {
+    handle: LoopHandle<'static, WinitLoop>,
     display: Display<Astera>,
     state: Astera,
     ipc: IpcServer,
@@ -138,6 +144,13 @@ impl WinitLoop {
         self.state.process_key_repeats();
         self.state.process_commit_timers();
         self.state.process_idle_timers();
+        for (source, context) in self.state.take_pending_security_contexts() {
+            self.handle
+                .insert_source(source, move |stream, _, runtime| {
+                    runtime.enqueue(RuntimeEvent::SandboxedClient(stream, context.clone()));
+                })
+                .map_err(|error| anyhow!(error.to_string()))?;
+        }
         self.state.remove_dead_windows();
         // Import replies are protocol progress, not visual damage. Process them even when the
         // host suppresses redraws for an occluded or hidden nested window.
@@ -229,6 +242,17 @@ impl WinitLoop {
                     .insert_client(stream, Arc::new(ClientState::default()))
                 {
                     tracing::warn!(%error, "could not insert Wayland client");
+                } else {
+                    self.dispatch_wayland_clients()?;
+                }
+            }
+            RuntimeEvent::SandboxedClient(stream, context) => {
+                if let Err(error) = self
+                    .display
+                    .handle()
+                    .insert_client(stream, Arc::new(ClientState::sandboxed(context)))
+                {
+                    tracing::warn!(%error, "could not insert sandboxed Wayland client");
                 } else {
                     self.dispatch_wayland_clients()?;
                 }
@@ -535,6 +559,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
     }
 
     let mut runtime = WinitLoop {
+        handle: event_loop.handle(),
         display,
         state,
         ipc,

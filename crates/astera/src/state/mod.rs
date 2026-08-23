@@ -136,6 +136,10 @@ use smithay::{
         pointer_constraints::PointerConstraintsState,
         pointer_gestures::PointerGesturesState,
         relative_pointer::RelativePointerManagerState,
+        security_context::{
+            SecurityContext, SecurityContextHandler, SecurityContextListenerSource,
+            SecurityContextState,
+        },
         selection::{
             SelectionHandler,
             data_device::{
@@ -268,6 +272,7 @@ pub struct Astera {
     pending_fifo_barriers:
         BTreeMap<OutputId, Vec<crate::backend::render::PresentedFifoBarrier>>,
     commit_timer_surfaces: HashSet<WlSurface>,
+    pending_security_contexts: Vec<(SecurityContextListenerSource, SecurityContext)>,
 }
 
 impl Deref for Astera {
@@ -285,6 +290,12 @@ impl DerefMut for Astera {
 }
 
 impl Astera {
+    pub(crate) fn take_pending_security_contexts(
+        &mut self,
+    ) -> Vec<(SecurityContextListenerSource, SecurityContext)> {
+        std::mem::take(&mut self.pending_security_contexts)
+    }
+
     fn track_fifo_barrier(&mut self, surface: &WlSurface, output: OutputId) {
         let barrier = with_states(surface, |states| {
             states
@@ -446,6 +457,11 @@ impl Astera {
         let xdg_dialog_state = XdgDialogState::new::<Self>(display);
         let fifo_manager_state = FifoManagerState::new::<Self>(display);
         let commit_timing_manager_state = CommitTimingManagerState::new::<Self>(display);
+        let security_context_state = SecurityContextState::new::<Self, _>(display, |client| {
+            client
+                .get_data::<ClientState>()
+                .is_some_and(|state| state.security_context.is_none())
+        });
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -492,6 +508,7 @@ impl Astera {
                 _xdg_dialog_state: xdg_dialog_state,
                 _fifo_manager_state: fifo_manager_state,
                 _commit_timing_manager_state: commit_timing_manager_state,
+                _security_context_state: security_context_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
@@ -591,6 +608,7 @@ impl Astera {
             last_primary_selection_serial: None,
             pending_fifo_barriers: BTreeMap::new(),
             commit_timer_surfaces: HashSet::new(),
+            pending_security_contexts: Vec::new(),
         }
     }
 
@@ -2535,6 +2553,7 @@ fn surface_tree_contains(root: &WlSurface, wanted: &WlSurface) -> bool {
 pub struct ClientState {
     compositor_state: CompositorClientState,
     trusted_input: bool,
+    security_context: Option<SecurityContext>,
 }
 
 impl ClientState {
@@ -2543,6 +2562,18 @@ impl ClientState {
             trusted_input: true,
             ..Self::default()
         }
+    }
+
+    pub(crate) fn sandboxed(security_context: SecurityContext) -> Self {
+        Self {
+            security_context: Some(security_context),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn security_context(&self) -> Option<&SecurityContext> {
+        self.security_context.as_ref()
     }
 }
 
