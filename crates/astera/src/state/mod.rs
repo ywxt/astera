@@ -697,7 +697,9 @@ impl Astera {
                             }
                             return FilterResult::Forward;
                         }
-                        if state.seat.keyboard_shortcuts_inhibited() {
+                        if state.seat.keyboard_shortcuts_inhibited()
+                            || state.exclusive_layer_has_keyboard_focus()
+                        {
                             state.key_repeat.cancel_repeats();
                             // A shortcut press consumed before inhibition must retain its consumed
                             // release; forwarding only that release would give the client an
@@ -1743,7 +1745,10 @@ impl Astera {
     }
 
     pub fn process_key_repeats(&mut self) {
-        if self.session_is_locked() || self.seat.keyboard_shortcuts_inhibited() {
+        if self.session_is_locked()
+            || self.seat.keyboard_shortcuts_inhibited()
+            || self.exclusive_layer_has_keyboard_focus()
+        {
             self.key_repeat.cancel_repeats();
             return;
         }

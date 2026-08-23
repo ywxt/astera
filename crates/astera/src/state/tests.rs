@@ -1753,8 +1753,29 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
     assert_eq!(state.keyboard.current_focus(), Some(layer_surface.clone()));
     state.sync_keyboard_focus();
     assert_eq!(state.keyboard.current_focus(), Some(layer_surface));
+    with_states(state.layers[0].surface.wl_surface(), |states| {
+        states
+            .cached_state
+            .get::<LayerSurfaceCachedState>()
+            .current()
+            .keyboard_interactivity =
+            smithay::wayland::shell::wlr_layer::KeyboardInteractivity::Exclusive;
+    });
+    state.on_demand_layer_focus = None;
+    state.sync_keyboard_focus();
+    assert!(state.exclusive_layer_has_keyboard_focus());
+    state.key_repeat.register(
+        smithay::backend::input::Keycode::new(30),
+        BindingModifiers::default(),
+        astera_config::Action::Quit,
+        0,
+        state.clock.now(),
+    );
+    state.process_key_repeats();
+    assert!(state.key_repeat.deadline().is_none());
     state.layers[0].mapped = false;
     state.sync_keyboard_focus();
+    assert!(!state.exclusive_layer_has_keyboard_focus());
     assert_eq!(state.on_demand_layer_focus, None);
     let generation = state.render_generation();
     destroy_popup_tx.send(()).unwrap();

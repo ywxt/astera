@@ -279,6 +279,24 @@ impl Astera {
         }
     }
 
+    pub(super) fn exclusive_layer_has_keyboard_focus(&self) -> bool {
+        let Some(focused) = self.keyboard.current_focus() else {
+            return false;
+        };
+        self.layers.iter().any(|mapped| {
+            mapped.mapped
+                && mapped.surface.wl_surface() == &focused
+                && with_states(mapped.surface.wl_surface(), |states| {
+                    states
+                        .cached_state
+                        .get::<LayerSurfaceCachedState>()
+                        .current()
+                        .keyboard_interactivity
+                        == KeyboardInteractivity::Exclusive
+                })
+        })
+    }
+
     fn resolve_output(&self, selector: OutputSelector) -> Result<OutputId, CommandError> {
         let output = match selector {
             OutputSelector::Id(output) => Some(output.into()),
