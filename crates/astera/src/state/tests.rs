@@ -1763,6 +1763,15 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
     let geometry = popup.with_pending_state(|pending| pending.geometry);
     assert_eq!(geometry.loc, (800, 0).into());
     state.layers[0].mapped = true;
+    assert_eq!(
+        state
+            .layer_keyboard_target(popup.wl_surface())
+            .map(|(layer, _, interactivity)| (layer, interactivity)),
+        Some((
+            state.layers[0].id,
+            smithay::wayland::shell::wlr_layer::KeyboardInteractivity::OnDemand,
+        ))
+    );
     state.on_demand_layer_focus = Some(state.layers[0].id);
     state.sync_keyboard_focus();
     let layer_surface = state.layers[0].surface.wl_surface().clone();

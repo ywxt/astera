@@ -1553,7 +1553,11 @@ impl Astera {
         surface: &WlSurface,
     ) -> Option<(u64, WlSurface, KeyboardInteractivity)> {
         self.layers.iter().find_map(|mapped| {
-            if !mapped.mapped || !surface_tree_contains(mapped.surface.wl_surface(), surface) {
+            let root = mapped.surface.wl_surface();
+            let belongs_to_layer = surface_tree_contains(root, surface)
+                || PopupManager::popups_for_surface(root)
+                    .any(|(popup, _)| surface_tree_contains(popup.wl_surface(), surface));
+            if !mapped.mapped || !belongs_to_layer {
                 return None;
             }
             let state = with_states(mapped.surface.wl_surface(), |states| {
