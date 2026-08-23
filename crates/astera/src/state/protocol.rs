@@ -544,7 +544,17 @@ impl XdgShellHandler for Astera {
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
-        if !self.seat.owns(&seat) || !self.pointer.has_grab(serial) || self.drag.is_some() {
+        if !self.seat.owns(&seat)
+            || !implicit_grab_authorizes_surface(
+                self.pointer.has_grab(serial),
+                self.pointer
+                    .grab_start_data()
+                    .and_then(|start| start.focus.map(|(surface, _)| surface))
+                    .as_ref(),
+                |origin| surface_tree_contains(surface.wl_surface(), origin),
+            )
+            || self.drag.is_some()
+        {
             return;
         }
         let Some(requested) = self
@@ -555,13 +565,7 @@ impl XdgShellHandler for Astera {
         else {
             return;
         };
-        let under_pointer = self
-            .surface_under(self.pointer_location)
-            .and_then(|(_, _, window)| window);
-        if under_pointer != Some(requested) {
-            return;
-        }
-        self.begin_drag();
+        self.begin_drag(Some(requested));
     }
 
     fn resize_request(
@@ -571,7 +575,17 @@ impl XdgShellHandler for Astera {
         serial: Serial,
         edges: xdg_toplevel::ResizeEdge,
     ) {
-        if !self.seat.owns(&seat) || !self.pointer.has_grab(serial) || self.drag.is_some() {
+        if !self.seat.owns(&seat)
+            || !implicit_grab_authorizes_surface(
+                self.pointer.has_grab(serial),
+                self.pointer
+                    .grab_start_data()
+                    .and_then(|start| start.focus.map(|(surface, _)| surface))
+                    .as_ref(),
+                |origin| surface_tree_contains(surface.wl_surface(), origin),
+            )
+            || self.drag.is_some()
+        {
             return;
         }
         let Some(requested) = self
@@ -582,12 +596,6 @@ impl XdgShellHandler for Astera {
         else {
             return;
         };
-        let under_pointer = self
-            .surface_under(self.pointer_location)
-            .and_then(|(_, _, window)| window);
-        if under_pointer != Some(requested) {
-            return;
-        }
         let edges = match edges {
             xdg_toplevel::ResizeEdge::Top => ResizeEdges {
                 top: true,
@@ -1343,12 +1351,20 @@ fn implicit_grab_authorizes_origin<T: PartialEq>(
     focused: Option<&T>,
     origin: &T,
 ) -> bool {
-    serial_matches && focused == Some(origin)
+    implicit_grab_authorizes_surface(serial_matches, focused, |focused| focused == origin)
+}
+
+fn implicit_grab_authorizes_surface<T>(
+    serial_matches: bool,
+    focused: Option<&T>,
+    belongs_to_surface_tree: impl FnOnce(&T) -> bool,
+) -> bool {
+    serial_matches && focused.is_some_and(belongs_to_surface_tree)
 }
 
 #[cfg(test)]
 mod data_device_tests {
-    use super::implicit_grab_authorizes_origin;
+    use super::{implicit_grab_authorizes_origin, implicit_grab_authorizes_surface};
 
     #[test]
     fn drag_origin_must_be_the_surface_that_received_the_implicit_grab() {
@@ -1369,6 +1385,25 @@ mod data_device_tests {
         ));
         assert!(!implicit_grab_authorizes_origin::<&str>(
             true, None, &"origin"
+        ));
+    }
+
+    #[test]
+    fn interactive_toplevel_request_must_own_the_grab_origin_tree() {
+        assert!(implicit_grab_authorizes_surface(
+            true,
+            Some(&"window/subsurface"),
+            |focused| focused.starts_with("window/")
+        ));
+        assert!(!implicit_grab_authorizes_surface(
+            true,
+            Some(&"other/surface"),
+            |focused| focused.starts_with("window/")
+        ));
+        assert!(!implicit_grab_authorizes_surface(
+            false,
+            Some(&"window/subsurface"),
+            |focused| focused.starts_with("window/")
         ));
     }
 }

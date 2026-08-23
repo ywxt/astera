@@ -1352,7 +1352,7 @@ impl Astera {
             && (self.drag.is_some() || self.keyboard.modifier_state().logo);
         if compositor_drag {
             match state {
-                BackendButtonState::Pressed => self.begin_drag(),
+                BackendButtonState::Pressed => self.begin_drag(None),
                 BackendButtonState::Released => self.finish_drag(),
             }
             return;
@@ -1416,14 +1416,17 @@ impl Astera {
         pointer.frame(self);
     }
 
-    fn begin_drag(&mut self) {
-        let Some((_surface, origin, window)) = self.surface_under(self.pointer_location) else {
-            return;
+    fn begin_drag(&mut self, requested: Option<WindowId>) {
+        let window = match requested {
+            Some(window) => window,
+            None => {
+                let Some((_, _, Some(window))) = self.surface_under(self.pointer_location) else {
+                    return;
+                };
+                window
+            }
         };
-        let Some(window) = window else {
-            return;
-        };
-        let Some((_, _, _, mode)) = self.visual_geometry(window) else {
+        let Some((origin, _, _, mode)) = self.visual_geometry(window) else {
             return;
         };
         if matches!(
@@ -1450,8 +1453,8 @@ impl Astera {
             mode,
             kind: DragKind::Move,
             grab_offset: (
-                self.pointer_location.x - origin.x,
-                self.pointer_location.y - origin.y,
+                self.pointer_location.x - origin.x as f64,
+                self.pointer_location.y - origin.y as f64,
             ),
             pointer_start: (self.pointer_location.x, self.pointer_location.y),
             min_size: Size::new(1, 1),
