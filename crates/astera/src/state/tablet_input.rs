@@ -13,6 +13,11 @@ use super::{Astera, saturating_i32};
 type TabletFocus = Option<(
     smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
     smithay::utils::Point<f64, smithay::utils::Logical>,
+    Option<astera_core::WindowId>,
+)>;
+type TabletProtocolFocus = Option<(
+    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    smithay::utils::Point<f64, smithay::utils::Logical>,
 )>;
 
 pub(super) struct TabletToolRuntime {
@@ -40,8 +45,10 @@ fn routed_focus<T: Clone>(grabbed: bool, current: &Option<T>, hit: Option<T>) ->
 struct TabletContext {
     tablet: smithay::wayland::tablet_manager::TabletHandle,
     tool: smithay::wayland::tablet_manager::TabletToolHandle,
+    output: astera_core::OutputId,
     location: smithay::utils::Point<f64, smithay::utils::Logical>,
-    focus: TabletFocus,
+    focus: TabletProtocolFocus,
+    window: Option<astera_core::WindowId>,
 }
 
 impl Astera {
@@ -107,14 +114,13 @@ impl Astera {
             .position_transformed((saturating_i32(size.width), saturating_i32(size.height)).into());
         let previous_output = self.active_output;
         self.active_output = output;
-        let hit_focus = self
-            .surface_under(location)
-            .map(|(surface, origin, _)| (surface, origin));
+        let hit = self.surface_under(location);
         self.active_output = previous_output;
+        let hit_focus = hit;
         let runtime = self.tablet_tools.get_mut(&descriptor)?;
         let changed_client = !runtime.is_grabbed()
             && match (&runtime.focus, &hit_focus) {
-                (Some((old, _)), Some((new, _))) => !old.id().same_client_as(&new.id()),
+                (Some((old, _, _)), Some((new, _, _))) => !old.id().same_client_as(&new.id()),
                 (Some(_), None) | (None, Some(_)) => true,
                 (None, None) => false,
             };
@@ -134,6 +140,8 @@ impl Astera {
         if !grabbed {
             runtime.focus = hit_focus.clone();
         }
+        let window = focus.as_ref().and_then(|(_, _, window)| *window);
+        let focus = focus.map(|(surface, origin, _)| (surface, origin));
         self.mark_render_dirty();
         if changed_client || changed_owner || changed_output {
             self.refresh_visible_scales();
@@ -141,8 +149,10 @@ impl Astera {
         Some(TabletContext {
             tablet,
             tool,
+            output,
             location,
             focus,
+            window,
         })
     }
 
@@ -201,6 +211,7 @@ impl Astera {
             tool,
             location,
             focus,
+            ..
         }) = self.tablet_context(&event)
         else {
             return;
@@ -224,6 +235,7 @@ impl Astera {
             tool,
             location,
             focus,
+            ..
         }) = self.tablet_context(&event)
         else {
             return;
@@ -240,8 +252,10 @@ impl Astera {
         let Some(TabletContext {
             tablet,
             tool,
+            output,
             location,
             focus,
+            window,
         }) = self.tablet_context(&event)
         else {
             return;
@@ -249,6 +263,23 @@ impl Astera {
         Self::apply_tablet_axes(&tool, &event);
         let serial = self.next_serial();
         tool.motion(location, focus, &tablet, serial, event.time_msec());
+        if event.tip_state() == TabletToolTipState::Down {
+            self.active_output = output;
+            if let Some(surface) = self
+                .tablet_tools
+                .get(&event.tool())
+                .and_then(|runtime| runtime.focus.as_ref())
+                .map(|(surface, _, _)| surface.clone())
+            {
+                self.focus_interaction_target(&surface, window);
+                if let Some(client) = surface.client() {
+                    self.activation_tracker
+                        .remember(serial, client.id(), self.clock.now());
+                }
+            } else {
+                self.sync_keyboard_focus();
+            }
+        }
         let runtime = self
             .tablet_tools
             .get_mut(&event.tool())
@@ -272,8 +303,10 @@ impl Astera {
         let Some(TabletContext {
             tablet,
             tool,
+            output,
             location,
             focus,
+            window,
         }) = self.tablet_context(&event)
         else {
             return;
@@ -287,6 +320,23 @@ impl Astera {
             serial,
             event.time_msec(),
         );
+        if event.button_state() == ButtonState::Pressed {
+            self.active_output = output;
+            if let Some(surface) = self
+                .tablet_tools
+                .get(&event.tool())
+                .and_then(|runtime| runtime.focus.as_ref())
+                .map(|(surface, _, _)| surface.clone())
+            {
+                self.focus_interaction_target(&surface, window);
+                if let Some(client) = surface.client() {
+                    self.activation_tracker
+                        .remember(serial, client.id(), self.clock.now());
+                }
+            } else {
+                self.sync_keyboard_focus();
+            }
+        }
         let runtime = self
             .tablet_tools
             .get_mut(&event.tool())

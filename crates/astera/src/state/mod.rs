@@ -898,12 +898,14 @@ impl Astera {
                 let location = event.position_transformed(
                     (saturating_i32(size.width), saturating_i32(size.height)).into(),
                 );
-                let previous_output = self.active_output;
                 self.active_output = output;
-                let focus = self
-                    .surface_under(location)
-                    .map(|(surface, origin, _)| (surface, origin));
-                self.active_output = previous_output;
+                let hit = self.surface_under(location);
+                if let Some((surface, _, window)) = &hit {
+                    self.focus_interaction_target(surface, *window);
+                } else {
+                    self.sync_keyboard_focus();
+                }
+                let focus = hit.map(|(surface, origin, _)| (surface, origin));
                 let recipient = focus
                     .as_ref()
                     .and_then(|(surface, _)| surface.client())
@@ -1387,23 +1389,7 @@ impl Astera {
         if state == BackendButtonState::Pressed
             && let Some((surface, _, window)) = self.surface_under(self.pointer_location)
         {
-            if let Some(window) = window {
-                self.on_demand_layer_focus = None;
-                if self.desktop.find_window(window).is_ok()
-                    && self.desktop.focus_window(window).is_ok()
-                {
-                    self.mark_public_dirty();
-                }
-                self.sync_keyboard_focus();
-            } else if let Some((layer, _target, interactivity)) =
-                self.layer_keyboard_target(&surface)
-            {
-                self.on_demand_layer_focus =
-                    (interactivity == KeyboardInteractivity::OnDemand).then_some(layer);
-                // Route every click through the common arbiter. A top/overlay exclusive layer
-                // must remain focused even when another on-demand layer is clicked.
-                self.sync_keyboard_focus();
-            }
+            self.focus_interaction_target(&surface, window);
         }
         // Scene-changing IPC/workspace actions may have changed the surface below a stationary
         // pointer. Refresh pointer focus before delivering the button to avoid targeting the
@@ -1440,6 +1426,26 @@ impl Astera {
             },
         );
         pointer.frame(self);
+    }
+
+    pub(super) fn focus_interaction_target(
+        &mut self,
+        surface: &WlSurface,
+        window: Option<WindowId>,
+    ) {
+        if let Some(window) = window {
+            self.on_demand_layer_focus = None;
+            if self.desktop.find_window(window).is_ok() && self.desktop.focus_window(window).is_ok()
+            {
+                self.mark_public_dirty();
+            }
+        } else if let Some((layer, _target, interactivity)) = self.layer_keyboard_target(surface) {
+            self.on_demand_layer_focus =
+                (interactivity == KeyboardInteractivity::OnDemand).then_some(layer);
+            // Route every press through the common arbiter. A top/overlay exclusive layer must
+            // remain focused even when another on-demand layer is pressed.
+        }
+        self.sync_keyboard_focus();
     }
 
     fn begin_drag(
