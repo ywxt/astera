@@ -1216,6 +1216,34 @@ impl
         data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
     ) {
         use smithay::reexports::wayland_server::protocol::wl_data_device::Request;
+        if let Request::StartDrag { origin, serial, .. } = &request {
+            let serial = Serial::from(*serial);
+            let pointer_authorized = implicit_grab_authorizes_origin(
+                state.pointer.has_grab(serial),
+                state
+                    .pointer
+                    .grab_start_data()
+                    .and_then(|start| start.focus.map(|(surface, _)| surface))
+                    .as_ref(),
+                origin,
+            );
+            let touch_authorized = implicit_grab_authorizes_origin(
+                state.touch.has_grab(serial),
+                state
+                    .touch
+                    .grab_start_data()
+                    .and_then(|start| start.focus.map(|(surface, _)| surface))
+                    .as_ref(),
+                origin,
+            );
+            if !pointer_authorized && !touch_authorized {
+                tracing::debug!(
+                    ?serial,
+                    "denying drag whose origin did not receive the grab"
+                );
+                return;
+            }
+        }
         if let Request::SetSelection { serial, .. } = &request {
             let serial = Serial::from(*serial);
             let client_id = client.id();
@@ -1255,6 +1283,41 @@ impl
         <DataDeviceState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::destroyed(
             state, client, resource, data,
         );
+    }
+}
+
+fn implicit_grab_authorizes_origin<T: PartialEq>(
+    serial_matches: bool,
+    focused: Option<&T>,
+    origin: &T,
+) -> bool {
+    serial_matches && focused == Some(origin)
+}
+
+#[cfg(test)]
+mod data_device_tests {
+    use super::implicit_grab_authorizes_origin;
+
+    #[test]
+    fn drag_origin_must_be_the_surface_that_received_the_implicit_grab() {
+        assert!(implicit_grab_authorizes_origin(
+            true,
+            Some(&"origin"),
+            &"origin"
+        ));
+        assert!(!implicit_grab_authorizes_origin(
+            true,
+            Some(&"other"),
+            &"origin"
+        ));
+        assert!(!implicit_grab_authorizes_origin(
+            false,
+            Some(&"origin"),
+            &"origin"
+        ));
+        assert!(!implicit_grab_authorizes_origin::<&str>(
+            true, None, &"origin"
+        ));
     }
 }
 
