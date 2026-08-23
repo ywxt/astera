@@ -544,19 +544,12 @@ impl XdgShellHandler for Astera {
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
-        if !self.seat.owns(&seat)
-            || !implicit_grab_authorizes_surface(
-                self.pointer.has_grab(serial),
-                self.pointer
-                    .grab_start_data()
-                    .and_then(|start| start.focus.map(|(surface, _)| surface))
-                    .as_ref(),
-                |origin| surface_tree_contains(surface.wl_surface(), origin),
-            )
-            || self.drag.is_some()
-        {
+        if !self.seat.owns(&seat) || self.drag.is_some() {
             return;
         }
+        let Some((source, location)) = self.interactive_grab(&surface, serial) else {
+            return;
+        };
         let Some(requested) = self
             .windows
             .iter()
@@ -565,7 +558,7 @@ impl XdgShellHandler for Astera {
         else {
             return;
         };
-        self.begin_drag(Some(requested));
+        self.begin_drag(Some((requested, source, location)));
     }
 
     fn resize_request(
@@ -575,19 +568,12 @@ impl XdgShellHandler for Astera {
         serial: Serial,
         edges: xdg_toplevel::ResizeEdge,
     ) {
-        if !self.seat.owns(&seat)
-            || !implicit_grab_authorizes_surface(
-                self.pointer.has_grab(serial),
-                self.pointer
-                    .grab_start_data()
-                    .and_then(|start| start.focus.map(|(surface, _)| surface))
-                    .as_ref(),
-                |origin| surface_tree_contains(surface.wl_surface(), origin),
-            )
-            || self.drag.is_some()
-        {
+        if !self.seat.owns(&seat) || self.drag.is_some() {
             return;
         }
+        let Some((source, location)) = self.interactive_grab(&surface, serial) else {
+            return;
+        };
         let Some(requested) = self
             .windows
             .iter()
@@ -648,7 +634,7 @@ impl XdgShellHandler for Astera {
             xdg_toplevel::ResizeEdge::None => return,
             _ => return,
         };
-        self.begin_resize(requested, edges);
+        self.begin_resize(requested, edges, source, location);
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
@@ -911,6 +897,32 @@ impl XdgShellHandler for Astera {
 }
 
 impl Astera {
+    fn interactive_grab(
+        &self,
+        surface: &ToplevelSurface,
+        serial: Serial,
+    ) -> Option<(DragSource, SmithayPoint<f64, Logical>)> {
+        let pointer = if self.pointer.has_grab(serial)
+            && let Some(start) = self.pointer.grab_start_data()
+            && implicit_grab_authorizes_surface(true, start.focus.as_ref(), |(origin, _)| {
+                surface_tree_contains(surface.wl_surface(), origin)
+            }) {
+            Some((DragSource::Pointer, start.location))
+        } else {
+            None
+        };
+        let touch = if self.touch.has_grab(serial)
+            && let Some(start) = self.touch.grab_start_data()
+            && implicit_grab_authorizes_surface(true, start.focus.as_ref(), |(origin, _)| {
+                surface_tree_contains(surface.wl_surface(), origin)
+            }) {
+            Some((DragSource::Touch(start.slot), start.location))
+        } else {
+            None
+        };
+        select_interactive_grab(pointer, touch)
+    }
+
     pub(super) fn reconstrain_reactive_popups(&mut self) {
         // Collect first because calculating a popup target reads the complete desktop/layer scene,
         // while sending a configure mutates protocol state.
@@ -1362,9 +1374,15 @@ fn implicit_grab_authorizes_surface<T>(
     serial_matches && focused.is_some_and(belongs_to_surface_tree)
 }
 
+fn select_interactive_grab<T>(pointer: Option<T>, touch: Option<T>) -> Option<T> {
+    pointer.or(touch)
+}
+
 #[cfg(test)]
 mod data_device_tests {
-    use super::{implicit_grab_authorizes_origin, implicit_grab_authorizes_surface};
+    use super::{
+        implicit_grab_authorizes_origin, implicit_grab_authorizes_surface, select_interactive_grab,
+    };
 
     #[test]
     fn drag_origin_must_be_the_surface_that_received_the_implicit_grab() {
@@ -1405,6 +1423,15 @@ mod data_device_tests {
             Some(&"window/subsurface"),
             |focused| focused.starts_with("window/")
         ));
+    }
+
+    #[test]
+    fn interactive_toplevel_request_accepts_touch_grab_fallback() {
+        assert_eq!(select_interactive_grab(None, Some("touch")), Some("touch"));
+        assert_eq!(
+            select_interactive_grab(Some("pointer"), Some("touch")),
+            Some("pointer")
+        );
     }
 }
 

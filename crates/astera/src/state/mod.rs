@@ -41,8 +41,8 @@ use geometry::{
 use idle::{IdleEvent, IdleRuntime};
 use key_repeat::KeyRepeatState;
 use model::{
-    ActivePointerGesture, DragKind, DragState, MappedInputMethodPopup, MappedLayer, MappedWindow,
-    OutputRuntime, ProtocolState, ResizeEdges,
+    ActivePointerGesture, DragKind, DragSource, DragState, MappedInputMethodPopup, MappedLayer,
+    MappedWindow, OutputRuntime, ProtocolState, ResizeEdges,
 };
 use output_power::OutputPowerGlobalData;
 use session_lock::{LockSurfaces, SessionState};
@@ -934,6 +934,13 @@ impl Astera {
                 let location = event.position_transformed(
                     (saturating_i32(size.width), saturating_i32(size.height)).into(),
                 );
+                if self
+                    .drag
+                    .is_some_and(|drag| drag.source == DragSource::Touch(synthetic_slot))
+                {
+                    self.update_drag(location);
+                    return;
+                }
                 let previous_output = self.active_output;
                 self.active_output = output;
                 let focus = self
@@ -958,6 +965,13 @@ impl Astera {
                 else {
                     return;
                 };
+                if self
+                    .drag
+                    .is_some_and(|drag| drag.source == DragSource::Touch(synthetic_slot))
+                {
+                    self.finish_drag();
+                    return;
+                }
                 let touch = self.touch.clone();
                 let serial = self.next_serial();
                 touch.up(
@@ -1046,6 +1060,12 @@ impl Astera {
     pub(super) fn cancel_touch_sequences(&mut self) {
         if self.touch_slots.is_empty() {
             return;
+        }
+        if self
+            .drag
+            .is_some_and(|drag| matches!(drag.source, DragSource::Touch(_)))
+        {
+            self.cancel_drag();
         }
         let touch = self.touch.clone();
         touch.cancel(self);
@@ -1136,7 +1156,10 @@ impl Astera {
         }
         // During compositor grabs, clients do not receive motion; the pending tiled placement is
         // committed only on release so the radial solver does not run for every pointer sample.
-        if self.drag.is_some() {
+        if self
+            .drag
+            .is_some_and(|drag| drag.source == DragSource::Pointer)
+        {
             self.update_drag(location);
             return;
         }
@@ -1347,9 +1370,12 @@ impl Astera {
             self.mark_render_dirty();
             self.refresh_visible_scales();
         }
+        let pointer_drag = self
+            .drag
+            .is_some_and(|drag| drag.source == DragSource::Pointer);
         let compositor_drag = !self.session_is_locked()
             && button == Some(MouseButton::Left)
-            && (self.drag.is_some() || self.keyboard.modifier_state().logo);
+            && (pointer_drag || self.keyboard.modifier_state().logo);
         if compositor_drag {
             match state {
                 BackendButtonState::Pressed => self.begin_drag(None),
@@ -1416,17 +1442,33 @@ impl Astera {
         pointer.frame(self);
     }
 
-    fn begin_drag(&mut self, requested: Option<WindowId>) {
-        let window = match requested {
-            Some(window) => window,
+    fn begin_drag(
+        &mut self,
+        requested: Option<(
+            WindowId,
+            DragSource,
+            SmithayPoint<f64, smithay::utils::Logical>,
+        )>,
+    ) {
+        let (window, source, location) = match requested {
+            Some(requested) => requested,
             None => {
                 let Some((_, _, Some(window))) = self.surface_under(self.pointer_location) else {
                     return;
                 };
-                window
+                (window, DragSource::Pointer, self.pointer_location)
             }
         };
-        let Some((origin, _, _, mode)) = self.visual_geometry(window) else {
+        let Ok(workspace_id) = self.desktop.find_window(window) else {
+            return;
+        };
+        let Ok(location_on_desktop) = self.desktop.workspace_location(workspace_id) else {
+            return;
+        };
+        let Some(output) = location_on_desktop.output else {
+            return;
+        };
+        let Some((origin, _, _, mode)) = self.visual_geometry_for_output(output, window) else {
             return;
         };
         if matches!(
@@ -1435,7 +1477,6 @@ impl Astera {
         ) {
             return;
         }
-        let workspace_id = self.desktop.find_window(window).unwrap();
         let Ok(workspace) = self.desktop.workspace(workspace_id) else {
             return;
         };
@@ -1448,15 +1489,15 @@ impl Astera {
         };
         let size = workspace.window_size(window).unwrap();
         let start = astera_core::Rect::new(start.x, start.y, size.width, size.height);
+        self.active_output = output;
         self.drag = Some(DragState {
             window,
+            output,
             mode,
             kind: DragKind::Move,
-            grab_offset: (
-                self.pointer_location.x - origin.x as f64,
-                self.pointer_location.y - origin.y as f64,
-            ),
-            pointer_start: (self.pointer_location.x, self.pointer_location.y),
+            source,
+            grab_offset: (location.x - origin.x as f64, location.y - origin.y as f64),
+            pointer_start: (location.x, location.y),
             min_size: Size::new(1, 1),
             max_size: Size::new(i64::MAX, i64::MAX),
             target: start,
@@ -1469,8 +1510,23 @@ impl Astera {
         self.sync_keyboard_focus();
     }
 
-    fn begin_resize(&mut self, window: WindowId, edges: ResizeEdges) {
-        let Some((origin, _, _, mode)) = self.visual_geometry(window) else {
+    fn begin_resize(
+        &mut self,
+        window: WindowId,
+        edges: ResizeEdges,
+        source: DragSource,
+        location: SmithayPoint<f64, smithay::utils::Logical>,
+    ) {
+        let Ok(workspace_id) = self.desktop.find_window(window) else {
+            return;
+        };
+        let Ok(location_on_desktop) = self.desktop.workspace_location(workspace_id) else {
+            return;
+        };
+        let Some(output) = location_on_desktop.output else {
+            return;
+        };
+        let Some((origin, _, _, mode)) = self.visual_geometry_for_output(output, window) else {
             return;
         };
         if matches!(
@@ -1479,9 +1535,6 @@ impl Astera {
         ) {
             return;
         }
-        let Ok(workspace_id) = self.desktop.find_window(window) else {
-            return;
-        };
         let workspace = self.desktop.workspace(workspace_id).unwrap();
         let start = match mode {
             WindowMode::Tiled => workspace.tiled[&window].geometry,
@@ -1515,15 +1568,15 @@ impl Astera {
                 ),
             )
         });
+        self.active_output = output;
         self.drag = Some(DragState {
             window,
+            output,
             mode,
             kind: DragKind::Resize(edges),
-            grab_offset: (
-                self.pointer_location.x - origin.x as f64,
-                self.pointer_location.y - origin.y as f64,
-            ),
-            pointer_start: (self.pointer_location.x, self.pointer_location.y),
+            source,
+            grab_offset: (location.x - origin.x as f64, location.y - origin.y as f64),
+            pointer_start: (location.x, location.y),
             min_size,
             max_size,
             target: start,
@@ -1590,11 +1643,8 @@ impl Astera {
                 let origin = if drag.mode == WindowMode::Floating {
                     Point::new(viewport_x.round() as i64, viewport_y.round() as i64)
                 } else {
-                    let output = &self.desktop.outputs[&self.active_output];
-                    let workspace = self
-                        .desktop
-                        .workspace_for_output(self.active_output)
-                        .unwrap();
+                    let output = &self.desktop.outputs[&drag.output];
+                    let workspace = self.desktop.workspace_for_output(drag.output).unwrap();
                     let left = workspace.camera.center.x as f64
                         - output.output.logical_size.width as f64 / 2.0;
                     let top = workspace.camera.center.y as f64
@@ -1631,17 +1681,22 @@ impl Astera {
         let Some(drag) = self.drag.take() else {
             return;
         };
-        if self.pointer.is_grabbed() {
-            let pointer = self.pointer.clone();
-            let serial = self.next_serial();
-            pointer.unset_grab(self, serial, 0);
+        match drag.source {
+            DragSource::Pointer if self.pointer.is_grabbed() => {
+                let pointer = self.pointer.clone();
+                let serial = self.next_serial();
+                pointer.unset_grab(self, serial, 0);
+            }
+            DragSource::Touch(_) if self.touch.is_grabbed() => {
+                let touch = self.touch.clone();
+                touch.unset_grab(self);
+            }
+            _ => {}
         }
         let Ok(workspace) = self.desktop.find_window(drag.window) else {
             return;
         };
-        let viewport_size = self.desktop.outputs[&self.active_output]
-            .output
-            .logical_size;
+        let viewport_size = self.desktop.outputs[&drag.output].output.logical_size;
         let direction = astera_core::Direction::between(
             drag.start.center(),
             drag.target.center(),
@@ -1698,10 +1753,17 @@ impl Astera {
         if matches!(drag.kind, DragKind::Resize(_)) {
             self.configure_resize_preview(drag.window, drag.start.size, false);
         }
-        if self.pointer.is_grabbed() {
-            let pointer = self.pointer.clone();
-            let serial = self.next_serial();
-            pointer.unset_grab(self, serial, 0);
+        match drag.source {
+            DragSource::Pointer if self.pointer.is_grabbed() => {
+                let pointer = self.pointer.clone();
+                let serial = self.next_serial();
+                pointer.unset_grab(self, serial, 0);
+            }
+            DragSource::Touch(_) if self.touch.is_grabbed() => {
+                let touch = self.touch.clone();
+                touch.unset_grab(self);
+            }
+            _ => {}
         }
         self.mark_render_dirty();
     }

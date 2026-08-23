@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use astera_core::{OutputId, Point, Rect, Size, WindowId, WindowMode};
 use smithay::{
+    backend::input::TouchSlot,
     desktop::{LayerSurface, PopupManager},
     input::{
         Seat, SeatState, keyboard::KeyboardHandle, pointer::PointerHandle, touch::TouchHandle,
@@ -85,8 +86,10 @@ pub(super) struct MappedWindow {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DragState {
     pub(super) window: WindowId,
+    pub(super) output: OutputId,
     pub(super) mode: WindowMode,
     pub(super) kind: DragKind,
+    pub(super) source: DragSource,
     /// Pointer-to-window offset captured at grab time to prevent the window from jumping.
     pub(super) grab_offset: (f64, f64),
     /// Latest candidate position; tiled geometry is committed only when the grab ends.
@@ -96,6 +99,12 @@ pub(super) struct DragState {
     pub(super) target: Rect,
     /// Original geometry used for resize and to seed the radial solver.
     pub(super) start: Rect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DragSource {
+    Pointer,
+    Touch(TouchSlot),
 }
 
 #[derive(Clone, Copy, Debug)]

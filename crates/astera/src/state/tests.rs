@@ -2876,8 +2876,10 @@ fn pointer_crosses_outputs_but_compositor_drag_stays_local() {
     state.pointer_location = (1270.0, 200.0).into();
     state.drag = Some(DragState {
         window: WindowId(999),
+        output: OutputId(0),
         mode: WindowMode::Floating,
         kind: DragKind::Move,
+        source: DragSource::Pointer,
         grab_offset: (0.0, 0.0),
         pointer_start: (0.0, 0.0),
         min_size: Size::new(1, 1),

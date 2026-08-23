@@ -218,7 +218,7 @@ impl Astera {
                 let mut rect = workspace.tiled[&id].geometry;
                 if let Some(drag) = self
                     .drag
-                    .filter(|drag| drag.window == id && output_id == self.active_output)
+                    .filter(|drag| drag.window == id && output_id == drag.output)
                 {
                     rect = drag.target;
                 }
@@ -238,7 +238,7 @@ impl Astera {
                 let mut rect = workspace.floating[&id].viewport.rect;
                 if let Some(drag) = self
                     .drag
-                    .filter(|drag| drag.window == id && output_id == self.active_output)
+                    .filter(|drag| drag.window == id && output_id == drag.output)
                 {
                     rect = drag.target;
                 }
