@@ -801,6 +801,69 @@ fn session_lock_revokes_a_silent_virtual_keyboard() {
 }
 
 #[test]
+fn virtual_keyboard_tracking_ends_after_last_instance_is_destroyed() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::trusted_input()))
+        .unwrap();
+    let (created_tx, created_rx) = mpsc::sync_channel(0);
+    let (destroy_first_tx, destroy_first_rx) = mpsc::sync_channel(0);
+    let (first_destroyed_tx, first_destroyed_rx) = mpsc::sync_channel(0);
+    let (destroy_second_tx, destroy_second_rx) = mpsc::sync_channel(0);
+    let (second_destroyed_tx, second_destroyed_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, _events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = _events.handle();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let manager = globals
+            .bind::<ZwpVirtualKeyboardManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let first = manager.create_virtual_keyboard(&seat, &queue, ());
+        let second = manager.create_virtual_keyboard(&seat, &queue, ());
+        connection.flush().unwrap();
+        created_tx.send(()).unwrap();
+        destroy_first_rx.recv().unwrap();
+        first.destroy();
+        connection.flush().unwrap();
+        first_destroyed_tx.send(()).unwrap();
+        destroy_second_rx.recv().unwrap();
+        second.destroy();
+        connection.flush().unwrap();
+        second_destroyed_tx.send(()).unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| created_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state
+            .virtual_keyboard_clients
+            .first()
+            .is_some_and(|(_, _, count)| *count == 2)
+    });
+    destroy_first_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        first_destroyed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        state
+            .virtual_keyboard_clients
+            .first()
+            .is_some_and(|(_, _, count)| *count == 1)
+    });
+    destroy_second_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        second_destroyed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        state.virtual_keyboard_clients.is_empty()
+    });
+    client.join().unwrap();
+}
+
+#[test]
 fn focused_client_receives_clipboard_selection_offer() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());

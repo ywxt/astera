@@ -272,7 +272,7 @@ impl Astera {
                 },
             );
         }
-        for (client, manager) in mem::take(&mut self.virtual_keyboard_clients) {
+        for (client, manager, _) in mem::take(&mut self.virtual_keyboard_clients) {
             if input_method_client
                 .as_ref()
                 .is_some_and(|input_method| input_method.id() == client.id())

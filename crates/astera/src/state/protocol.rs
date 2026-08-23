@@ -1614,14 +1614,18 @@ impl smithay::reexports::wayland_server::Dispatch<
             &request,
             smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::Request::CreateVirtualKeyboard { .. }
         );
-        if creates_keyboard && !state
-            .virtual_keyboard_clients
-            .iter()
-            .any(|(known, _)| known.id() == client.id())
-        {
-            state
+        if creates_keyboard {
+            if let Some((_, _, count)) = state
                 .virtual_keyboard_clients
-                .push((client.clone(), resource.clone()));
+                .iter_mut()
+                .find(|(known, _, _)| known.id() == client.id())
+            {
+                *count = count.saturating_add(1);
+            } else {
+                state
+                    .virtual_keyboard_clients
+                    .push((client.clone(), resource.clone(), 1));
+            }
         }
         <VirtualKeyboardManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
             state, client, resource, request, data, display, data_init,
@@ -1684,8 +1688,19 @@ impl smithay::reexports::wayland_server::Dispatch<
         data: &smithay::wayland::virtual_keyboard::VirtualKeyboardUserData<Self>,
     ) {
         <VirtualKeyboardManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::destroyed(
-            state, client, resource, data,
+            state, client.clone(), resource, data,
         );
+        if let Some(index) = state
+            .virtual_keyboard_clients
+            .iter()
+            .position(|(known, _, _)| known.id() == client)
+        {
+            let count = &mut state.virtual_keyboard_clients[index].2;
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.virtual_keyboard_clients.remove(index);
+            }
+        }
     }
 }
 delegate_relative_pointer!(Astera);

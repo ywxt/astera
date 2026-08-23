@@ -175,6 +175,7 @@ pub struct Astera {
     virtual_keyboard_clients: Vec<(
         Client,
         smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+        usize,
     )>,
     next_window_id: u64,
     next_layer_id: u64,
