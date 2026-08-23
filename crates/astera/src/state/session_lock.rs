@@ -144,6 +144,15 @@ impl Astera {
         wl_output: WlOutput,
         data_init: &mut DataInit<'_, Self>,
     ) {
+        // Every request carrying a new object ID must initialize it, including requests that are
+        // about to receive a fatal protocol error. Returning first makes wayland-server panic and
+        // lets a malformed locker terminate the compositor instead of only its own connection.
+        let protocol = data_init.init(
+            id,
+            LockSurfaceData {
+                wl_surface: wl_surface.clone(),
+            },
+        );
         if !self.lock_owner_is(lock) {
             lock.post_error(
                 ext_session_lock_v1::Error::InvalidUnlock,
@@ -200,12 +209,6 @@ impl Astera {
             );
             return;
         }
-        let protocol = data_init.init(
-            id,
-            LockSurfaceData {
-                wl_surface: wl_surface.clone(),
-            },
-        );
         let mut surface = AsteraLockSurface {
             protocol,
             wl_surface,

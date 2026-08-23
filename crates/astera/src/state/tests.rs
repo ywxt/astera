@@ -1119,6 +1119,56 @@ fn session_lock_is_fail_closed_before_confirmation_and_after_disconnect() {
 }
 
 #[test]
+fn duplicate_session_lock_output_rejects_client_without_server_panic() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (requested_tx, requested_rx) = mpsc::sync_channel(0);
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let output = globals.bind::<WlOutput, _, _>(&queue, 1..=4, ()).unwrap();
+        let manager = globals
+            .bind::<ExtSessionLockManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let lock = manager.lock(&queue, ());
+        let first = compositor.create_surface(&queue, ());
+        let second = compositor.create_surface(&queue, ());
+        let _first_lock = lock.get_lock_surface(&first, &output, &queue, mpsc::channel().0);
+        let _duplicate = lock.get_lock_surface(&second, &output, &queue, mpsc::channel().0);
+        connection.flush().unwrap();
+        requested_tx.send(()).unwrap();
+        result_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        requested_rx.try_recv().is_ok()
+    });
+    let mut rejected = false;
+    dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
+        Ok(value) => {
+            rejected = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(rejected);
+    assert!(state.session_is_locked());
+    client.join().unwrap();
+}
+
+#[test]
 fn session_lock_surface_allows_damage_only_commits() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
