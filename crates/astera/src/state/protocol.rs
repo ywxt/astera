@@ -284,11 +284,15 @@ impl CompositorHandler for Astera {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        let was_entered = self
-            .output_runtime
-            .values()
-            .any(|runtime| runtime.entered_surfaces.contains(surface));
+        let entered_output = self.output_runtime.iter().find_map(|(output, runtime)| {
+            runtime
+                .entered_surfaces
+                .contains(surface)
+                .then_some(*output)
+        });
+        let was_entered = entered_output.is_some();
         on_commit_buffer_handler::<Self>(surface);
+        self.track_fifo_barrier(surface, entered_output.unwrap_or(self.active_output));
         self.validate_lock_surface_commit(surface);
         self.popup_manager.commit(surface);
         self.reposition_input_method_popup_surface(surface);
@@ -2030,6 +2034,7 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
 ] => smithay::wayland::output::OutputManagerState);
 delegate_compositor!(Astera);
 delegate_content_type!(Astera);
+delegate_fifo!(Astera);
 delegate_alpha_modifier!(Astera);
 delegate_shm!(Astera);
 delegate_single_pixel_buffer!(Astera);

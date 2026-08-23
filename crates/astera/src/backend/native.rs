@@ -51,7 +51,10 @@ use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use crate::{
     backend::{
         native_policy::{ConnectorSnapshot, ModeCandidate, SnapshotSource, scan_outputs},
-        render::{FrameCallback, complete_frame_callbacks, surface_tree_snapshot},
+        render::{
+            FrameCallback, PresentationCapture, PresentedFifoBarrier, complete_frame_callbacks,
+            surface_tree_snapshot,
+        },
         runtime::{RenderRequest, RepaintReasons, RepaintScheduler},
         sources::{OneShotReadableFdSource, ReadableFdSource, WaylandSocketSource},
     },
@@ -103,6 +106,7 @@ enum NativeEvent {
         crtc: crtc::Handle,
         frame_id: u64,
         callbacks: Vec<FrameCallback>,
+        fifo_barriers: Vec<PresentedFifoBarrier>,
         scanout: PreparedScanout,
     },
     WaylandClient(std::os::unix::net::UnixStream),
@@ -173,6 +177,7 @@ struct NativeSurface {
 struct PendingNativeFrame {
     frame_id: u64,
     callbacks: Vec<FrameCallback>,
+    fifo_barriers: Vec<PresentedFifoBarrier>,
     queued: bool,
     deadline: Option<Instant>,
     lock_generation: Option<u64>,
@@ -182,6 +187,7 @@ struct PendingNativeFrame {
 struct PendingGpuFence {
     frame_id: u64,
     callbacks: Vec<FrameCallback>,
+    fifo_barriers: Vec<PresentedFifoBarrier>,
     sync: SyncPoint,
     deadline: Instant,
     delay: Duration,
@@ -442,8 +448,9 @@ impl NativeLoop {
                 crtc,
                 frame_id,
                 callbacks,
+                fifo_barriers,
                 scanout,
-            } => self.queue_prepared_frame(node, crtc, frame_id, callbacks, scanout),
+            } => self.queue_prepared_frame(node, crtc, frame_id, callbacks, fifo_barriers, scanout),
             NativeEvent::WaylandClient(stream) => {
                 self.display
                     .handle()
@@ -779,6 +786,7 @@ impl NativeLoop {
                 .lock_frame_presented(surface.output, frame.lock_generation);
             let frame_time = self.started.elapsed().as_millis() as u32;
             complete_frame_callbacks(&frame.callbacks, frame_time);
+            self.state.signal_fifo_barriers(&frame.fifo_barriers);
         }
     }
 
@@ -851,6 +859,7 @@ impl NativeLoop {
                     &frame.callbacks,
                     self.started.elapsed().as_millis() as u32,
                 );
+                self.state.signal_fifo_barriers(&frame.fifo_barriers);
             }
         }
     }
@@ -888,7 +897,14 @@ impl NativeLoop {
                 {
                     if fence.sync.is_reached() {
                         let fence = surface.waiting_fence.take().unwrap();
-                        ready.push((*node, *crtc, fence.frame_id, fence.callbacks, fence.scanout));
+                        ready.push((
+                            *node,
+                            *crtc,
+                            fence.frame_id,
+                            fence.callbacks,
+                            fence.fifo_barriers,
+                            fence.scanout,
+                        ));
                     } else if fence.expires_at <= now {
                         let fence = surface.waiting_fence.take().unwrap();
                         surface.drm.reset_buffers();
@@ -921,8 +937,8 @@ impl NativeLoop {
             tracing::warn!(?output, frame_id, "GPU fence timed out; retrying frame");
             self.scheduler.retry_at(output, frame_id, now + retrace);
         }
-        for (node, crtc, frame_id, callbacks, scanout) in ready {
-            self.queue_prepared_frame(node, crtc, frame_id, callbacks, scanout);
+        for (node, crtc, frame_id, callbacks, fifo_barriers, scanout) in ready {
+            self.queue_prepared_frame(node, crtc, frame_id, callbacks, fifo_barriers, scanout);
         }
     }
 
@@ -950,6 +966,7 @@ impl NativeLoop {
         crtc: crtc::Handle,
         frame_id: u64,
         callbacks: Vec<FrameCallback>,
+        fifo_barriers: Vec<PresentedFifoBarrier>,
         scanout: PreparedScanout,
     ) {
         let Some(surface) = self
@@ -982,6 +999,7 @@ impl NativeLoop {
         surface.pending = Some(PendingNativeFrame {
             frame_id,
             callbacks,
+            fifo_barriers,
             queued: true,
             deadline: None,
             lock_generation: scanout.lock_generation,
@@ -1003,7 +1021,10 @@ impl NativeLoop {
             }
         };
         self.state.validate_dmabuf_imports(&mut renderer);
-        let mut callbacks = Vec::new();
+        let mut presentation = PresentationCapture {
+            fifo_barriers: self.state.fifo_barriers_for_output(output),
+            ..PresentationCapture::default()
+        };
         let mut elements: Vec<NativeRenderElement<NativeRenderer<'_>>> = roots
             .iter()
             .flat_map(|(surface, location, scale)| {
@@ -1023,7 +1044,7 @@ impl NativeLoop {
                             *scale,
                             1.0,
                             Kind::Unspecified,
-                            &mut callbacks,
+                            &mut presentation,
                         )
                         .into_iter()
                         .map(Into::into),
@@ -1037,7 +1058,7 @@ impl NativeLoop {
                         *scale,
                         1.0,
                         Kind::Unspecified,
-                        &mut callbacks,
+                        &mut presentation,
                     )
                     .into_iter()
                     .map(Into::into),
@@ -1053,7 +1074,7 @@ impl NativeLoop {
                 scale,
                 1.0,
                 Kind::Cursor,
-                &mut callbacks,
+                &mut presentation,
             );
             elements.splice(0..0, icon_elements.into_iter().map(Into::into));
         }
@@ -1071,7 +1092,7 @@ impl NativeLoop {
                         scale,
                         1.0,
                         Kind::Cursor,
-                        &mut callbacks,
+                        &mut presentation,
                     );
                     elements.splice(0..0, cursor_elements.into_iter().map(Into::into));
                 }
@@ -1096,6 +1117,10 @@ impl NativeLoop {
                 }
             }
         }
+        let PresentationCapture {
+            callbacks,
+            fifo_barriers,
+        } = presentation;
         let Some(surface) = self
             .devices
             .get_mut(&node)
@@ -1121,6 +1146,7 @@ impl NativeLoop {
                     surface.pending = Some(PendingNativeFrame {
                         frame_id: request.frame_id,
                         callbacks,
+                        fifo_barriers,
                         queued: false,
                         deadline: Some(Instant::now() + surface.retrace),
                         lock_generation,
@@ -1144,6 +1170,7 @@ impl NativeLoop {
                 };
                 if let Some(fence_fd) = sync.as_ref().and_then(|sync| sync.export()) {
                     let mut callbacks = Some(callbacks);
+                    let mut fifo_barriers = Some(fifo_barriers);
                     let mut scanout = Some(scanout);
                     let registration = self.handle.insert_source(
                         OneShotReadableFdSource::new(fence_fd),
@@ -1153,6 +1180,9 @@ impl NativeLoop {
                                 crtc,
                                 frame_id: request.frame_id,
                                 callbacks: callbacks
+                                    .take()
+                                    .expect("one-shot GPU fence fired more than once"),
+                                fifo_barriers: fifo_barriers
                                     .take()
                                     .expect("one-shot GPU fence fired more than once"),
                                 scanout: scanout
@@ -1187,6 +1217,7 @@ impl NativeLoop {
                         surface.waiting_fence = Some(PendingGpuFence {
                             frame_id: request.frame_id,
                             callbacks,
+                            fifo_barriers,
                             sync,
                             deadline: Instant::now() + FENCE_RECHECK_INITIAL,
                             delay: FENCE_RECHECK_INITIAL,
@@ -1215,6 +1246,7 @@ impl NativeLoop {
                         surface.pending = Some(PendingNativeFrame {
                             frame_id: request.frame_id,
                             callbacks,
+                            fifo_barriers,
                             queued: true,
                             deadline: None,
                             lock_generation,

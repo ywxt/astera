@@ -28,7 +28,7 @@ use smithay::{
 
 use crate::{
     backend::{
-        render::{complete_frame_callbacks, surface_tree_snapshot},
+        render::{PresentationCapture, complete_frame_callbacks, surface_tree_snapshot},
         sources::{ReadableFdSource, WaylandSocketSource},
     },
     ipc_server::IpcServer,
@@ -272,7 +272,12 @@ impl WinitLoop {
             0
         };
         let roots = self.state.render_roots();
-        let mut frame_callbacks = Vec::new();
+        let mut presentation = PresentationCapture {
+            fifo_barriers: self
+                .state
+                .fifo_barriers_for_output(astera_core::OutputId(0)),
+            ..PresentationCapture::default()
+        };
         let (damage, render_states) = {
             tracing::trace!("binding nested framebuffer");
             let (renderer, mut framebuffer) = self.backend.bind()?;
@@ -296,7 +301,7 @@ impl WinitLoop {
                             *scale,
                             1.0,
                             Kind::Unspecified,
-                            &mut frame_callbacks,
+                            &mut presentation,
                         );
                         elements.extend(popup_elements.into_iter().map(Into::into));
                     }
@@ -307,7 +312,7 @@ impl WinitLoop {
                         *scale,
                         1.0,
                         Kind::Unspecified,
-                        &mut frame_callbacks,
+                        &mut presentation,
                     );
                     elements.extend(root_elements.into_iter().map(Into::into));
                     elements
@@ -323,7 +328,7 @@ impl WinitLoop {
                     scale,
                     1.0,
                     Kind::Cursor,
-                    &mut frame_callbacks,
+                    &mut presentation,
                 );
                 elements.splice(0..0, icon_elements.into_iter().map(Into::into));
             }
@@ -341,7 +346,7 @@ impl WinitLoop {
                             scale,
                             1.0,
                             Kind::Cursor,
-                            &mut frame_callbacks,
+                            &mut presentation,
                         );
                         elements.splice(0..0, cursor_elements.into_iter().map(Into::into));
                     }
@@ -392,7 +397,8 @@ impl WinitLoop {
         tracing::trace!("nested frame submitted");
         self.has_presented = true;
         let frame_time = self.started.elapsed().as_millis() as u32;
-        complete_frame_callbacks(&frame_callbacks, frame_time);
+        complete_frame_callbacks(&presentation.callbacks, frame_time);
+        self.state.signal_fifo_barriers(&presentation.fifo_barriers);
         self.display.flush_clients()?;
         Ok(())
     }

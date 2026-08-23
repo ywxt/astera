@@ -17,7 +17,8 @@ use smithay::{
     },
     utils::{Physical, Point, Scale},
     wayland::compositor::{
-        SurfaceAttributes, SurfaceData, TraversalAction, with_states, with_surface_tree_downward,
+        Barrier, SurfaceAttributes, SurfaceData, TraversalAction, with_states,
+        with_surface_tree_downward,
     },
 };
 
@@ -46,6 +47,18 @@ fn frame_callbacks(surface: &WlSurface, states: &SurfaceData) -> Vec<FrameCallba
         .collect()
 }
 
+#[derive(Clone)]
+pub struct PresentedFifoBarrier {
+    pub(crate) surface: WlSurface,
+    pub(crate) barrier: Barrier,
+}
+
+#[derive(Default)]
+pub struct PresentationCapture {
+    pub callbacks: Vec<FrameCallback>,
+    pub fifo_barriers: Vec<PresentedFifoBarrier>,
+}
+
 pub fn surface_tree_snapshot<R>(
     renderer: &mut R,
     surface: &WlSurface,
@@ -53,7 +66,7 @@ pub fn surface_tree_snapshot<R>(
     scale: f64,
     alpha: f32,
     kind: Kind,
-    callbacks: &mut Vec<FrameCallback>,
+    capture: &mut PresentationCapture,
 ) -> Vec<WaylandSurfaceRenderElement<R>>
 where
     R: Renderer + ImportAll,
@@ -91,7 +104,7 @@ where
                 kind,
             ) {
                 Ok(Some(element)) => {
-                    callbacks.extend(frame_callbacks(surface, states));
+                    capture.callbacks.extend(frame_callbacks(surface, states));
                     elements.push(element);
                 }
                 Ok(None) => {}

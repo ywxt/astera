@@ -74,7 +74,7 @@ use smithay::{
         },
     },
     delegate_alpha_modifier, delegate_compositor, delegate_content_type, delegate_cursor_shape,
-    delegate_dmabuf, delegate_foreign_toplevel_list, delegate_fractional_scale,
+    delegate_dmabuf, delegate_fifo, delegate_foreign_toplevel_list, delegate_fractional_scale,
     delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit, delegate_layer_shell,
     delegate_pointer_constraints, delegate_pointer_gestures, delegate_relative_pointer,
     delegate_seat, delegate_shm, delegate_single_pixel_buffer, delegate_tablet_manager,
@@ -118,6 +118,7 @@ use smithay::{
             DmabufFeedback, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
             SurfaceDmabufFeedbackState,
         },
+        fifo::FifoManagerState,
         foreign_toplevel_list::{ForeignToplevelListHandler, ForeignToplevelListState},
         fractional_scale::{
             FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
@@ -263,6 +264,8 @@ pub struct Astera {
     activation_tracker: ActivationTracker,
     last_selection_serial: Option<Serial>,
     last_primary_selection_serial: Option<Serial>,
+    pending_fifo_barriers:
+        BTreeMap<OutputId, Vec<crate::backend::render::PresentedFifoBarrier>>,
 }
 
 impl Deref for Astera {
@@ -280,6 +283,66 @@ impl DerefMut for Astera {
 }
 
 impl Astera {
+    fn track_fifo_barrier(&mut self, surface: &WlSurface, output: OutputId) {
+        let barrier = with_states(surface, |states| {
+            states
+                .cached_state
+                .get::<smithay::wayland::fifo::FifoBarrierCachedState>()
+                .current()
+                .barrier
+                .clone()
+        });
+        let Some(barrier) = barrier.filter(|barrier| !barrier.is_signaled()) else {
+            return;
+        };
+        let pending = self.pending_fifo_barriers.entry(output).or_default();
+        if pending.iter().any(|item| item.barrier == barrier) {
+            return;
+        }
+        pending.push(crate::backend::render::PresentedFifoBarrier {
+            surface: surface.clone(),
+            barrier,
+        });
+    }
+
+    pub(crate) fn fifo_barriers_for_output(
+        &self,
+        output: OutputId,
+    ) -> Vec<crate::backend::render::PresentedFifoBarrier> {
+        self.pending_fifo_barriers
+            .get(&output)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn signal_fifo_barriers(
+        &mut self,
+        barriers: &[crate::backend::render::PresentedFifoBarrier],
+    ) {
+        let display = self.display.clone();
+        for item in barriers {
+            item.barrier.signal();
+        }
+        let mut notified = HashSet::new();
+        for item in barriers {
+            let Some(client) = item.surface.client() else {
+                continue;
+            };
+            if !notified.insert(client.id()) {
+                continue;
+            }
+            if let Some(client_state) = client.get_data::<ClientState>() {
+                client_state
+                    .compositor_state
+                    .blocker_cleared(self, &display);
+            }
+        }
+        self.pending_fifo_barriers.retain(|_, barriers| {
+            barriers.retain(|item| !item.barrier.is_signaled());
+            !barriers.is_empty()
+        });
+    }
+
     pub fn new(display: &DisplayHandle, config: Config) -> Self {
         Self::new_with_clock(display, config, Arc::new(SystemClock))
     }
@@ -379,6 +442,7 @@ impl Astera {
         let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(display);
         let content_type_state = ContentTypeState::new::<Self>(display);
         let xdg_dialog_state = XdgDialogState::new::<Self>(display);
+        let fifo_manager_state = FifoManagerState::new::<Self>(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -423,6 +487,7 @@ impl Astera {
                 foreign_toplevel_list_state,
                 _content_type_state: content_type_state,
                 _xdg_dialog_state: xdg_dialog_state,
+                _fifo_manager_state: fifo_manager_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
@@ -520,6 +585,7 @@ impl Astera {
             activation_tracker: ActivationTracker::default(),
             last_selection_serial: None,
             last_primary_selection_serial: None,
+            pending_fifo_barriers: BTreeMap::new(),
         }
     }
 
@@ -637,6 +703,11 @@ impl Astera {
             && let Some(next) = self.desktop.outputs.keys().next().copied()
         {
             self.active_output = next;
+        }
+        if let Some(barriers) = self.pending_fifo_barriers.remove(&output) {
+            // A retired output can never present the commit carrying these barriers. Release
+            // them so clients can submit replacement content for a surviving output.
+            self.signal_fifo_barriers(&barriers);
         }
         self.reflow_outputs();
         self.configure_fullscreen_windows();

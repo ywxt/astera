@@ -46,6 +46,7 @@ use wayland_protocols::wp::{
         wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
         wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
     },
+    fifo::v1::client::{wp_fifo_manager_v1::WpFifoManagerV1, wp_fifo_v1::WpFifoV1},
     fractional_scale::v1::client::{
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
         wp_fractional_scale_v1::WpFractionalScaleV1,
@@ -205,6 +206,8 @@ delegate_noop!(TestClient: ignore WpContentTypeManagerV1);
 delegate_noop!(TestClient: ignore WpContentTypeV1);
 delegate_noop!(TestClient: ignore XdgWmDialogV1);
 delegate_noop!(TestClient: ignore XdgDialogV1);
+delegate_noop!(TestClient: ignore WpFifoManagerV1);
+delegate_noop!(TestClient: ignore WpFifoV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
 
 impl Dispatch<ExtForeignToplevelListV1, ()> for TestClient {
@@ -1555,6 +1558,102 @@ fn content_type_is_double_buffered_and_can_be_recreated() {
     dispatch_until(&mut display, &mut state, |state| {
         content_type(state) == Type::None
     });
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn fifo_wait_blocks_surface_state_until_presented_barrier_signals() {
+    use smithay::{
+        reexports::wayland_protocols::wp::content_type::v1::server::wp_content_type_v1::Type,
+        wayland::{content_type::ContentTypeSurfaceCachedState, fifo::FifoBarrierCachedState},
+    };
+
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (barrier_tx, barrier_rx) = mpsc::sync_channel(0);
+    let (wait_tx, wait_rx) = mpsc::sync_channel(0);
+    let (waited_tx, waited_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let fifo_manager = globals
+            .bind::<WpFifoManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let content_manager = globals
+            .bind::<WpContentTypeManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        let fifo = fifo_manager.get_fifo(&surface, &queue, ());
+        let content = content_manager.get_surface_content_type(&surface, &queue, ());
+        fifo.set_barrier();
+        surface.commit();
+        connection.flush().unwrap();
+        barrier_tx.send(()).unwrap();
+
+        wait_rx.recv().unwrap();
+        content.set_content_type(
+            wayland_protocols::wp::content_type::v1::client::wp_content_type_v1::Type::Video,
+        );
+        fifo.wait_barrier();
+        surface.commit();
+        connection.flush().unwrap();
+        waited_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| barrier_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    let surface = state.windows[0].surface.wl_surface().clone();
+    let barrier = with_states(&surface, |states| {
+        states
+            .cached_state
+            .get::<FifoBarrierCachedState>()
+            .current()
+            .barrier
+            .clone()
+            .expect("set_barrier commit must publish a barrier")
+    });
+    assert!(!barrier.is_signaled());
+
+    wait_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| waited_rx.try_recv().is_ok());
+    for _ in 0..8 {
+        display.dispatch_clients(&mut state).unwrap();
+    }
+    let content_type =
+        |surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
+            with_states(surface, |states| {
+                *states
+                    .cached_state
+                    .get::<ContentTypeSurfaceCachedState>()
+                    .current()
+                    .content_type()
+            })
+        };
+    assert_eq!(content_type(&surface), Type::None);
+
+    let presented = state.fifo_barriers_for_output(astera_core::OutputId(0));
+    assert_eq!(presented.len(), 1);
+    assert_eq!(presented[0].barrier, barrier);
+    state.signal_fifo_barriers(&presented);
+    dispatch_until(&mut display, &mut state, |_| {
+        content_type(&surface) == Type::Video
+    });
+    assert!(barrier.is_signaled());
     done_tx.send(()).unwrap();
     client.join().unwrap();
 }
