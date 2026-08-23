@@ -58,22 +58,26 @@ impl Astera {
         }
         self.output_power_modes.insert(output, powered);
         self.session_output_powered(output, powered);
-        if let Some(control) = self.output_power_controls.get(&output) {
-            control.mode(if powered {
-                zwlr_output_power_v1::Mode::On
-            } else {
-                zwlr_output_power_v1::Mode::Off
-            });
+        if let Some(controls) = self.output_power_controls.get(&output) {
+            for control in controls {
+                control.mode(if powered {
+                    zwlr_output_power_v1::Mode::On
+                } else {
+                    zwlr_output_power_v1::Mode::Off
+                });
+            }
         }
         tracing::info!(?output, powered, "output power mode changed");
     }
 
     pub(crate) fn fail_output_power(&mut self, output: OutputId) {
-        if let Some(control) = self.output_power_controls.remove(&output) {
-            if let Some(data) = control.data::<OutputPowerData>() {
-                data.valid.store(false, Ordering::Relaxed);
+        if let Some(controls) = self.output_power_controls.remove(&output) {
+            for control in controls {
+                if let Some(data) = control.data::<OutputPowerData>() {
+                    data.valid.store(false, Ordering::Relaxed);
+                }
+                control.failed();
             }
-            control.failed();
         }
         tracing::warn!(?output, "output power control failed");
     }
@@ -83,11 +87,13 @@ impl Astera {
     }
 
     pub(super) fn output_power_disconnected(&mut self, output: OutputId) {
-        if let Some(control) = self.output_power_controls.remove(&output) {
-            if let Some(data) = control.data::<OutputPowerData>() {
-                data.valid.store(false, Ordering::Relaxed);
+        if let Some(controls) = self.output_power_controls.remove(&output) {
+            for control in controls {
+                if let Some(data) = control.data::<OutputPowerData>() {
+                    data.valid.store(false, Ordering::Relaxed);
+                }
+                control.failed();
             }
-            control.failed();
         }
         self.output_power_modes.remove(&output);
         self.pending_output_power
@@ -105,15 +111,14 @@ impl Astera {
                 .iter()
                 .find_map(|(id, runtime)| (runtime.wayland == requested).then_some(*id))
         });
-        let accepted = output.filter(|output| !self.output_power_controls.contains_key(output));
         let control = data_init.init(
             id,
             OutputPowerData {
-                output: accepted,
-                valid: AtomicBool::new(accepted.is_some()),
+                output,
+                valid: AtomicBool::new(output.is_some()),
             },
         );
-        let Some(output) = accepted else {
+        let Some(output) = output else {
             control.failed();
             return;
         };
@@ -122,7 +127,10 @@ impl Astera {
             .get(&output)
             .copied()
             .unwrap_or(true);
-        self.output_power_controls.insert(output, control.clone());
+        self.output_power_controls
+            .entry(output)
+            .or_default()
+            .push(control.clone());
         control.mode(if powered {
             zwlr_output_power_v1::Mode::On
         } else {
@@ -196,7 +204,10 @@ impl Dispatch<ZwlrOutputPowerV1, OutputPowerData> for Astera {
                     return;
                 };
                 let Some(output) = data.output.filter(|output| {
-                    state.output_power_controls.get(output) == Some(control)
+                    state
+                        .output_power_controls
+                        .get(output)
+                        .is_some_and(|controls| controls.contains(control))
                         && state.output_runtime.contains_key(output)
                 }) else {
                     control.failed();
@@ -210,10 +221,8 @@ impl Dispatch<ZwlrOutputPowerV1, OutputPowerData> for Astera {
                 tracing::debug!(?output, powered, "output power mode requested");
             }
             zwlr_output_power_v1::Request::Destroy => {
-                if let Some(output) = data.output
-                    && state.output_power_controls.get(&output) == Some(control)
-                {
-                    state.output_power_controls.remove(&output);
+                if let Some(output) = data.output {
+                    remove_output_power_control(state, output, control);
                 }
                 data.valid.store(false, Ordering::Relaxed);
             }
@@ -227,10 +236,21 @@ impl Dispatch<ZwlrOutputPowerV1, OutputPowerData> for Astera {
         control: &ZwlrOutputPowerV1,
         data: &OutputPowerData,
     ) {
-        if let Some(output) = data.output
-            && state.output_power_controls.get(&output) == Some(control)
-        {
-            state.output_power_controls.remove(&output);
+        if let Some(output) = data.output {
+            remove_output_power_control(state, output, control);
         }
+        data.valid.store(false, Ordering::Relaxed);
+    }
+}
+
+fn remove_output_power_control(state: &mut Astera, output: OutputId, control: &ZwlrOutputPowerV1) {
+    let remove_entry = if let Some(controls) = state.output_power_controls.get_mut(&output) {
+        controls.retain(|candidate| candidate != control);
+        controls.is_empty()
+    } else {
+        false
+    };
+    if remove_entry {
+        state.output_power_controls.remove(&output);
     }
 }

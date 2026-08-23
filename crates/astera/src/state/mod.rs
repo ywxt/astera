@@ -236,7 +236,7 @@ pub struct Astera {
     lock_surfaces: LockSurfaces,
     next_lock_generation: u64,
     output_power_advertised: Arc<AtomicBool>,
-    output_power_controls: BTreeMap<OutputId, smithay::reexports::wayland_protocols_wlr::output_power_management::v1::server::zwlr_output_power_v1::ZwlrOutputPowerV1>,
+    output_power_controls: BTreeMap<OutputId, Vec<smithay::reexports::wayland_protocols_wlr::output_power_management::v1::server::zwlr_output_power_v1::ZwlrOutputPowerV1>>,
     output_power_modes: BTreeMap<OutputId, bool>,
     pending_output_power: VecDeque<(OutputId, bool)>,
     _relative_pointer_state: RelativePointerManagerState,

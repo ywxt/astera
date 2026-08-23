@@ -437,7 +437,7 @@ fn attach_one_pixel_buffer(
 }
 
 #[test]
-fn output_power_requests_are_exclusive_coalesced_and_backend_confirmed() {
+fn output_power_allows_multiple_controls_and_coalesces_backend_requests() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
     state.enable_output_power_management();
@@ -457,9 +457,9 @@ fn output_power_requests_are_exclusive_coalesced_and_backend_confirmed() {
             .bind::<ZwlrOutputPowerManagerV1, _, _>(&queue, 1..=1, ())
             .unwrap();
         let control = manager.get_output_power(&output, &queue, ());
-        let rejected = manager.get_output_power(&output, &queue, ());
-        rejected.destroy();
+        let second_control = manager.get_output_power(&output, &queue, ());
         control.set_mode(zwlr_output_power_v1::Mode::Off);
+        second_control.set_mode(zwlr_output_power_v1::Mode::Off);
         control.set_mode(zwlr_output_power_v1::Mode::On);
         control.set_mode(zwlr_output_power_v1::Mode::Off);
         connection.flush().unwrap();
@@ -473,7 +473,7 @@ fn output_power_requests_are_exclusive_coalesced_and_backend_confirmed() {
     dispatch_until(&mut display, &mut state, |state| {
         !state.pending_output_power.is_empty()
     });
-    assert_eq!(state.output_power_controls.len(), 1);
+    assert_eq!(state.output_power_controls[&OutputId(0)].len(), 2);
     assert_eq!(
         state.take_output_power_requests(),
         vec![(OutputId(0), false)],
