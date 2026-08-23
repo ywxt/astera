@@ -95,7 +95,7 @@ impl Astera {
                         WindowSurfaceType::ALL,
                     ) {
                         candidates.push((
-                            (mode_layer(mode), index, popup_index + 1),
+                            (mode_layer(mode), index, popup_stack_rank(popup_index)),
                             surface,
                             (
                                 popup_origin.x as f64 + f64::from(offset.x) * scale,
@@ -160,7 +160,7 @@ impl Astera {
                         WindowSurfaceType::ALL,
                     ) {
                         candidates.push((
-                            (order, index, popup_index + 1),
+                            (order, index, popup_stack_rank(popup_index)),
                             surface,
                             (
                                 popup_origin.x as f64 + f64::from(offset.x),
@@ -227,5 +227,25 @@ impl Astera {
             WindowMode::Fullscreen => Some((Point::ORIGIN, output.output.logical_size, 1.0, mode)),
             WindowMode::Minimized => None,
         }
+    }
+}
+
+// PopupManager yields nested children before their parents, matching the top-to-bottom render
+// order used by Smithay. All popups must rank above their root (rank zero), while earlier iterator
+// entries must beat later ones when their input regions overlap.
+fn popup_stack_rank(index: usize) -> usize {
+    usize::MAX - index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::popup_stack_rank;
+
+    #[test]
+    fn popup_hit_order_keeps_children_above_parents_and_roots() {
+        let child = popup_stack_rank(0);
+        let parent = popup_stack_rank(1);
+        assert!(child > parent);
+        assert!(parent > 0);
     }
 }
