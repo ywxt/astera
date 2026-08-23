@@ -259,6 +259,31 @@ impl CompositorHandler for Astera {
         self.reposition_input_method_popup_surface(surface);
         let committed_buffer =
             with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
+        if committed_buffer {
+            let configured = self
+                .windows
+                .iter()
+                .find(|window| window.surface.wl_surface() == surface)
+                .map(|window| window.surface.ensure_configured())
+                .or_else(|| {
+                    self.xdg_shell_state
+                        .popup_surfaces()
+                        .iter()
+                        .find(|popup| popup.wl_surface() == surface)
+                        .map(PopupSurface::ensure_configured)
+                })
+                .or_else(|| {
+                    self.layers
+                        .iter()
+                        .find(|mapped| mapped.surface.wl_surface() == surface)
+                        .map(|mapped| mapped.surface.layer_surface().ensure_configured())
+                });
+            if configured == Some(false) {
+                // Role-specific ensure_configured posts the protocol error required when a client
+                // attaches a buffer before acknowledging its initial configure.
+                return;
+            }
+        }
         // Buffer attachment, damage and subsurface state are visual changes even
         // when the public window metadata remains identical. A role's initial
         // null-buffer commit is protocol setup, however, and must not consume a
@@ -290,11 +315,6 @@ impl CompositorHandler for Astera {
             .position(|window| window.surface.wl_surface() == surface)
         {
             let has_buffer = committed_buffer;
-            if has_buffer && !self.windows[index].surface.ensure_configured() {
-                // xdg-shell forbids attaching a buffer until the client has acknowledged a
-                // configure. ensure_configured posts the required not_constructed error.
-                return;
-            }
             match (self.windows[index].mapped, has_buffer) {
                 (false, true) => self.map_toplevel(index),
                 (true, false) => self.unmap_toplevel(index),

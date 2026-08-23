@@ -415,6 +415,27 @@ fn dispatch_until(
     panic!("Wayland harness condition did not become true");
 }
 
+fn attach_one_pixel_buffer(
+    shm: &WlShm,
+    surface: &WlSurface,
+    queue: &QueueHandle<TestClient>,
+    name: &str,
+) {
+    let fd = rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+    rustix::fs::ftruncate(&fd, 4).unwrap();
+    let pool = shm.create_pool(fd.as_fd(), 4, queue, ());
+    let buffer = pool.create_buffer(
+        0,
+        1,
+        1,
+        4,
+        wayland_client::protocol::wl_shm::Format::Argb8888,
+        queue,
+        (),
+    );
+    surface.attach(Some(&buffer), 0, 0);
+}
+
 #[test]
 fn output_power_requests_are_exclusive_coalesced_and_backend_confirmed() {
     let mut display = Display::<Astera>::new().unwrap();
@@ -1792,6 +1813,123 @@ fn toplevel_buffer_before_ack_configure_is_rejected() {
     });
     assert_eq!(rejected, Some(true));
     assert!(state.windows.iter().all(|window| !window.mapped));
+    client.join().unwrap();
+}
+
+#[test]
+fn popup_buffer_before_ack_configure_is_rejected() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let shm = globals.bind::<WlShm, _, _>(&queue, 1..=1, ()).unwrap();
+        let parent_surface = compositor.create_surface(&queue, ());
+        let parent_xdg = shell.get_xdg_surface(&parent_surface, &queue, ());
+        let _parent_toplevel = parent_xdg.get_toplevel(&queue, ());
+        let positioner = shell.create_positioner(&queue, ());
+        positioner.set_size(1, 1);
+        positioner.set_anchor_rect(0, 0, 1, 1);
+        let popup_surface = compositor.create_surface(&queue, ());
+        let popup_xdg = shell.get_xdg_surface(&popup_surface, &queue, ());
+        let _popup = popup_xdg.get_popup(Some(&parent_xdg), &positioner, &queue, mpsc::channel().0);
+        attach_one_pixel_buffer(
+            &shm,
+            &popup_surface,
+            &queue,
+            "astera-unconfigured-popup-test",
+        );
+        popup_surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+        result_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    let mut rejected = None;
+    dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
+        Ok(value) => {
+            rejected = Some(value);
+            true
+        }
+        Err(_) => false,
+    });
+    assert_eq!(rejected, Some(true));
+    client.join().unwrap();
+}
+
+#[test]
+fn layer_buffer_before_ack_configure_is_rejected() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let layer_shell = globals
+            .bind::<ZwlrLayerShellV1, _, _>(&queue, 1..=4, ())
+            .unwrap();
+        let shm = globals.bind::<WlShm, _, _>(&queue, 1..=1, ()).unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let layer = layer_shell.get_layer_surface(
+            &surface,
+            None,
+            wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer::Top,
+            "unconfigured-test".into(),
+            &queue,
+            (),
+        );
+        layer.set_size(1, 1);
+        attach_one_pixel_buffer(&shm, &surface, &queue, "astera-unconfigured-layer-test");
+        surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+        result_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    let mut rejected = None;
+    dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
+        Ok(value) => {
+            rejected = Some(value);
+            true
+        }
+        Err(_) => false,
+    });
+    assert_eq!(rejected, Some(true));
+    assert!(state.layers.iter().all(|layer| !layer.mapped));
     client.join().unwrap();
 }
 
