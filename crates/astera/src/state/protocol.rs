@@ -1555,12 +1555,13 @@ impl smithay::reexports::wayland_server::Dispatch<
         data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
     ) {
         state.input_method_resource = Some(resource.clone());
+        use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::Request;
         if state.session_is_locked()
-            && matches!(
-                request,
-                smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::Request::GrabKeyboard { .. }
-            )
+            && let Request::GrabKeyboard { keyboard } = request
         {
+            // GrabKeyboard carries a new object ID. Initialize an inert child before the fatal
+            // policy error; returning with an uninitialized New makes wayland-server panic.
+            data_init.init(keyboard, ());
             resource.post_error(0u32, "input-method keyboard grabs are disabled while locked");
             return;
         }
