@@ -172,6 +172,10 @@ pub struct Astera {
     input_method_client: Option<Client>,
     input_method_manager_resource: Option<smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_manager_v2::ZwpInputMethodManagerV2>,
     input_method_resource: Option<smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::ZwpInputMethodV2>,
+    virtual_keyboard_clients: Vec<(
+        Client,
+        smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    )>,
     next_window_id: u64,
     next_layer_id: u64,
     pointer_location: SmithayPoint<f64, smithay::utils::Logical>,
@@ -418,6 +422,7 @@ impl Astera {
             input_method_client: None,
             input_method_manager_resource: None,
             input_method_resource: None,
+            virtual_keyboard_clients: Vec::new(),
             next_window_id: 1,
             next_layer_id: 1,
             pointer_location: (0.0, 0.0).into(),

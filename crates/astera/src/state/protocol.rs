@@ -1433,7 +1433,20 @@ impl smithay::reexports::wayland_server::Dispatch<
         data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
     ) {
         use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_manager_v2::Request;
-        if state.input_method_claimed {
+        if state.session_is_locked() {
+            match request {
+                Request::GetInputMethod { input_method, .. } => {
+                    let input_method = data_init.init(input_method, ());
+                    input_method.unavailable();
+                    return;
+                }
+                request => {
+                    return <InputMethodManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                        state, client, resource, request, data, display, data_init,
+                    );
+                }
+            }
+        } else if state.input_method_claimed {
             match request {
                 Request::GetInputMethod { input_method, .. } => {
                     // input-method-v2 requires a second instance to be created and receive the sole
@@ -1583,9 +1596,52 @@ smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
     smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1:
     smithay::wayland::virtual_keyboard::VirtualKeyboardManagerGlobalData
 ] => smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState);
-smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
-    smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1: ()
-] => smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState);
+impl smithay::reexports::wayland_server::Dispatch<
+    smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    (),
+> for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+        request: smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::Request,
+        data: &(),
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        let creates_keyboard = matches!(
+            &request,
+            smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::Request::CreateVirtualKeyboard { .. }
+        );
+        if creates_keyboard && !state
+            .virtual_keyboard_clients
+            .iter()
+            .any(|(known, _)| known.id() == client.id())
+        {
+            state
+                .virtual_keyboard_clients
+                .push((client.clone(), resource.clone()));
+        }
+        <VirtualKeyboardManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, resource, request, data, display, data_init,
+        );
+        if creates_keyboard && state.session_is_locked() {
+            resource.post_error(0u32, "virtual keyboards are unavailable while locked");
+        }
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        client: ClientId,
+        resource: &smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+        data: &(),
+    ) {
+        <VirtualKeyboardManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::destroyed(
+            state, client, resource, data,
+        );
+    }
+}
 
 impl smithay::reexports::wayland_server::Dispatch<
     smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::server::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,

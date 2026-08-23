@@ -753,6 +753,54 @@ fn session_lock_revokes_an_input_method_before_its_first_request() {
 }
 
 #[test]
+fn session_lock_revokes_a_silent_virtual_keyboard() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::trusted_input()))
+        .unwrap();
+    let (created_tx, created_rx) = mpsc::sync_channel(0);
+    let (revoked_tx, revoked_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let manager = globals
+            .bind::<ZwpVirtualKeyboardManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        // No keymap or key request follows. The lock transition must revoke the object at creation
+        // time instead of waiting for activity that might arrive only after unlock.
+        let _keyboard = manager.create_virtual_keyboard(&seat, &queue, ());
+        connection.flush().unwrap();
+        created_tx.send(()).unwrap();
+        revoked_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| created_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        !state.virtual_keyboard_clients.is_empty()
+    });
+    state.secure_input_for_lock();
+    display.flush_clients().unwrap();
+    let mut revoked = false;
+    dispatch_until(&mut display, &mut state, |_| match revoked_rx.try_recv() {
+        Ok(value) => {
+            revoked = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(revoked);
+    assert!(state.virtual_keyboard_clients.is_empty());
+    client.join().unwrap();
+}
+
+#[test]
 fn focused_client_receives_clipboard_selection_offer() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());

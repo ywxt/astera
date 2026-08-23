@@ -260,7 +260,8 @@ impl Astera {
             .take()
             .map(|manager| manager.id().protocol_id())
             .unwrap_or(0);
-        if let Some(client) = self.input_method_client.take() {
+        let input_method_client = self.input_method_client.take();
+        if let Some(client) = input_method_client.as_ref() {
             client.kill(
                 &self.display,
                 smithay::reexports::wayland_server::backend::protocol::ProtocolError {
@@ -268,6 +269,23 @@ impl Astera {
                     object_id: input_method_object_id,
                     object_interface: "zwp_input_method_manager_v2".into(),
                     message: "input method must reconnect after session lock".into(),
+                },
+            );
+        }
+        for (client, manager) in mem::take(&mut self.virtual_keyboard_clients) {
+            if input_method_client
+                .as_ref()
+                .is_some_and(|input_method| input_method.id() == client.id())
+            {
+                continue;
+            }
+            client.kill(
+                &self.display,
+                smithay::reexports::wayland_server::backend::protocol::ProtocolError {
+                    code: 0,
+                    object_id: manager.id().protocol_id(),
+                    object_interface: "zwp_virtual_keyboard_manager_v1".into(),
+                    message: "virtual keyboard must reconnect after session lock".into(),
                 },
             );
         }
