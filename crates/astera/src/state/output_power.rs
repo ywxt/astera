@@ -45,6 +45,17 @@ impl Astera {
     }
 
     pub(crate) fn confirm_output_power(&mut self, output: OutputId, powered: bool) {
+        // A DRM completion can race with hot-unplug. Once the Wayland output has disappeared the
+        // completion belongs to the retired backend object and must not recreate protocol or
+        // session-lock state for that OutputId.
+        if !self.output_runtime.contains_key(&output) {
+            tracing::debug!(
+                ?output,
+                powered,
+                "ignoring power confirmation for removed output"
+            );
+            return;
+        }
         self.output_power_modes.insert(output, powered);
         self.session_output_powered(output, powered);
         if let Some(control) = self.output_power_controls.get(&output) {

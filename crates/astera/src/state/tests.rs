@@ -461,6 +461,27 @@ fn output_power_requests_are_exclusive_coalesced_and_backend_confirmed() {
 }
 
 #[test]
+fn late_output_power_confirmation_does_not_resurrect_removed_output_state() {
+    let display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    state
+        .connect_output(Output::new(
+            OutputId(1),
+            "power-fallback-output",
+            Size::new(1024, 768),
+        ))
+        .unwrap();
+    state.disconnect_output(OutputId(0)).unwrap();
+    assert!(!state.output_power_modes.contains_key(&OutputId(0)));
+
+    // Model a KMS completion queued before hot-unplug but delivered afterwards.
+    state.confirm_output_power(OutputId(0), false);
+
+    assert!(!state.output_power_modes.contains_key(&OutputId(0)));
+    assert!(state.output_power_modes[&OutputId(1)]);
+}
+
+#[test]
 fn privileged_input_globals_are_hidden_from_ordinary_clients() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
@@ -907,7 +928,13 @@ fn session_lock_is_fail_closed_before_confirmation_and_after_disconnect() {
     assert!(matches!(state.session_state, SessionState::Locking { .. }));
     state.lock_frame_presented(OutputId(0), None);
     assert!(matches!(state.session_state, SessionState::Locking { .. }));
-    state.session_output_connected(OutputId(1));
+    state
+        .connect_output(Output::new(
+            OutputId(1),
+            "lock-hotplug-output",
+            Size::new(1024, 768),
+        ))
+        .unwrap();
     state.confirm_output_power(OutputId(1), false);
     state.confirm_output_power(OutputId(1), true);
     let generation = state.locking_generation();
