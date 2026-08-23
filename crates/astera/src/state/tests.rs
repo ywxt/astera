@@ -2259,6 +2259,46 @@ fn xdg_output_reports_authoritative_logical_size() {
 }
 
 #[test]
+fn xdg_output_v3_remains_usable_with_wl_output_v1() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (sizes_tx, sizes_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let output = globals.bind::<WlOutput, _, _>(&queue, 1..=1, ()).unwrap();
+        let manager = globals
+            .bind::<ZxdgOutputManagerV1, _, _>(&queue, 3..=3, ())
+            .unwrap();
+        let _xdg_output = manager.get_xdg_output(&output, &queue, sizes_tx);
+        let connected = events.roundtrip(&mut TestClient).is_ok();
+        result_tx.send(connected).unwrap();
+    });
+
+    let mut connected = false;
+    dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
+        Ok(value) => {
+            connected = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(
+        connected,
+        "wl_output v1 must not receive the v2-only done event"
+    );
+    assert_eq!(sizes_rx.recv().unwrap(), (1280, 720));
+    client.join().unwrap();
+}
+
+#[test]
 fn output_reconfigure_preserves_camera_and_updates_protocol_state() {
     let display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());

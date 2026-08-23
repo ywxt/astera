@@ -10,6 +10,7 @@ use smithay::reexports::{
 #[derive(Debug)]
 pub(super) struct AsteraXdgOutputData {
     output: Option<OutputId>,
+    wl_output: WlOutput,
 }
 
 impl GlobalDispatch<ZxdgOutputManagerV1, ()> for Astera {
@@ -43,7 +44,13 @@ impl Dispatch<ZxdgOutputManagerV1, ()> for Astera {
                         .iter()
                         .find_map(|(id, runtime)| (runtime.wayland == requested).then_some(*id))
                 });
-                let xdg_output = data_init.init(id, AsteraXdgOutputData { output: output_id });
+                let xdg_output = data_init.init(
+                    id,
+                    AsteraXdgOutputData {
+                        output: output_id,
+                        wl_output: output.clone(),
+                    },
+                );
                 if let Some(output_id) = output_id {
                     state
                         .xdg_outputs
@@ -53,7 +60,9 @@ impl Dispatch<ZxdgOutputManagerV1, ()> for Astera {
                     state.send_xdg_output_state(output_id, &xdg_output, true);
                     // For xdg-output v3, wl_output.done is the transaction boundary. Older
                     // versions additionally receive zxdg_output_v1.done below.
-                    output.done();
+                    if output.version() >= 2 {
+                        output.done();
+                    }
                 }
             }
             zxdg_output_manager_v1::Request::Destroy => {}
@@ -121,7 +130,13 @@ impl Astera {
             instance.name(core.stable_key.clone());
             instance.description(format!("Astera output {}", core.stable_key));
         }
-        if instance.version() < 3 {
+        // xdg-output v3 normally uses wl_output.done as its transaction boundary. A client may
+        // legally bind the associated wl_output at v1, where that event does not exist; retain the
+        // deprecated xdg-output boundary for that version instead of sending an undecodable event.
+        let wl_output_supports_done = instance
+            .data::<AsteraXdgOutputData>()
+            .is_some_and(|data| data.wl_output.version() >= 2);
+        if instance.version() < 3 || !wl_output_supports_done {
             instance.done();
         }
     }
