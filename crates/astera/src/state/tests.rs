@@ -1357,6 +1357,55 @@ fn layer_surface_targeting_an_already_removed_output_is_closed() {
 }
 
 #[test]
+fn initial_fullscreen_with_a_removed_output_does_not_crash_the_compositor() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (bound_tx, bound_rx) = mpsc::sync_channel(0);
+    let (removed_tx, removed_rx) = mpsc::sync_channel(0);
+    let (requested_tx, requested_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, event_queue) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = event_queue.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let removed_output = globals.bind::<WlOutput, _, _>(&queue, 1..=4, ()).unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        connection.flush().unwrap();
+        bound_tx.send(()).unwrap();
+        removed_rx.recv().unwrap();
+
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+        toplevel.set_fullscreen(Some(&removed_output));
+        surface.commit();
+        connection.flush().unwrap();
+        requested_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| bound_rx.try_recv().is_ok());
+    state.disconnect_output(OutputId(0)).unwrap();
+    display.flush_clients().unwrap();
+    removed_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        requested_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    assert_eq!(state.windows[0].initial_mode, None);
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
 fn layer_exclusive_zone_reduces_usable_viewport() {
     use wayland_protocols_wlr::layer_shell::v1::client::{
         zwlr_layer_shell_v1::Layer,

@@ -651,9 +651,10 @@ impl XdgShellHandler for Astera {
             .position(|window| !window.mapped && window.surface == surface)
         {
             if let Some(requested) = output
-                && !self.output_runtime[&self.active_output]
-                    .wayland
-                    .owns(&requested)
+                && !self
+                    .output_runtime
+                    .get(&self.active_output)
+                    .is_some_and(|runtime| runtime.wayland.owns(&requested))
             {
                 tracing::warn!("initial fullscreen request targeted an inactive output");
                 surface.send_configure();
