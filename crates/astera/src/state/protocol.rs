@@ -143,6 +143,21 @@ fn same_application(first: &WlSurface, second: &WlSurface) -> bool {
     }
 }
 
+fn xdg_toplevel_metadata(surface: &ToplevelSurface) -> (String, String) {
+    with_states(surface.wl_surface(), |states| {
+        let Some(attributes) = states.data_map.get::<XdgToplevelSurfaceData>() else {
+            return (String::new(), String::new());
+        };
+        let Ok(attributes) = attributes.lock() else {
+            return (String::new(), String::new());
+        };
+        (
+            attributes.title.clone().unwrap_or_default(),
+            attributes.app_id.clone().unwrap_or_default(),
+        )
+    })
+}
+
 impl Astera {
     fn configure_client_side_decoration(&self, toplevel: &ToplevelSurface) {
         use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;
@@ -533,12 +548,17 @@ impl XdgShellHandler for Astera {
             );
         });
         surface.send_configure();
+        let (title, app_id) = xdg_toplevel_metadata(&surface);
+        let foreign_toplevel = self
+            .foreign_toplevel_list_state
+            .new_toplevel::<Self>(title, app_id);
         self.windows.push(MappedWindow {
             id,
             surface,
             mapped: false,
             initial_mode: None,
             urgent: false,
+            foreign_toplevel,
         });
         tracing::debug!(window = ?id, "toplevel role created");
     }
@@ -905,6 +925,8 @@ impl XdgShellHandler for Astera {
             return;
         };
         let window = self.windows.remove(index);
+        self.foreign_toplevel_list_state
+            .remove_toplevel(&window.foreign_toplevel);
         if window.mapped
             && let Ok(workspace) = self.desktop.find_window(window.id)
         {
@@ -930,6 +952,14 @@ impl XdgShellHandler for Astera {
         self.handle_pointer_motion(self.pointer_location, 0);
     }
 
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        self.update_foreign_toplevel_metadata(&surface);
+    }
+
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        self.update_foreign_toplevel_metadata(&surface);
+    }
+
     fn reposition_request(
         &mut self,
         surface: PopupSurface,
@@ -948,6 +978,22 @@ impl XdgShellHandler for Astera {
 }
 
 impl Astera {
+    fn update_foreign_toplevel_metadata(&mut self, surface: &ToplevelSurface) {
+        let Some(handle) = self
+            .windows
+            .iter()
+            .find(|window| window.surface == *surface)
+            .map(|window| window.foreign_toplevel.clone())
+        else {
+            return;
+        };
+        let (title, app_id) = xdg_toplevel_metadata(surface);
+        handle.send_title(&title);
+        handle.send_app_id(&app_id);
+        handle.send_done();
+        self.mark_public_dirty();
+    }
+
     fn interactive_grab(
         &self,
         surface: &ToplevelSurface,
@@ -1640,7 +1686,14 @@ impl ServerDndGrabHandler for Astera {
     fn send(&mut self, _mime_type: String, _fd: OwnedFd, _seat: Seat<Self>) {}
 }
 
+impl ForeignToplevelListHandler for Astera {
+    fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+        &mut self.foreign_toplevel_list_state
+    }
+}
+
 delegate_xdg_shell!(Astera);
+delegate_foreign_toplevel_list!(Astera);
 delegate_xdg_decoration!(Astera);
 delegate_xdg_activation!(Astera);
 delegate_idle_inhibit!(Astera);

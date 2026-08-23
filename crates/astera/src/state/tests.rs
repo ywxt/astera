@@ -21,6 +21,10 @@ use wayland_client::{
         wl_shm_pool::WlShmPool, wl_surface::WlSurface,
     },
 };
+use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
+    ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
+    ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1,
+};
 use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1::ExtIdleNotificationV1, ext_idle_notifier_v1::ExtIdleNotifierV1,
 };
@@ -193,6 +197,23 @@ delegate_noop!(TestClient: ignore ZwpPrimarySelectionSourceV1);
 delegate_noop!(TestClient: ignore WpSinglePixelBufferManagerV1);
 delegate_noop!(TestClient: ignore WpAlphaModifierV1);
 delegate_noop!(TestClient: ignore WpAlphaModifierSurfaceV1);
+delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
+
+impl Dispatch<ExtForeignToplevelListV1, ()> for TestClient {
+    wayland_client::event_created_child!(TestClient, ExtForeignToplevelListV1, [
+        0 => (ExtForeignToplevelHandleV1, ())
+    ]);
+
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtForeignToplevelListV1,
+        _event: wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_list_v1::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+    }
+}
 
 impl Dispatch<ZxdgOutputV1, mpsc::Sender<(i32, i32)>> for TestClient {
     fn event(
@@ -1336,6 +1357,7 @@ fn single_pixel_buffer_maps_an_xdg_toplevel() {
         .unwrap();
     let (role_tx, role_rx) = mpsc::sync_channel(0);
     let (mapped_tx, mapped_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
     let client = thread::spawn(move || {
         let connection = Connection::from_socket(client_socket).unwrap();
         let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
@@ -1362,12 +1384,16 @@ fn single_pixel_buffer_maps_an_xdg_toplevel() {
         surface.commit();
         connection.flush().unwrap();
         mapped_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
     });
 
     dispatch_until(&mut display, &mut state, |_| role_rx.try_recv().is_ok());
     dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
     dispatch_until(&mut display, &mut state, |_| mapped_rx.try_recv().is_ok());
-    dispatch_until(&mut display, &mut state, |state| state.windows[0].mapped);
+    dispatch_until(&mut display, &mut state, |state| {
+        state.windows.first().is_some_and(|window| window.mapped)
+    });
+    done_tx.send(()).unwrap();
     client.join().unwrap();
 }
 
@@ -1419,6 +1445,74 @@ fn alpha_modifier_is_double_buffered_with_surface_commit() {
     });
     assert_eq!(multiplier, Some(FACTOR));
     done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn foreign_toplevel_list_tracks_metadata_and_role_lifetime() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (created_tx, created_rx) = mpsc::sync_channel(0);
+    let (update_tx, update_rx) = mpsc::sync_channel(0);
+    let (updated_tx, updated_rx) = mpsc::sync_channel(0);
+    let (destroy_tx, destroy_rx) = mpsc::sync_channel(0);
+    let (destroyed_tx, destroyed_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let _list = globals
+            .bind::<ExtForeignToplevelListV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+        connection.flush().unwrap();
+        created_tx.send(()).unwrap();
+
+        update_rx.recv().unwrap();
+        toplevel.set_title("Astera editor".into());
+        toplevel.set_app_id("org.astera.Editor".into());
+        connection.flush().unwrap();
+        updated_tx.send(()).unwrap();
+
+        destroy_rx.recv().unwrap();
+        toplevel.destroy();
+        xdg_surface.destroy();
+        connection.flush().unwrap();
+        destroyed_tx.send(()).unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| created_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state.windows.len() == 1 && state.windows[0].foreign_toplevel.resources().len() == 1
+    });
+    let handle = state.windows[0].foreign_toplevel.clone();
+    assert_eq!(handle.title(), "");
+    assert_eq!(handle.app_id(), "");
+
+    update_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| updated_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state.windows[0].foreign_toplevel.title() == "Astera editor"
+            && state.windows[0].foreign_toplevel.app_id() == "org.astera.Editor"
+    });
+
+    destroy_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        destroyed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| state.windows.is_empty());
+    assert!(handle.is_closed());
     client.join().unwrap();
 }
 

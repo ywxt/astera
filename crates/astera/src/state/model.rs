@@ -16,6 +16,7 @@ use smithay::{
         compositor::CompositorState,
         cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufState,
+        foreign_toplevel_list::{ForeignToplevelHandle, ForeignToplevelListState},
         fractional_scale::FractionalScaleManagerState,
         idle_inhibit::IdleInhibitManagerState,
         input_method::{InputMethodManagerState, PopupSurface as InputMethodPopupSurface},
@@ -66,6 +67,7 @@ pub struct ProtocolState {
     pub(super) primary_selection_state: PrimarySelectionState,
     pub(super) _single_pixel_buffer_state: SinglePixelBufferState,
     pub(super) _alpha_modifier_state: AlphaModifierState,
+    pub(super) foreign_toplevel_list_state: ForeignToplevelListState,
     pub(super) dmabuf_state: DmabufState,
     pub(super) popup_manager: PopupManager,
     pub(super) seat: Seat<Astera>,
@@ -86,6 +88,7 @@ pub(super) struct MappedWindow {
     pub(super) initial_mode: Option<WindowMode>,
     /// Set when an activation was denied; cleared once the window legitimately receives focus.
     pub(super) urgent: bool,
+    pub(super) foreign_toplevel: ForeignToplevelHandle,
 }
 
 #[derive(Clone, Copy, Debug)]
