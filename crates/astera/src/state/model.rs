@@ -47,6 +47,7 @@ use smithay::{
         viewporter::ViewporterState,
         virtual_keyboard::VirtualKeyboardManagerState,
         xdg_activation::XdgActivationState,
+        xdg_system_bell::XdgSystemBellState,
     },
 };
 
@@ -88,6 +89,7 @@ pub struct ProtocolState {
     pub(super) _security_context_state: SecurityContextState,
     pub(super) _presentation_state: PresentationState,
     pub(super) xdg_foreign_state: XdgForeignState,
+    pub(super) _xdg_system_bell_state: XdgSystemBellState,
     pub(super) dmabuf_state: DmabufState,
     pub(super) popup_manager: PopupManager,
     pub(super) seat: Seat<Astera>,

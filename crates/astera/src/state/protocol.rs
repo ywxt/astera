@@ -46,6 +46,36 @@ impl XdgDialogHandler for Astera {
     }
 }
 
+impl XdgSystemBellHandler for Astera {
+    fn ring(&mut self, surface: Option<WlSurface>) {
+        const FLASH_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
+
+        let target = surface
+            .as_ref()
+            .and_then(|surface| {
+                self.windows
+                    .iter()
+                    .find(|window| {
+                        window.mapped && surface_tree_contains(window.surface.wl_surface(), surface)
+                    })
+                    .map(|window| window.id)
+            })
+            .or_else(|| {
+                self.desktop
+                    .active_workspace_id(self.active_output)
+                    .and_then(|workspace| self.desktop.workspace(workspace).ok()?.focused_window)
+            });
+        if let Some(target) = target
+            && let Some(window) = self.windows.iter_mut().find(|window| window.id == target)
+        {
+            window.urgent = true;
+            self.mark_public_dirty();
+        }
+        self.bell_flash_until = Some(self.clock.now() + FLASH_DURATION);
+        self.mark_render_dirty();
+    }
+}
+
 impl XdgActivationHandler for Astera {
     fn activation_state(&mut self) -> &mut XdgActivationState {
         &mut self.xdg_activation_state
@@ -2137,6 +2167,7 @@ delegate_dmabuf!(Astera);
 smithay::delegate_security_context!(Astera);
 delegate_presentation!(Astera);
 delegate_ext_data_control!(Astera);
+delegate_xdg_system_bell!(Astera);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
     smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::WpCommitTimingManagerV1: bool
 ] => smithay::wayland::commit_timing::CommitTimingManagerState);

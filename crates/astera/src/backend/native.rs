@@ -1198,6 +1198,8 @@ impl NativeLoop {
         let power_mode = surface.committing_power_mode;
         let clear = if self.state.session_is_locked() {
             Color32F::new(0.0, 0.0, 0.0, 1.0)
+        } else if self.state.bell_flash_active() {
+            Color32F::new(0.35, 0.35, 0.35, 1.0)
         } else {
             Color32F::new(0.025, 0.035, 0.06, 1.0)
         };

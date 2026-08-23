@@ -112,6 +112,7 @@ use wayland_protocols::xdg::shell::client::{
     xdg_popup::XdgPopup, xdg_positioner::XdgPositioner, xdg_surface::XdgSurface,
     xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
 };
+use wayland_protocols::xdg::system_bell::v1::client::xdg_system_bell_v1::XdgSystemBellV1;
 use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1, zxdg_output_v1::ZxdgOutputV1,
 };
@@ -239,6 +240,7 @@ delegate_noop!(TestClient: ignore ExtDataControlOfferV1);
 delegate_noop!(TestClient: ignore ExtDataControlSourceV1);
 delegate_noop!(TestClient: ignore ZxdgExporterV2);
 delegate_noop!(TestClient: ignore ZxdgImporterV2);
+delegate_noop!(TestClient: ignore XdgSystemBellV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
 
 impl Dispatch<ZxdgExportedV2, mpsc::Sender<String>> for TestClient {
@@ -2230,6 +2232,73 @@ fn xdg_foreign_links_cross_client_parent_and_revokes_it_with_export() {
     parent_done_tx.send(()).unwrap();
     parent.join().unwrap();
     child.join().unwrap();
+}
+
+#[test]
+fn system_bell_marks_target_urgent_and_flash_expires_on_timer() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let start = Instant::now();
+    let clock = Arc::new(ManualClock::new(start));
+    let mut state = Astera::new_with_clock(&display.handle(), Config::default(), clock.clone());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (ring_tx, ring_rx) = mpsc::sync_channel(0);
+    let (sent_tx, sent_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let bell = globals
+            .bind::<XdgSystemBellV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        surface.commit();
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        ring_rx.recv().unwrap();
+        bell.ring(Some(&surface));
+        connection.flush().unwrap();
+        sent_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    state.map_toplevel(0);
+    let generation = state.render_generation();
+    ring_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| sent_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.bell_flash_active());
+    assert!(state.windows[0].urgent);
+    assert!(state.render_generation() > generation);
+    assert_eq!(
+        state.next_visual_timer_deadline(),
+        Some(start + Duration::from_millis(150))
+    );
+
+    let generation = state.render_generation();
+    clock.advance(Duration::from_millis(151));
+    state.process_idle_timers();
+    assert!(!state.bell_flash_active());
+    assert!(state.render_generation() > generation);
+    assert_ne!(
+        state.next_visual_timer_deadline(),
+        Some(start + Duration::from_millis(150))
+    );
+
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
 }
 
 #[test]

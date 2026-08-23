@@ -81,6 +81,7 @@ use smithay::{
     delegate_presentation, delegate_relative_pointer, delegate_seat, delegate_shm,
     delegate_single_pixel_buffer, delegate_tablet_manager, delegate_viewporter,
     delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_dialog, delegate_xdg_shell,
+    delegate_xdg_system_bell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -176,6 +177,7 @@ use smithay::{
         xdg_activation::{
             XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
         },
+        xdg_system_bell::{XdgSystemBellHandler, XdgSystemBellState},
     },
 };
 
@@ -244,6 +246,7 @@ pub struct Astera {
     // readiness alone must not schedule a frame: only a mutation which can
     // change the composed scene advances it.
     render_generation: u64,
+    bell_flash_until: Option<std::time::Instant>,
     #[cfg(test)]
     public_snapshot_builds: u64,
     should_quit: bool,
@@ -479,6 +482,7 @@ impl Astera {
         });
         let presentation_state = PresentationState::new::<Self>(display, 1);
         let xdg_foreign_state = xdg_foreign::XdgForeignState::new(display);
+        let xdg_system_bell_state = XdgSystemBellState::new::<Self>(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -529,6 +533,7 @@ impl Astera {
                 _security_context_state: security_context_state,
                 _presentation_state: presentation_state,
                 xdg_foreign_state,
+                _xdg_system_bell_state: xdg_system_bell_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
@@ -595,6 +600,7 @@ impl Astera {
             // The first publish establishes the event hub's authoritative baseline.
             public_dirty: true,
             render_generation: 0,
+            bell_flash_until: None,
             #[cfg(test)]
             public_snapshot_builds: 0,
             should_quit: false,
@@ -2076,6 +2082,7 @@ impl Astera {
     pub fn next_visual_timer_deadline(&self) -> Option<std::time::Instant> {
         [
             self.key_repeat.deadline(),
+            self.bell_flash_until,
             self.config_watcher
                 .as_ref()
                 .and_then(ConfigWatcher::deadline),
@@ -2086,8 +2093,20 @@ impl Astera {
     }
 
     pub fn process_idle_timers(&mut self) {
+        if self
+            .bell_flash_until
+            .is_some_and(|deadline| deadline <= self.clock.now())
+        {
+            self.bell_flash_until = None;
+            self.mark_render_dirty();
+        }
         let events = self.idle_runtime.process_due(self.clock.now());
         self.send_idle_events(events);
+    }
+
+    pub(crate) fn bell_flash_active(&self) -> bool {
+        self.bell_flash_until
+            .is_some_and(|deadline| deadline > self.clock.now())
     }
 
     fn send_idle_events(&self, events: Vec<IdleEvent>) {
