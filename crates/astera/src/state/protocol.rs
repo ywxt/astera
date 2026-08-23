@@ -1356,12 +1356,59 @@ impl smithay::reexports::wayland_server::Dispatch<
         _state: &mut Self,
         _client: &Client,
         _resource: &smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::ZwpInputMethodV2,
-        _request: smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::Request,
+        request: smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::Request,
+        _data: &(),
+        _display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_v2::Request;
+
+        // Objects rejected with `unavailable` are inert for the rest of their lifetime. Requests
+        // carrying new IDs still need inert server resources: leaving a New uninitialized makes
+        // wayland-server panic instead of ignoring the request as the protocol requires.
+        match request {
+            Request::GetInputPopupSurface { id, .. } => {
+                data_init.init(id, ());
+            }
+            Request::GrabKeyboard { keyboard } => {
+                data_init.init(keyboard, ());
+            }
+            _ => {}
+        }
+    }
+}
+
+impl smithay::reexports::wayland_server::Dispatch<
+    smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
+    (),
+> for Astera
+{
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
+        _request: smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_popup_surface_v2::Request,
         _data: &(),
         _display: &DisplayHandle,
         _data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
     ) {
-        // Objects rejected with `unavailable` are inert for the rest of their lifetime.
+    }
+}
+
+impl smithay::reexports::wayland_server::Dispatch<
+    smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
+    (),
+> for Astera
+{
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
+        _request: smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_keyboard_grab_v2::Request,
+        _data: &(),
+        _display: &DisplayHandle,
+        _data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
     }
 }
 

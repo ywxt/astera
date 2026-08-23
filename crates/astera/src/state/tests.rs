@@ -86,7 +86,9 @@ use wayland_protocols::xdg::{
     },
 };
 use wayland_protocols_misc::zwp_input_method_v2::client::{
+    zwp_input_method_keyboard_grab_v2::ZwpInputMethodKeyboardGrabV2,
     zwp_input_method_manager_v2::ZwpInputMethodManagerV2, zwp_input_method_v2::ZwpInputMethodV2,
+    zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
 };
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
@@ -168,6 +170,8 @@ delegate_noop!(TestClient: ignore ZwpTextInputManagerV3);
 delegate_noop!(TestClient: ignore ZwpTextInputV3);
 delegate_noop!(TestClient: ignore ZwpInputMethodManagerV2);
 delegate_noop!(TestClient: ignore ZwpInputMethodV2);
+delegate_noop!(TestClient: ignore ZwpInputMethodKeyboardGrabV2);
+delegate_noop!(TestClient: ignore ZwpInputPopupSurfaceV2);
 delegate_noop!(TestClient: ignore ZwpVirtualKeyboardManagerV1);
 delegate_noop!(TestClient: ignore ZwpVirtualKeyboardV1);
 delegate_noop!(TestClient: ignore ZwpLinuxDmabufV1);
@@ -622,13 +626,21 @@ fn second_input_method_is_unavailable_without_disconnect() {
         let connection = Connection::from_socket(client_socket).unwrap();
         let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
         let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
         let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
         let manager = globals
             .bind::<ZwpInputMethodManagerV2, _, _>(&queue, 1..=1, ())
             .unwrap();
         let _first = manager.get_input_method(&seat, &queue, ());
         let (unavailable_tx, unavailable_rx) = mpsc::channel();
-        let _second = manager.get_input_method(&seat, &queue, unavailable_tx);
+        let second = manager.get_input_method(&seat, &queue, unavailable_tx);
+        connection.flush().unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let _popup = second.get_input_popup_surface(&surface, &queue, ());
+        let _grab = second.grab_keyboard(&queue, ());
         connection.flush().unwrap();
         let connected = events.roundtrip(&mut TestClient).is_ok();
         result_tx
