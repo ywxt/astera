@@ -814,10 +814,33 @@ impl XdgShellHandler for Astera {
         let Ok(root) = find_popup_root_surface(&popup) else {
             return;
         };
+        let root_client = root.client().map(|client| client.id());
+        let pointer_start = self.pointer.grab_start_data();
+        let touch_start = self.touch.grab_start_data();
+        let pointer_authorized = self.pointer.has_grab(serial)
+            && pointer_start.as_ref().is_some_and(|start| {
+                start
+                    .focus
+                    .as_ref()
+                    .and_then(|(surface, _)| surface.client())
+                    .map(|client| client.id())
+                    == root_client
+            });
+        let touch_authorized = self.touch.has_grab(serial)
+            && touch_start.as_ref().is_some_and(|start| {
+                start
+                    .focus
+                    .as_ref()
+                    .and_then(|(surface, _)| surface.client())
+                    .map(|client| client.id())
+                    == root_client
+            });
+        let grab_source = popup_grab_source(pointer_authorized, touch_authorized);
         let authorized = self.seat.owns(&seat_resource)
-            && root.client().is_some_and(|client| {
+            && grab_source.is_some()
+            && root_client.as_ref().is_some_and(|client| {
                 self.activation_tracker
-                    .authorizes_input(serial, &client.id(), self.clock.now())
+                    .authorizes_input(serial, client, self.clock.now())
             });
         if !authorized {
             // xdg-shell requires denied grabs to be dismissed immediately. In particular, never
@@ -835,13 +858,26 @@ impl XdgShellHandler for Astera {
         };
         let keyboard = self.keyboard.clone();
         keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
-        let pointer = self.pointer.clone();
-        pointer.set_grab(
-            self,
-            PopupPointerGrab::new(&grab),
-            serial,
-            PointerFocusMode::Keep,
-        );
+        match grab_source {
+            Some(PopupGrabSource::Pointer) => {
+                let pointer = self.pointer.clone();
+                pointer.set_grab(
+                    self,
+                    PopupPointerGrab::new(&grab),
+                    serial,
+                    PointerFocusMode::Keep,
+                );
+            }
+            Some(PopupGrabSource::Touch) => {
+                let touch = self.touch.clone();
+                touch.set_grab(
+                    self,
+                    popup_touch::PopupTouchGrab::new(grab, touch_start.unwrap()),
+                    serial,
+                );
+            }
+            None => unreachable!("unauthorized popup grabs returned above"),
+        }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -1378,10 +1414,27 @@ fn select_interactive_grab<T>(pointer: Option<T>, touch: Option<T>) -> Option<T>
     pointer.or(touch)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PopupGrabSource {
+    Pointer,
+    Touch,
+}
+
+fn popup_grab_source(pointer: bool, touch: bool) -> Option<PopupGrabSource> {
+    if pointer {
+        Some(PopupGrabSource::Pointer)
+    } else if touch {
+        Some(PopupGrabSource::Touch)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod data_device_tests {
     use super::{
-        implicit_grab_authorizes_origin, implicit_grab_authorizes_surface, select_interactive_grab,
+        PopupGrabSource, implicit_grab_authorizes_origin, implicit_grab_authorizes_surface,
+        popup_grab_source, select_interactive_grab,
     };
 
     #[test]
@@ -1432,6 +1485,16 @@ mod data_device_tests {
             select_interactive_grab(Some("pointer"), Some("touch")),
             Some("pointer")
         );
+    }
+
+    #[test]
+    fn popup_grab_requires_pointer_or_touch_implicit_grab() {
+        assert_eq!(
+            popup_grab_source(true, true),
+            Some(PopupGrabSource::Pointer)
+        );
+        assert_eq!(popup_grab_source(false, true), Some(PopupGrabSource::Touch));
+        assert_eq!(popup_grab_source(false, false), None);
     }
 }
 

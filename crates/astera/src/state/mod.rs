@@ -21,6 +21,7 @@ mod model;
 mod output;
 mod output_power;
 mod pointer_constraints;
+mod popup_touch;
 mod process;
 pub(crate) use process::{InputServiceExit, InputServiceSupervisor};
 mod public_state;
