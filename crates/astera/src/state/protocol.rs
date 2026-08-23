@@ -728,10 +728,21 @@ impl XdgShellHandler for Astera {
         else {
             return;
         };
-        let Ok(mode) = self.toggle_fullscreen_mode(window) else {
+        let Ok(workspace) = self.desktop.find_window(window) else {
             return;
         };
-        let Ok(workspace) = self.desktop.find_window(window) else {
+        if self
+            .desktop
+            .workspace(workspace)
+            .ok()
+            .and_then(|workspace| workspace.window_mode(window))
+            != Some(WindowMode::Fullscreen)
+        {
+            // unset_fullscreen is not a toggle. Repeating it, or issuing it for a window that was
+            // never fullscreen, must not enter fullscreen as a side effect.
+            return;
+        }
+        let Ok(mode) = self.toggle_fullscreen_mode(window) else {
             return;
         };
         let Some(viewport_size) = self

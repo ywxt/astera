@@ -1803,6 +1803,71 @@ fn initial_toplevel_mode_requests_are_retained_until_mapping() {
 }
 
 #[test]
+fn unset_fullscreen_is_not_a_fullscreen_toggle() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (request_tx, request_rx) = mpsc::sync_channel(0);
+    let (sent_tx, sent_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+        surface.commit();
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        request_rx.recv().unwrap();
+        toplevel.unset_fullscreen();
+        connection.flush().unwrap();
+        sent_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    state.map_toplevel(0);
+    let window = state.windows[0].id;
+    let workspace = state.desktop.find_window(window).unwrap();
+    assert_eq!(
+        state
+            .desktop
+            .workspace(workspace)
+            .unwrap()
+            .window_mode(window),
+        Some(WindowMode::Tiled)
+    );
+
+    request_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| sent_rx.try_recv().is_ok());
+    for _ in 0..8 {
+        display.dispatch_clients(&mut state).unwrap();
+    }
+    assert_eq!(
+        state
+            .desktop
+            .workspace(workspace)
+            .unwrap()
+            .window_mode(window),
+        Some(WindowMode::Tiled)
+    );
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
 fn frame_callback_snapshot_does_not_relock_surface_tree_state() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
