@@ -135,6 +135,9 @@ use smithay::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
                 set_data_device_focus,
             },
+            primary_selection::{
+                PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
+            },
         },
         session_lock::SessionLockManagerState,
         shell::wlr_layer::{
@@ -252,6 +255,7 @@ pub struct Astera {
     next_idle_notification: u64,
     activation_tracker: ActivationTracker,
     last_selection_serial: Option<Serial>,
+    last_primary_selection_serial: Option<Serial>,
 }
 
 impl Deref for Astera {
@@ -362,6 +366,7 @@ impl Astera {
         let pointer = seat.add_pointer();
         let touch = touch::add_touch(&mut seat);
         let data_device_state = DataDeviceState::new::<Self>(display);
+        let primary_selection_state = PrimarySelectionState::new::<Self>(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -400,6 +405,7 @@ impl Astera {
                 shm_state,
                 seat_state,
                 data_device_state,
+                primary_selection_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
@@ -496,6 +502,7 @@ impl Astera {
             next_idle_notification: 1,
             activation_tracker: ActivationTracker::default(),
             last_selection_serial: None,
+            last_primary_selection_serial: None,
         }
     }
 

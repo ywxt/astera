@@ -276,6 +276,7 @@ impl Astera {
         self.update_shortcut_inhibitor(&seat, target.as_ref());
         if target.is_none() {
             set_data_device_focus(&self.display, &seat, None);
+            set_primary_focus(&self.display, &seat, None);
         }
     }
 

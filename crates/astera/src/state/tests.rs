@@ -57,6 +57,12 @@ use wayland_protocols::wp::{
         zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1,
         zwp_pointer_gestures_v1::ZwpPointerGesturesV1,
     },
+    primary_selection::zv1::client::{
+        zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
+        zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+        zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1,
+        zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+    },
     relative_pointer::zv1::client::{
         zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
         zwp_relative_pointer_v1::ZwpRelativePointerV1,
@@ -175,6 +181,10 @@ delegate_noop!(TestClient: ignore ZwpInputPopupSurfaceV2);
 delegate_noop!(TestClient: ignore ZwpVirtualKeyboardManagerV1);
 delegate_noop!(TestClient: ignore ZwpVirtualKeyboardV1);
 delegate_noop!(TestClient: ignore ZwpLinuxDmabufV1);
+delegate_noop!(TestClient: ignore ZwpPrimarySelectionDeviceManagerV1);
+delegate_noop!(TestClient: ignore ZwpPrimarySelectionDeviceV1);
+delegate_noop!(TestClient: ignore ZwpPrimarySelectionOfferV1);
+delegate_noop!(TestClient: ignore ZwpPrimarySelectionSourceV1);
 
 impl Dispatch<ZxdgOutputV1, mpsc::Sender<(i32, i32)>> for TestClient {
     fn event(
@@ -976,6 +986,59 @@ fn clipboard_selection_rejects_an_unissued_serial() {
 }
 
 #[test]
+fn primary_selection_rejects_an_unissued_serial() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (request_tx, request_rx) = mpsc::sync_channel(0);
+    let (sent_tx, sent_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let manager = globals
+            .bind::<ZwpPrimarySelectionDeviceManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let device = manager.get_device(&seat, &queue, ());
+        let source = manager.create_source(&queue, ());
+        source.offer("text/plain".into());
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        request_rx.recv().unwrap();
+        device.set_selection(Some(&source), 0xfeed_beef);
+        connection.flush().unwrap();
+        sent_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    state.map_toplevel(0);
+    request_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| sent_rx.try_recv().is_ok());
+    for _ in 0..8 {
+        display.dispatch_clients(&mut state).unwrap();
+    }
+    assert_eq!(state.last_primary_selection_serial, None);
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
 fn clipboard_selection_transfers_requested_mime_bytes() {
     const PAYLOAD: &[u8] = b"astera clipboard payload";
 
@@ -1312,6 +1375,9 @@ fn decoration_and_activation_globals_are_advertised() {
         let text_inputs = globals
             .bind::<ZwpTextInputManagerV3, _, _>(&queue, 1..=1, ())
             .unwrap();
+        let primary_selection = globals
+            .bind::<ZwpPrimarySelectionDeviceManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
         let input_methods = globals
             .bind::<ZwpInputMethodManagerV2, _, _>(&queue, 1..=1, ())
             .unwrap();
@@ -1336,6 +1402,8 @@ fn decoration_and_activation_globals_are_advertised() {
         let _tablet_seat = tablet_manager.get_tablet_seat(&seat, &queue, ());
         let _cursor_shape = cursor_shapes.get_pointer(&pointer, &queue, ());
         let _text_input = text_inputs.get_text_input(&seat, &queue, ());
+        let _primary_device = primary_selection.get_device(&seat, &queue, ());
+        let _primary_source = primary_selection.create_source(&queue, ());
         let _input_method = input_methods.get_input_method(&seat, &queue, ());
         let _virtual_keyboard = virtual_keyboards.create_virtual_keyboard(&seat, &queue, ());
         let _first_inhibitor = idle_inhibit.create_inhibitor(&surface, &queue, ());

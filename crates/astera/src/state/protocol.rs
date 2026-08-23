@@ -1215,7 +1215,9 @@ impl SeatHandler for Astera {
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         self.update_shortcut_inhibitor(seat, focused);
-        set_data_device_focus(&self.display, seat, focused.and_then(Resource::client));
+        let client = focused.and_then(Resource::client);
+        set_data_device_focus(&self.display, seat, client.clone());
+        set_primary_focus(&self.display, seat, client);
     }
 
     fn cursor_image(
@@ -1320,6 +1322,70 @@ impl SelectionHandler for Astera {
 impl DataDeviceHandler for Astera {
     fn data_device_state(&self) -> &DataDeviceState {
         &self.data_device_state
+    }
+}
+
+impl PrimarySelectionHandler for Astera {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+
+impl
+    smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+        smithay::wayland::selection::primary_selection::PrimaryDeviceUserData,
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &smithay::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+        request: smithay::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_v1::Request,
+        data: &smithay::wayland::selection::primary_selection::PrimaryDeviceUserData,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_v1::Request;
+        if let Request::SetSelection { serial, .. } = &request {
+            let serial = Serial::from(*serial);
+            let client_id = client.id();
+            let focused = state
+                .keyboard
+                .current_focus()
+                .and_then(|surface| surface.client())
+                .is_some_and(|focused| focused.id() == client_id);
+            let authorized = focused
+                && state
+                    .activation_tracker
+                    .authorizes_input(serial, &client_id, state.clock.now())
+                && state
+                    .last_primary_selection_serial
+                    .is_none_or(|last| serial.is_no_older_than(&last));
+            if !authorized {
+                tracing::debug!(
+                    ?serial,
+                    ?client_id,
+                    "denying primary selection with invalid input serial"
+                );
+                return;
+            }
+            state.last_primary_selection_serial = Some(serial);
+        }
+        <PrimarySelectionState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, resource, request, data, display, data_init,
+        );
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        client: ClientId,
+        resource: &smithay::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+        data: &smithay::wayland::selection::primary_selection::PrimaryDeviceUserData,
+    ) {
+        <PrimarySelectionState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::destroyed(
+            state, client, resource, data,
+        );
     }
 }
 
@@ -1915,4 +1981,15 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
     smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource:
     smithay::wayland::selection::data_device::DataSourceUserData
 ] => smithay::wayland::selection::data_device::DataDeviceState);
+smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1:
+    smithay::wayland::selection::primary_selection::PrimaryDeviceManagerGlobalData
+] => smithay::wayland::selection::primary_selection::PrimarySelectionState);
+smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1: ()
+] => smithay::wayland::selection::primary_selection::PrimarySelectionState);
+smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1:
+    smithay::wayland::selection::primary_selection::PrimarySourceUserData
+] => smithay::wayland::selection::primary_selection::PrimarySelectionState);
 delegate_dmabuf!(Astera);
