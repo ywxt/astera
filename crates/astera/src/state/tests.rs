@@ -2384,6 +2384,13 @@ fn frame_callback_snapshot_does_not_relock_surface_tree_state() {
 }
 
 #[test]
+fn persistent_touch_grab_is_cancelled_without_active_slots() {
+    assert!(touch_state_requires_cancel(true, true));
+    assert!(touch_state_requires_cancel(false, false));
+    assert!(!touch_state_requires_cancel(true, false));
+}
+
+#[test]
 fn disconnected_xdg_client_is_removed_without_explicit_destroy() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());

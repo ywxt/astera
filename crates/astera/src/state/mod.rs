@@ -1074,7 +1074,7 @@ impl Astera {
     }
 
     pub(super) fn cancel_touch_sequences(&mut self) {
-        if self.touch_slots.is_empty() {
+        if !touch_state_requires_cancel(self.touch_slots.is_empty(), self.touch.is_grabbed()) {
             return;
         }
         if self
@@ -2267,6 +2267,10 @@ impl Astera {
             self.handle_pointer_motion(self.pointer_location, 0);
         }
     }
+}
+
+fn touch_state_requires_cancel(slots_empty: bool, grabbed: bool) -> bool {
+    !slots_empty || grabbed
 }
 
 fn resized_rect(
