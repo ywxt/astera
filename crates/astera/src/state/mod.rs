@@ -555,6 +555,12 @@ impl Astera {
     pub fn disconnect_output(&mut self, output: OutputId) -> Result<(), astera_core::DesktopError> {
         self.cancel_surface_bound_input();
         let event = self.desktop.disconnect_output(output)?;
+        if let Some(runtime) = self.output_runtime.get(&output) {
+            for layer in self.layers.iter().filter(|layer| layer.output == output) {
+                layer_map_for_output(&runtime.wayland).unmap_layer(&layer.surface);
+                layer.surface.layer_surface().send_close();
+            }
+        }
         let runtime = self
             .output_runtime
             .remove(&output)

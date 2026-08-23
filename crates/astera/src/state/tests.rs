@@ -323,6 +323,28 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for TestClient {
     }
 }
 
+impl Dispatch<ZwlrLayerSurfaceV1, Arc<std::sync::atomic::AtomicBool>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        proxy: &ZwlrLayerSurfaceV1,
+        event: wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event,
+        closed: &Arc<std::sync::atomic::AtomicBool>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        match event {
+            wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event::Configure {
+                serial,
+                ..
+            } => proxy.ack_configure(serial),
+            wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::Event::Closed => {
+                closed.store(true, std::sync::atomic::Ordering::Release);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl Dispatch<XdgWmBase, ()> for TestClient {
     fn event(
         _state: &mut Self,
@@ -1071,6 +1093,69 @@ fn decoration_and_activation_globals_are_advertised() {
     );
     done_tx.send(()).unwrap();
     client.join().unwrap();
+}
+
+#[test]
+fn layer_surface_is_closed_when_its_output_is_removed() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    state
+        .connect_output(Output::new(
+            OutputId(1),
+            "layer-fallback-output",
+            Size::new(1024, 768),
+        ))
+        .unwrap();
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let client_closed = closed.clone();
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        // The initial output global is registered before the hotplugged fallback output.
+        let output = globals.bind::<WlOutput, _, _>(&queue, 1..=4, ()).unwrap();
+        let shell = globals
+            .bind::<ZwlrLayerShellV1, _, _>(&queue, 1..=4, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let layer = shell.get_layer_surface(
+            &surface,
+            Some(&output),
+            wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer::Top,
+            "hotplug-test".into(),
+            &queue,
+            client_closed.clone(),
+        );
+        layer.set_size(100, 100);
+        surface.commit();
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        while !client_closed.load(std::sync::atomic::Ordering::Acquire) {
+            events.blocking_dispatch(&mut TestClient).unwrap();
+        }
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state
+            .layers
+            .first()
+            .is_some_and(|layer| layer.output == OutputId(0))
+    });
+    state.disconnect_output(OutputId(0)).unwrap();
+    display.flush_clients().unwrap();
+    client.join().unwrap();
+    assert!(closed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(state.layers.is_empty());
 }
 
 #[test]
