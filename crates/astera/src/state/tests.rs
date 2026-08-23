@@ -613,6 +613,30 @@ fn dmabuf_with_a_render_node_advertises_version_four_feedback() {
 }
 
 #[test]
+fn removing_the_last_dmabuf_device_disables_stale_global_and_allows_recreation() {
+    let display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let format = smithay::backend::allocator::Format {
+        code: smithay::backend::allocator::Fourcc::Argb8888,
+        modifier: smithay::backend::allocator::Modifier::Linear,
+    };
+    state.enable_dmabuf(Some(1), [format]);
+    assert!(state.dmabuf_enabled);
+    assert_eq!(state.dmabuf_default_device, Some(1));
+    assert!(state.dmabuf_global.is_some());
+
+    state.unregister_dmabuf_device(1);
+    assert!(!state.dmabuf_enabled);
+    assert_eq!(state.dmabuf_default_device, None);
+    assert!(state.dmabuf_global.is_none());
+
+    state.enable_dmabuf(Some(2), [format]);
+    assert!(state.dmabuf_enabled);
+    assert_eq!(state.dmabuf_default_device, Some(2));
+    assert!(state.dmabuf_global.is_some());
+}
+
+#[test]
 fn second_input_method_is_unavailable_without_disconnect() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());

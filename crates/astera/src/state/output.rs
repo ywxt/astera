@@ -296,9 +296,19 @@ impl Astera {
             if let Some(replacement) = self.dmabuf_devices.keys().next().copied() {
                 self.rebase_dmabuf_feedback(replacement);
             } else {
+                // A v4 feedback object cannot represent "no render device". Stop advertising the
+                // stale global so newly connected clients do not receive formats for a GPU that no
+                // longer exists. The old global stays internally alive for bound resources, as
+                // required by Wayland, while a later GPU creates a fresh registry global.
+                if let Some(global) = self.dmabuf_global.take() {
+                    let display = self.display.clone();
+                    self.dmabuf_state.disable_global::<Self>(&display, &global);
+                }
+                self.dmabuf_enabled = false;
                 self.dmabuf_default_device = None;
                 self.dmabuf_default_formats.clear();
                 self.dmabuf_output_feedback.clear();
+                self.fail_pending_dmabuf_imports();
             }
         }
         self.refresh_requested_dmabuf_feedbacks();
