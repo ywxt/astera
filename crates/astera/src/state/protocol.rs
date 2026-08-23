@@ -371,16 +371,23 @@ impl WlrLayerShellHandler for Astera {
         layer: Layer,
         namespace: String,
     ) {
-        // A missing wl_output means the compositor-selected active output, as required by the
-        // layer-shell protocol; placement remains viewport-local to that output.
-        let output = output
-            .as_ref()
-            .and_then(|requested| {
-                self.output_runtime
-                    .iter()
-                    .find_map(|(id, runtime)| runtime.wayland.owns(requested).then_some(*id))
-            })
-            .unwrap_or(self.active_output);
+        // Only a NULL wl_output permits compositor-selected placement.  A resource for a removed
+        // output can outlive its global, but must not silently redirect a panel to another output.
+        let output = match output {
+            Some(requested) => self
+                .output_runtime
+                .iter()
+                .find_map(|(id, runtime)| runtime.wayland.owns(&requested).then_some(*id)),
+            None => self
+                .output_runtime
+                .contains_key(&self.active_output)
+                .then_some(self.active_output)
+                .or_else(|| self.output_runtime.keys().next().copied()),
+        };
+        let Some(output) = output else {
+            surface.send_close();
+            return;
+        };
         let mapped_surface = smithay::desktop::LayerSurface::new(surface.clone(), namespace);
         let id = self.next_layer_id;
         self.next_layer_id = self

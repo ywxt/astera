@@ -1216,6 +1216,73 @@ fn layer_surface_is_closed_when_its_output_is_removed() {
 }
 
 #[test]
+fn layer_surface_targeting_an_already_removed_output_is_closed() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    state
+        .connect_output(Output::new(
+            OutputId(1),
+            "layer-fallback-output",
+            Size::new(1024, 768),
+        ))
+        .unwrap();
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (bound_tx, bound_rx) = mpsc::sync_channel(0);
+    let (removed_tx, removed_rx) = mpsc::sync_channel(0);
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let client_closed = closed.clone();
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        // Keep the proxy alive after its global has been removed, reproducing the race between
+        // output hot-unplug and a client's get_layer_surface request.
+        let removed_output = globals.bind::<WlOutput, _, _>(&queue, 1..=4, ()).unwrap();
+        let shell = globals
+            .bind::<ZwlrLayerShellV1, _, _>(&queue, 1..=4, ())
+            .unwrap();
+        connection.flush().unwrap();
+        bound_tx.send(()).unwrap();
+        removed_rx.recv().unwrap();
+
+        let surface = compositor.create_surface(&queue, ());
+        let layer = shell.get_layer_surface(
+            &surface,
+            Some(&removed_output),
+            wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer::Top,
+            "stale-output-test".into(),
+            &queue,
+            client_closed.clone(),
+        );
+        layer.set_size(100, 100);
+        surface.commit();
+        connection.flush().unwrap();
+        while !client_closed.load(std::sync::atomic::Ordering::Acquire) {
+            events.blocking_dispatch(&mut TestClient).unwrap();
+        }
+    });
+
+    dispatch_until(&mut display, &mut state, |_| bound_rx.try_recv().is_ok());
+    state.disconnect_output(OutputId(0)).unwrap();
+    display.flush_clients().unwrap();
+    removed_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        closed.load(std::sync::atomic::Ordering::Acquire)
+    });
+    display.flush_clients().unwrap();
+    client.join().unwrap();
+    assert!(closed.load(std::sync::atomic::Ordering::Acquire));
+    assert!(state.layers.is_empty());
+}
+
+#[test]
 fn layer_exclusive_zone_reduces_usable_viewport() {
     use wayland_protocols_wlr::layer_shell::v1::client::{
         zwlr_layer_shell_v1::Layer,
