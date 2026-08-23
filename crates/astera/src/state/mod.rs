@@ -72,11 +72,11 @@ use smithay::{
             utils::{on_commit_buffer_handler, with_renderer_surface_state},
         },
     },
-    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
-    delegate_fractional_scale, delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit,
-    delegate_layer_shell, delegate_pointer_constraints, delegate_pointer_gestures,
-    delegate_relative_pointer, delegate_seat, delegate_shm, delegate_tablet_manager,
-    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_compositor, delegate_cursor_shape, delegate_dmabuf, delegate_fractional_scale,
+    delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit, delegate_layer_shell,
+    delegate_pointer_constraints, delegate_pointer_gestures, delegate_relative_pointer,
+    delegate_seat, delegate_shm, delegate_tablet_manager, delegate_viewporter,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -238,6 +238,7 @@ pub struct Astera {
     idle_notifications: BTreeMap<u64, smithay::reexports::wayland_protocols::ext::idle_notify::v1::server::ext_idle_notification_v1::ExtIdleNotificationV1>,
     next_idle_notification: u64,
     activation_tracker: ActivationTracker,
+    last_selection_serial: Option<Serial>,
 }
 
 impl Deref for Astera {
@@ -477,6 +478,7 @@ impl Astera {
             idle_notifications: BTreeMap::new(),
             next_idle_notification: 1,
             activation_tracker: ActivationTracker::default(),
+            last_selection_serial: None,
         }
     }
 

@@ -1192,6 +1192,64 @@ impl DataDeviceHandler for Astera {
     }
 }
 
+impl
+    smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_server::protocol::wl_data_device::WlDataDevice,
+        smithay::wayland::selection::data_device::DataDeviceUserData,
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &smithay::reexports::wayland_server::protocol::wl_data_device::WlDataDevice,
+        request: smithay::reexports::wayland_server::protocol::wl_data_device::Request,
+        data: &smithay::wayland::selection::data_device::DataDeviceUserData,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_server::protocol::wl_data_device::Request;
+        if let Request::SetSelection { serial, .. } = &request {
+            let serial = Serial::from(*serial);
+            let client_id = client.id();
+            let focused = state
+                .keyboard
+                .current_focus()
+                .and_then(|surface| surface.client())
+                .is_some_and(|focused| focused.id() == client_id);
+            let authorized = focused
+                && state
+                    .activation_tracker
+                    .authorizes_input(serial, &client_id, state.clock.now())
+                && state
+                    .last_selection_serial
+                    .is_none_or(|last| serial.is_no_older_than(&last));
+            if !authorized {
+                tracing::debug!(
+                    ?serial,
+                    ?client_id,
+                    "denying selection with invalid input serial"
+                );
+                return;
+            }
+            state.last_selection_serial = Some(serial);
+        }
+        <DataDeviceState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, resource, request, data, display, data_init,
+        );
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        client: ClientId,
+        resource: &smithay::reexports::wayland_server::protocol::wl_data_device::WlDataDevice,
+        data: &smithay::wayland::selection::data_device::DataDeviceUserData,
+    ) {
+        <DataDeviceState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::destroyed(
+            state, client, resource, data,
+        );
+    }
+}
+
 impl ClientDndGrabHandler for Astera {
     fn started(
         &mut self,
@@ -1414,5 +1472,14 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
 delegate_compositor!(Astera);
 delegate_shm!(Astera);
 delegate_seat!(Astera);
-delegate_data_device!(Astera);
+smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
+    smithay::reexports::wayland_server::protocol::wl_data_device_manager::WlDataDeviceManager: ()
+] => smithay::wayland::selection::data_device::DataDeviceState);
+smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
+    smithay::reexports::wayland_server::protocol::wl_data_device_manager::WlDataDeviceManager: ()
+] => smithay::wayland::selection::data_device::DataDeviceState);
+smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
+    smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource:
+    smithay::wayland::selection::data_device::DataSourceUserData
+] => smithay::wayland::selection::data_device::DataDeviceState);
 delegate_dmabuf!(Astera);

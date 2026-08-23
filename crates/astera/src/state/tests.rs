@@ -684,6 +684,59 @@ fn focused_client_receives_clipboard_selection_offer() {
 }
 
 #[test]
+fn clipboard_selection_rejects_an_unissued_serial() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (request_tx, request_rx) = mpsc::sync_channel(0);
+    let (sent_tx, sent_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, _events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = _events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let manager = globals
+            .bind::<WlDataDeviceManager, _, _>(&queue, 1..=3, ())
+            .unwrap();
+        let device = manager.get_data_device(&seat, &queue, mpsc::channel().0);
+        let source = manager.create_data_source(&queue, ());
+        source.offer("text/plain".into());
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        request_rx.recv().unwrap();
+        device.set_selection(Some(&source), 0xfeed_beef);
+        connection.flush().unwrap();
+        sent_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    state.map_toplevel(0);
+    request_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| sent_rx.try_recv().is_ok());
+    for _ in 0..8 {
+        display.dispatch_clients(&mut state).unwrap();
+    }
+    assert_eq!(state.last_selection_serial, None);
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
 fn clipboard_selection_transfers_requested_mime_bytes() {
     const PAYLOAD: &[u8] = b"astera clipboard payload";
 
@@ -733,7 +786,11 @@ fn clipboard_selection_transfers_requested_mime_bytes() {
     let serial = state.next_serial();
     let keyboard = state.keyboard.clone();
     let focused = state.windows[0].surface.wl_surface().clone();
+    let recipient = focused.client().unwrap().id();
     keyboard.set_focus(&mut state, Some(focused), serial);
+    state
+        .activation_tracker
+        .remember(serial, recipient, state.clock.now());
     serial_tx.send(serial.into()).unwrap();
 
     let (read_fd, write_fd) = rustix::pipe::pipe().unwrap();
