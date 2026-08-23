@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use astera_config::Config;
 use astera_core::{Output, OutputId, Size};
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::{
     backend::{
         allocator::{
@@ -36,7 +37,7 @@ use smithay::{
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent},
     },
-    desktop::PopupManager,
+    desktop::{PopupManager, utils::SurfacePresentationFeedback},
     reexports::{
         calloop::{EventLoop, LoopHandle, RegistrationToken},
         drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc, property::Value},
@@ -45,7 +46,7 @@ use smithay::{
         wayland_server::Display,
     },
     utils::{DeviceFd, Physical, Point},
-    wayland::security_context::SecurityContext,
+    wayland::{presentation::Refresh, security_context::SecurityContext},
 };
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
@@ -54,7 +55,7 @@ use crate::{
         native_policy::{ConnectorSnapshot, ModeCandidate, SnapshotSource, scan_outputs},
         render::{
             FrameCallback, PresentationCapture, PresentedFifoBarrier, complete_frame_callbacks,
-            surface_tree_snapshot,
+            complete_presentation_feedback, monotonic_time, surface_tree_snapshot,
         },
         runtime::{RenderRequest, RepaintReasons, RepaintScheduler},
         sources::{OneShotReadableFdSource, ReadableFdSource, WaylandSocketSource},
@@ -108,6 +109,7 @@ enum NativeEvent {
         frame_id: u64,
         callbacks: Vec<FrameCallback>,
         fifo_barriers: Vec<PresentedFifoBarrier>,
+        feedback: Vec<SurfacePresentationFeedback>,
         scanout: PreparedScanout,
     },
     WaylandClient(std::os::unix::net::UnixStream),
@@ -180,6 +182,7 @@ struct PendingNativeFrame {
     frame_id: u64,
     callbacks: Vec<FrameCallback>,
     fifo_barriers: Vec<PresentedFifoBarrier>,
+    feedback: Vec<SurfacePresentationFeedback>,
     queued: bool,
     deadline: Option<Instant>,
     lock_generation: Option<u64>,
@@ -190,6 +193,7 @@ struct PendingGpuFence {
     frame_id: u64,
     callbacks: Vec<FrameCallback>,
     fifo_barriers: Vec<PresentedFifoBarrier>,
+    feedback: Vec<SurfacePresentationFeedback>,
     sync: SyncPoint,
     deadline: Instant,
     delay: Duration,
@@ -451,8 +455,15 @@ impl NativeLoop {
                 frame_id,
                 callbacks,
                 fifo_barriers,
+                feedback,
                 scanout,
-            } => self.queue_prepared_frame(node, crtc, frame_id, callbacks, fifo_barriers, scanout),
+            } => self.queue_prepared_frame(
+                node,
+                crtc,
+                frame_id,
+                (callbacks, fifo_barriers, feedback),
+                scanout,
+            ),
             NativeEvent::WaylandClient(stream) => {
                 self.display
                     .handle()
@@ -776,7 +787,7 @@ impl NativeLoop {
                 return;
             }
         };
-        let Some(frame) = surface
+        let Some(mut frame) = surface
             .pending
             .take_if(|frame| frame.queued && frame.frame_id == frame_id)
         else {
@@ -800,6 +811,18 @@ impl NativeLoop {
                 .lock_frame_presented(surface.output, frame.lock_generation);
             let frame_time = self.started.elapsed().as_millis() as u32;
             complete_frame_callbacks(&frame.callbacks, frame_time);
+            if let Some(output) = self.state.protocol_output(surface.output) {
+                complete_presentation_feedback(
+                    &mut frame.feedback,
+                    &output,
+                    monotonic_time(),
+                    Refresh::fixed(surface.retrace),
+                    frame.frame_id,
+                    wp_presentation_feedback::Kind::Vsync
+                        | wp_presentation_feedback::Kind::HwClock
+                        | wp_presentation_feedback::Kind::HwCompletion,
+                );
+            }
             self.state.signal_fifo_barriers(&frame.fifo_barriers);
         }
     }
@@ -849,7 +872,7 @@ impl NativeLoop {
                     due.then(|| (surface.output, surface.pending.take().unwrap()))
                 })
                 .collect::<Vec<_>>();
-        for (output, frame) in ready {
+        for (output, mut frame) in ready {
             if self.scheduler.presented(output, frame.frame_id) {
                 let power_mode = frame.power_mode;
                 if power_mode.is_some()
@@ -873,6 +896,22 @@ impl NativeLoop {
                     &frame.callbacks,
                     self.started.elapsed().as_millis() as u32,
                 );
+                if let Some(protocol_output) = self.state.protocol_output(output) {
+                    complete_presentation_feedback(
+                        &mut frame.feedback,
+                        &protocol_output,
+                        monotonic_time(),
+                        Refresh::fixed(
+                            self.devices
+                                .values()
+                                .flat_map(|device| device.outputs.values())
+                                .find(|surface| surface.output == output)
+                                .map_or(DEFAULT_RETRACE, |surface| surface.retrace),
+                        ),
+                        frame.frame_id,
+                        wp_presentation_feedback::Kind::Vsync,
+                    );
+                }
                 self.state.signal_fifo_barriers(&frame.fifo_barriers);
             }
         }
@@ -917,6 +956,7 @@ impl NativeLoop {
                             fence.frame_id,
                             fence.callbacks,
                             fence.fifo_barriers,
+                            fence.feedback,
                             fence.scanout,
                         ));
                     } else if fence.expires_at <= now {
@@ -951,8 +991,14 @@ impl NativeLoop {
             tracing::warn!(?output, frame_id, "GPU fence timed out; retrying frame");
             self.scheduler.retry_at(output, frame_id, now + retrace);
         }
-        for (node, crtc, frame_id, callbacks, fifo_barriers, scanout) in ready {
-            self.queue_prepared_frame(node, crtc, frame_id, callbacks, fifo_barriers, scanout);
+        for (node, crtc, frame_id, callbacks, fifo_barriers, feedback, scanout) in ready {
+            self.queue_prepared_frame(
+                node,
+                crtc,
+                frame_id,
+                (callbacks, fifo_barriers, feedback),
+                scanout,
+            );
         }
     }
 
@@ -979,10 +1025,14 @@ impl NativeLoop {
         node: DrmNode,
         crtc: crtc::Handle,
         frame_id: u64,
-        callbacks: Vec<FrameCallback>,
-        fifo_barriers: Vec<PresentedFifoBarrier>,
+        signals: (
+            Vec<FrameCallback>,
+            Vec<PresentedFifoBarrier>,
+            Vec<SurfacePresentationFeedback>,
+        ),
         scanout: PreparedScanout,
     ) {
+        let (callbacks, fifo_barriers, feedback) = signals;
         let Some(surface) = self
             .devices
             .get_mut(&node)
@@ -1014,6 +1064,7 @@ impl NativeLoop {
             frame_id,
             callbacks,
             fifo_barriers,
+            feedback,
             queued: true,
             deadline: None,
             lock_generation: scanout.lock_generation,
@@ -1134,6 +1185,7 @@ impl NativeLoop {
         let PresentationCapture {
             callbacks,
             fifo_barriers,
+            feedback,
         } = presentation;
         let Some(surface) = self
             .devices
@@ -1161,6 +1213,7 @@ impl NativeLoop {
                         frame_id: request.frame_id,
                         callbacks,
                         fifo_barriers,
+                        feedback,
                         queued: false,
                         deadline: Some(Instant::now() + surface.retrace),
                         lock_generation,
@@ -1185,6 +1238,7 @@ impl NativeLoop {
                 if let Some(fence_fd) = sync.as_ref().and_then(|sync| sync.export()) {
                     let mut callbacks = Some(callbacks);
                     let mut fifo_barriers = Some(fifo_barriers);
+                    let mut feedback = Some(feedback);
                     let mut scanout = Some(scanout);
                     let registration = self.handle.insert_source(
                         OneShotReadableFdSource::new(fence_fd),
@@ -1197,6 +1251,9 @@ impl NativeLoop {
                                     .take()
                                     .expect("one-shot GPU fence fired more than once"),
                                 fifo_barriers: fifo_barriers
+                                    .take()
+                                    .expect("one-shot GPU fence fired more than once"),
+                                feedback: feedback
                                     .take()
                                     .expect("one-shot GPU fence fired more than once"),
                                 scanout: scanout
@@ -1232,6 +1289,7 @@ impl NativeLoop {
                             frame_id: request.frame_id,
                             callbacks,
                             fifo_barriers,
+                            feedback,
                             sync,
                             deadline: Instant::now() + FENCE_RECHECK_INITIAL,
                             delay: FENCE_RECHECK_INITIAL,
@@ -1261,6 +1319,7 @@ impl NativeLoop {
                             frame_id: request.frame_id,
                             callbacks,
                             fifo_barriers,
+                            feedback,
                             queued: true,
                             deadline: None,
                             lock_generation,

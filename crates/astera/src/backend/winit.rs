@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use astera_config::Config;
 use astera_ipc::Command;
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::{
     backend::{
         egl::EGLDevice,
@@ -27,12 +28,15 @@ use smithay::{
         wayland_server::Display,
     },
     utils::{Physical, Point, Transform},
-    wayland::security_context::SecurityContext,
+    wayland::{presentation::Refresh, security_context::SecurityContext},
 };
 
 use crate::{
     backend::{
-        render::{PresentationCapture, complete_frame_callbacks, surface_tree_snapshot},
+        render::{
+            PresentationCapture, complete_frame_callbacks, complete_presentation_feedback,
+            monotonic_time, surface_tree_snapshot,
+        },
         sources::{ReadableFdSource, WaylandSocketSource},
     },
     ipc_server::IpcServer,
@@ -81,6 +85,7 @@ struct WinitLoop {
     has_presented: bool,
     scene_dirty: bool,
     input_service: Option<InputServiceSupervisor>,
+    presentation_sequence: u64,
 }
 
 impl WinitLoop {
@@ -423,6 +428,17 @@ impl WinitLoop {
         self.has_presented = true;
         let frame_time = self.started.elapsed().as_millis() as u32;
         complete_frame_callbacks(&presentation.callbacks, frame_time);
+        self.presentation_sequence = self.presentation_sequence.wrapping_add(1);
+        if let Some(output) = self.state.protocol_output(astera_core::OutputId(0)) {
+            complete_presentation_feedback(
+                &mut presentation.feedback,
+                &output,
+                monotonic_time(),
+                Refresh::Unknown,
+                self.presentation_sequence,
+                wp_presentation_feedback::Kind::empty(),
+            );
+        }
         self.state.signal_fifo_barriers(&presentation.fifo_barriers);
         self.display.flush_clients()?;
         Ok(())
@@ -577,6 +593,7 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
         has_presented: false,
         scene_dirty: false,
         input_service,
+        presentation_sequence: 0,
     };
 
     tracing::info!(wayland_display = %socket_name, "nested compositor is ready");

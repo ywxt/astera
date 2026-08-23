@@ -2125,6 +2125,7 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
 ] => smithay::wayland::selection::primary_selection::PrimarySelectionState);
 delegate_dmabuf!(Astera);
 smithay::delegate_security_context!(Astera);
+delegate_presentation!(Astera);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
     smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::WpCommitTimingManagerV1: bool
 ] => smithay::wayland::commit_timing::CommitTimingManagerState);

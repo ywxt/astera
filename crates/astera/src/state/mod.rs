@@ -76,10 +76,10 @@ use smithay::{
     delegate_alpha_modifier, delegate_compositor, delegate_content_type, delegate_cursor_shape,
     delegate_dmabuf, delegate_fifo, delegate_foreign_toplevel_list, delegate_fractional_scale,
     delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit, delegate_layer_shell,
-    delegate_pointer_constraints, delegate_pointer_gestures, delegate_relative_pointer,
-    delegate_seat, delegate_shm, delegate_single_pixel_buffer, delegate_tablet_manager,
-    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_dialog,
-    delegate_xdg_shell,
+    delegate_pointer_constraints, delegate_pointer_gestures, delegate_presentation,
+    delegate_relative_pointer, delegate_seat, delegate_shm, delegate_single_pixel_buffer,
+    delegate_tablet_manager, delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration,
+    delegate_xdg_dialog, delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -135,6 +135,7 @@ use smithay::{
         output::{OutputHandler, OutputManagerState},
         pointer_constraints::PointerConstraintsState,
         pointer_gestures::PointerGesturesState,
+        presentation::PresentationState,
         relative_pointer::RelativePointerManagerState,
         security_context::{
             SecurityContext, SecurityContextHandler, SecurityContextListenerSource,
@@ -462,6 +463,7 @@ impl Astera {
                 .get_data::<ClientState>()
                 .is_some_and(|state| state.security_context.is_none())
         });
+        let presentation_state = PresentationState::new::<Self>(display, 1);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -509,6 +511,7 @@ impl Astera {
                 _fifo_manager_state: fifo_manager_state,
                 _commit_timing_manager_state: commit_timing_manager_state,
                 _security_context_state: security_context_state,
+                _presentation_state: presentation_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,

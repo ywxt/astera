@@ -3,14 +3,20 @@
 //! Frame callbacks are captured beside the exact surface that produced an
 //! element. Backends complete this immutable list only after presentation.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::{
     backend::renderer::{
         ImportAll, Renderer,
         element::{Kind, surface::WaylandSurfaceRenderElement},
         utils::RendererSurfaceStateUserData,
     },
+    desktop::utils::SurfacePresentationFeedback,
+    output::Output,
     reexports::wayland_server::{
         Resource,
         protocol::{wl_callback::WlCallback, wl_surface::WlSurface},
@@ -20,6 +26,7 @@ use smithay::{
         Barrier, SurfaceAttributes, SurfaceData, TraversalAction, with_states,
         with_surface_tree_downward,
     },
+    wayland::presentation::Refresh,
 };
 
 /// A presentation callback captured in the same surface-tree snapshot as its
@@ -57,6 +64,7 @@ pub struct PresentedFifoBarrier {
 pub struct PresentationCapture {
     pub callbacks: Vec<FrameCallback>,
     pub fifo_barriers: Vec<PresentedFifoBarrier>,
+    pub feedback: Vec<SurfacePresentationFeedback>,
 }
 
 pub fn surface_tree_snapshot<R>(
@@ -105,6 +113,12 @@ where
             ) {
                 Ok(Some(element)) => {
                     capture.callbacks.extend(frame_callbacks(surface, states));
+                    if let Some(feedback) = SurfacePresentationFeedback::from_states(
+                        states,
+                        wp_presentation_feedback::Kind::empty(),
+                    ) {
+                        capture.feedback.push(feedback);
+                    }
                     elements.push(element);
                 }
                 Ok(None) => {}
@@ -114,6 +128,27 @@ where
         |_, _, _| true,
     );
     elements
+}
+
+pub fn complete_presentation_feedback(
+    feedback: &mut [SurfacePresentationFeedback],
+    output: &Output,
+    time: Duration,
+    refresh: Refresh,
+    sequence: u64,
+    flags: wp_presentation_feedback::Kind,
+) {
+    for item in feedback {
+        item.presented(output, 1, time, refresh, sequence, flags);
+    }
+}
+
+pub fn monotonic_time() -> Duration {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    Duration::new(
+        u64::try_from(now.tv_sec).expect("monotonic clock cannot be negative"),
+        u32::try_from(now.tv_nsec).expect("monotonic nanoseconds must fit u32"),
+    )
 }
 
 /// Complete only callbacks captured by a successfully submitted frame.

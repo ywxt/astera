@@ -72,6 +72,9 @@ use wayland_protocols::wp::{
         zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1,
         zwp_pointer_gestures_v1::ZwpPointerGesturesV1,
     },
+    presentation_time::client::{
+        wp_presentation::WpPresentation, wp_presentation_feedback::WpPresentationFeedback,
+    },
     primary_selection::zv1::client::{
         zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1,
         zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
@@ -219,7 +222,30 @@ delegate_noop!(TestClient: ignore WpCommitTimingManagerV1);
 delegate_noop!(TestClient: ignore WpCommitTimerV1);
 delegate_noop!(TestClient: ignore WpSecurityContextManagerV1);
 delegate_noop!(TestClient: ignore WpSecurityContextV1);
+delegate_noop!(TestClient: ignore WpPresentation);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
+
+impl Dispatch<WpPresentationFeedback, mpsc::Sender<bool>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpPresentationFeedback,
+        event: wayland_protocols::wp::presentation_time::client::wp_presentation_feedback::Event,
+        presented: &mpsc::Sender<bool>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback::Event;
+        match event {
+            Event::Presented { .. } => {
+                let _ = presented.send(true);
+            }
+            Event::Discarded => {
+                let _ = presented.send(false);
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<ExtForeignToplevelListV1, ()> for TestClient {
     wayland_client::event_created_child!(TestClient, ExtForeignToplevelListV1, [
@@ -595,6 +621,69 @@ fn security_context_accepts_sandboxed_clients_and_hides_its_manager() {
     done_tx.send(()).unwrap();
     creator_thread.join().unwrap();
     std::fs::remove_file(socket_path).unwrap();
+}
+
+#[test]
+fn presentation_feedback_is_committed_and_completed_once() {
+    use smithay::{
+        desktop::utils::SurfacePresentationFeedback,
+        wayland::{compositor::with_states, presentation::Refresh},
+    };
+    use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (presented_tx, presented_rx) = mpsc::channel();
+    let (complete_tx, complete_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let presentation = globals
+            .bind::<WpPresentation, _, _>(&queue, 1..=2, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        let _feedback = presentation.feedback(&surface, &queue, presented_tx);
+        surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+        complete_rx.recv().unwrap();
+        events.blocking_dispatch(&mut TestClient).unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    let surface = state.windows[0].surface.wl_surface().clone();
+    let mut feedback = with_states(&surface, |states| {
+        SurfacePresentationFeedback::from_states(states, wp_presentation_feedback::Kind::ZeroCopy)
+            .unwrap()
+    });
+    crate::backend::render::complete_presentation_feedback(
+        std::slice::from_mut(&mut feedback),
+        &state.protocol_output(OutputId(0)).unwrap(),
+        crate::backend::render::monotonic_time(),
+        Refresh::fixed(Duration::from_millis(16)),
+        42,
+        wp_presentation_feedback::Kind::Vsync,
+    );
+    display.flush_clients().unwrap();
+    complete_tx.send(()).unwrap();
+    assert!(presented_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+    client.join().unwrap();
 }
 
 #[test]
