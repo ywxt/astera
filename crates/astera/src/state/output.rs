@@ -428,14 +428,15 @@ impl Astera {
         let mut instances: Vec<_> = self
             .windows
             .iter()
-            .filter_map(|mapped| {
+            .enumerate()
+            .filter_map(|(index, mapped)| {
                 let (origin, _, scale, mode) =
                     self.visual_geometry_for_output(output, mapped.id)?;
-                let layer = mode_layer(mode);
-                Some((layer, &mapped.surface, origin, scale, mode))
+                let order = self.window_stack_key(output, mapped.id, mode, index);
+                Some((order, &mapped.surface, origin, scale, mode))
             })
             .collect();
-        instances.sort_by_key(|(layer, _, _, _, _)| std::cmp::Reverse(*layer));
+        instances.sort_by_key(|(order, _, _, _, _)| std::cmp::Reverse(*order));
         instances
             .into_iter()
             .map(move |(_, surface, origin, scale, mode)| {

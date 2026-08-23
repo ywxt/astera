@@ -49,6 +49,7 @@ impl Astera {
             let Some((origin, size, scale, mode)) = self.visual_geometry(mapped.id) else {
                 continue;
             };
+            let order = self.window_stack_key(self.active_output, mapped.id, mode, index);
             if point_inside(location, origin, size, scale) {
                 let local = SmithayPoint::from((
                     (location.x - origin.x as f64) / scale,
@@ -63,7 +64,7 @@ impl Astera {
                     WindowSurfaceType::ALL,
                 ) {
                     candidates.push((
-                        (mode_layer(mode), index, 0usize),
+                        (order.0, order.1, order.2, 0usize),
                         surface,
                         (
                             origin.x as f64 + f64::from(offset.x) * scale,
@@ -95,7 +96,7 @@ impl Astera {
                         WindowSurfaceType::ALL,
                     ) {
                         candidates.push((
-                            (mode_layer(mode), index, popup_stack_rank(popup_index)),
+                            (order.0, order.1, order.2, popup_stack_rank(popup_index)),
                             surface,
                             (
                                 popup_origin.x as f64 + f64::from(offset.x) * scale,
@@ -128,7 +129,7 @@ impl Astera {
                     WindowSurfaceType::ALL,
                 ) {
                     candidates.push((
-                        (order, index, 0),
+                        (order, 0, index, 0),
                         surface,
                         (
                             origin.x as f64 + f64::from(offset.x),
@@ -160,7 +161,7 @@ impl Astera {
                         WindowSurfaceType::ALL,
                     ) {
                         candidates.push((
-                            (order, index, popup_stack_rank(popup_index)),
+                            (order, 0, index, popup_stack_rank(popup_index)),
                             surface,
                             (
                                 popup_origin.x as f64 + f64::from(offset.x),
@@ -181,6 +182,26 @@ impl Astera {
 
     pub(super) fn visual_geometry(&self, id: WindowId) -> Option<(Point, Size, f64, WindowMode)> {
         self.visual_geometry_for_output(self.active_output, id)
+    }
+
+    pub(super) fn window_stack_key(
+        &self,
+        output: OutputId,
+        id: WindowId,
+        mode: WindowMode,
+        insertion_index: usize,
+    ) -> (u8, usize, usize) {
+        let focus_rank = self
+            .desktop
+            .workspace_for_output(output)
+            .and_then(|workspace| {
+                workspace
+                    .focus_history
+                    .iter()
+                    .position(|candidate| *candidate == id)
+            })
+            .map_or(0, |index| index + 1);
+        window_stack_key(mode, focus_rank, insertion_index)
     }
 
     pub(super) fn visual_geometry_for_output(
@@ -237,9 +258,18 @@ fn popup_stack_rank(index: usize) -> usize {
     usize::MAX - index
 }
 
+fn window_stack_key(
+    mode: WindowMode,
+    focus_rank: usize,
+    insertion_index: usize,
+) -> (u8, usize, usize) {
+    (mode_layer(mode), focus_rank, insertion_index)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::popup_stack_rank;
+    use super::{popup_stack_rank, window_stack_key};
+    use astera_core::WindowMode;
 
     #[test]
     fn popup_hit_order_keeps_children_above_parents_and_roots() {
@@ -247,5 +277,15 @@ mod tests {
         let parent = popup_stack_rank(1);
         assert!(child > parent);
         assert!(parent > 0);
+    }
+
+    #[test]
+    fn window_stack_order_prefers_layer_then_recent_focus() {
+        let tiled = window_stack_key(WindowMode::Tiled, 3, 2);
+        let old_floating = window_stack_key(WindowMode::Floating, 1, 5);
+        let focused_floating = window_stack_key(WindowMode::Floating, 2, 0);
+
+        assert!(old_floating > tiled);
+        assert!(focused_floating > old_floating);
     }
 }
