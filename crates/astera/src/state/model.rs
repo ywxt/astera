@@ -14,6 +14,7 @@ use smithay::{
     wayland::{
         alpha_modifier::AlphaModifierState,
         compositor::CompositorState,
+        content_type::ContentTypeState,
         cursor_shape::CursorShapeManagerState,
         dmabuf::DmabufState,
         foreign_toplevel_list::{ForeignToplevelHandle, ForeignToplevelListState},
@@ -68,6 +69,7 @@ pub struct ProtocolState {
     pub(super) _single_pixel_buffer_state: SinglePixelBufferState,
     pub(super) _alpha_modifier_state: AlphaModifierState,
     pub(super) foreign_toplevel_list_state: ForeignToplevelListState,
+    pub(super) _content_type_state: ContentTypeState,
     pub(super) dmabuf_state: DmabufState,
     pub(super) popup_manager: PopupManager,
     pub(super) seat: Seat<Astera>,

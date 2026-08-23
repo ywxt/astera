@@ -39,6 +39,9 @@ use wayland_protocols::wp::{
         wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1,
         wp_alpha_modifier_v1::WpAlphaModifierV1,
     },
+    content_type::v1::client::{
+        wp_content_type_manager_v1::WpContentTypeManagerV1, wp_content_type_v1::WpContentTypeV1,
+    },
     cursor_shape::v1::client::{
         wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
         wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
@@ -197,6 +200,8 @@ delegate_noop!(TestClient: ignore ZwpPrimarySelectionSourceV1);
 delegate_noop!(TestClient: ignore WpSinglePixelBufferManagerV1);
 delegate_noop!(TestClient: ignore WpAlphaModifierV1);
 delegate_noop!(TestClient: ignore WpAlphaModifierSurfaceV1);
+delegate_noop!(TestClient: ignore WpContentTypeManagerV1);
+delegate_noop!(TestClient: ignore WpContentTypeV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
 
 impl Dispatch<ExtForeignToplevelListV1, ()> for TestClient {
@@ -1444,6 +1449,109 @@ fn alpha_modifier_is_double_buffered_with_surface_commit() {
             .multiplier()
     });
     assert_eq!(multiplier, Some(FACTOR));
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn content_type_is_double_buffered_and_can_be_recreated() {
+    use smithay::reexports::wayland_protocols::wp::content_type::v1::server::wp_content_type_v1::Type;
+    use smithay::wayland::content_type::ContentTypeSurfaceCachedState;
+
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (requested_tx, requested_rx) = mpsc::sync_channel(0);
+    let (commit_tx, commit_rx) = mpsc::sync_channel(0);
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (destroy_tx, destroy_rx) = mpsc::sync_channel(0);
+    let (destroyed_tx, destroyed_rx) = mpsc::sync_channel(0);
+    let (reset_tx, reset_rx) = mpsc::sync_channel(0);
+    let (reset_committed_tx, reset_committed_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let manager = globals
+            .bind::<WpContentTypeManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        let content = manager.get_surface_content_type(&surface, &queue, ());
+        content.set_content_type(
+            wayland_protocols::wp::content_type::v1::client::wp_content_type_v1::Type::Video,
+        );
+        connection.flush().unwrap();
+        requested_tx.send(()).unwrap();
+
+        commit_rx.recv().unwrap();
+        surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+
+        destroy_rx.recv().unwrap();
+        content.destroy();
+        let replacement = manager.get_surface_content_type(&surface, &queue, ());
+        replacement.destroy();
+        connection.flush().unwrap();
+        destroyed_tx.send(()).unwrap();
+
+        reset_rx.recv().unwrap();
+        surface.commit();
+        connection.flush().unwrap();
+        reset_committed_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        requested_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    let content_type = |state: &Astera| {
+        with_states(state.windows[0].surface.wl_surface(), |states| {
+            *states
+                .cached_state
+                .get::<ContentTypeSurfaceCachedState>()
+                .current()
+                .content_type()
+        })
+    };
+    assert_eq!(content_type(&state), Type::None);
+
+    commit_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        content_type(state) == Type::Video
+    });
+
+    destroy_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        destroyed_rx.try_recv().is_ok()
+    });
+    for _ in 0..8 {
+        display.dispatch_clients(&mut state).unwrap();
+    }
+    assert_eq!(content_type(&state), Type::Video);
+
+    reset_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        reset_committed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        content_type(state) == Type::None
+    });
     done_tx.send(()).unwrap();
     client.join().unwrap();
 }

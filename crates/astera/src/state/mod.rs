@@ -73,12 +73,12 @@ use smithay::{
             utils::{on_commit_buffer_handler, with_renderer_surface_state},
         },
     },
-    delegate_alpha_modifier, delegate_compositor, delegate_cursor_shape, delegate_dmabuf,
-    delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_inhibit,
-    delegate_keyboard_shortcuts_inhibit, delegate_layer_shell, delegate_pointer_constraints,
-    delegate_pointer_gestures, delegate_relative_pointer, delegate_seat, delegate_shm,
-    delegate_single_pixel_buffer, delegate_tablet_manager, delegate_viewporter,
-    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_alpha_modifier, delegate_compositor, delegate_content_type, delegate_cursor_shape,
+    delegate_dmabuf, delegate_foreign_toplevel_list, delegate_fractional_scale,
+    delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit, delegate_layer_shell,
+    delegate_pointer_constraints, delegate_pointer_gestures, delegate_relative_pointer,
+    delegate_seat, delegate_shm, delegate_single_pixel_buffer, delegate_tablet_manager,
+    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -111,6 +111,7 @@ use smithay::{
             CompositorClientState, CompositorHandler, CompositorState, TraversalAction,
             with_states, with_surface_tree_downward,
         },
+        content_type::ContentTypeState,
         cursor_shape::CursorShapeManagerState,
         dmabuf::{
             DmabufFeedback, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
@@ -374,6 +375,7 @@ impl Astera {
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(display);
         let alpha_modifier_state = AlphaModifierState::new::<Self>(display);
         let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(display);
+        let content_type_state = ContentTypeState::new::<Self>(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -416,6 +418,7 @@ impl Astera {
                 _single_pixel_buffer_state: single_pixel_buffer_state,
                 _alpha_modifier_state: alpha_modifier_state,
                 foreign_toplevel_list_state,
+                _content_type_state: content_type_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,

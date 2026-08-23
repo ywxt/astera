@@ -2022,6 +2022,7 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
     smithay::wayland::output::OutputUserData
 ] => smithay::wayland::output::OutputManagerState);
 delegate_compositor!(Astera);
+delegate_content_type!(Astera);
 delegate_alpha_modifier!(Astera);
 delegate_shm!(Astera);
 delegate_single_pixel_buffer!(Astera);
