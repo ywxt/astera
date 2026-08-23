@@ -1397,6 +1397,14 @@ impl
         );
         if update_touch_icon {
             state.dnd_touch_icon = state.dnd_icon.is_some().then_some(touch_icon).flatten();
+            if state.dnd_touch_icon.is_some() {
+                // `ClientDndGrabHandler::started` runs inside the delegated request before this
+                // wrapper can identify the touch slot. Recompute enter/leave and preferred scale
+                // now that the icon's real output is known instead of leaving it on the pointer
+                // output until an unrelated scene change.
+                state.mark_render_dirty();
+                state.refresh_visible_scales();
+            }
         }
     }
 

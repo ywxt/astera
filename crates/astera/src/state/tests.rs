@@ -2363,6 +2363,17 @@ fn frame_callback_snapshot_does_not_relock_surface_tree_state() {
     state.dnd_touch_icon = Some((OutputId(0), Some(7).into(), (48.0, 64.0).into()));
     let (_, location, _) = state.dnd_icon_render_source(OutputId(0)).unwrap();
     assert_eq!(location, (48, 64).into());
+    state
+        .connect_output(Output::new(
+            OutputId(1),
+            "touch-dnd-output",
+            Size::new(800, 600),
+        ))
+        .unwrap();
+    state.dnd_touch_icon = Some((OutputId(1), Some(7).into(), (20.0, 25.0).into()));
+    assert!(state.dnd_icon_render_source(OutputId(0)).is_none());
+    let (_, location, _) = state.dnd_icon_render_source(OutputId(1)).unwrap();
+    assert_eq!(location, (20, 25).into());
     <Astera as ClientDndGrabHandler>::dropped(&mut state, None, false, seat);
     assert!(state.dnd_icon_render_source(OutputId(0)).is_none());
     assert!(state.dnd_touch_icon.is_none());
