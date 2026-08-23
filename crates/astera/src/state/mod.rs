@@ -596,6 +596,7 @@ impl Astera {
             self.active_output = next;
         }
         self.reflow_outputs();
+        self.configure_fullscreen_windows();
         tracing::info!(?output, ?event, "output disconnected");
         self.refresh_requested_dmabuf_feedbacks();
         self.refresh_visible_scales();

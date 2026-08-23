@@ -1833,6 +1833,79 @@ fn interactive_resize_preserves_opposite_edge_and_client_limits() {
 }
 
 #[test]
+fn output_removal_reconfigures_migrated_fullscreen_window() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    state
+        .connect_output(Output::new(
+            OutputId(1),
+            "fullscreen-fallback-output",
+            Size::new(1024, 768),
+        ))
+        .unwrap();
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    state.map_toplevel(0);
+    let window = state.windows[0].id;
+    let workspace = state.desktop.find_window(window).unwrap();
+    state
+        .desktop
+        .apply_window(
+            workspace,
+            WindowTransaction::SetMode {
+                id: window,
+                mode: WindowMode::Fullscreen,
+                viewport_size: Size::new(1280, 720),
+            },
+        )
+        .unwrap();
+    state.configure_window_mode(window, WindowMode::Fullscreen);
+    assert_eq!(
+        state.windows[0]
+            .surface
+            .with_pending_state(|pending| pending.size),
+        Some((1280, 720).into())
+    );
+
+    state.disconnect_output(OutputId(0)).unwrap();
+    assert_eq!(
+        state.desktop.workspace_location(workspace).unwrap().output,
+        Some(OutputId(1))
+    );
+    assert_eq!(
+        state.windows[0]
+            .surface
+            .with_pending_state(|pending| pending.size),
+        Some((1024, 768).into())
+    );
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
 fn hotplug_moves_disconnected_workspaces_to_primary() {
     let display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
