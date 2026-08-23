@@ -1731,6 +1731,71 @@ fn uncommitted_toplevel_does_not_map_and_role_destroy_cleans_up() {
 }
 
 #[test]
+fn toplevel_buffer_before_ack_configure_is_rejected() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let shm = globals.bind::<WlShm, _, _>(&queue, 1..=1, ()).unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        let fd = rustix::fs::memfd_create(
+            "astera-unconfigured-toplevel-test",
+            rustix::fs::MemfdFlags::CLOEXEC,
+        )
+        .unwrap();
+        rustix::fs::ftruncate(&fd, 4).unwrap();
+        let pool = shm.create_pool(fd.as_fd(), 4, &queue, ());
+        let buffer = pool.create_buffer(
+            0,
+            1,
+            1,
+            4,
+            wayland_client::protocol::wl_shm::Format::Argb8888,
+            &queue,
+            (),
+        );
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+        result_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    let mut rejected = None;
+    dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
+        Ok(value) => {
+            rejected = Some(value);
+            true
+        }
+        Err(_) => false,
+    });
+    assert_eq!(rejected, Some(true));
+    assert!(state.windows.iter().all(|window| !window.mapped));
+    client.join().unwrap();
+}
+
+#[test]
 fn initial_toplevel_mode_requests_are_retained_until_mapping() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());

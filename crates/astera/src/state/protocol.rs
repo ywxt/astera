@@ -290,6 +290,11 @@ impl CompositorHandler for Astera {
             .position(|window| window.surface.wl_surface() == surface)
         {
             let has_buffer = committed_buffer;
+            if has_buffer && !self.windows[index].surface.ensure_configured() {
+                // xdg-shell forbids attaching a buffer until the client has acknowledged a
+                // configure. ensure_configured posts the required not_constructed error.
+                return;
+            }
             match (self.windows[index].mapped, has_buffer) {
                 (false, true) => self.map_toplevel(index),
                 (true, false) => self.unmap_toplevel(index),
