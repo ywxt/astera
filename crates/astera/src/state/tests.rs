@@ -104,6 +104,10 @@ use wayland_protocols::wp::{
     },
     viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter},
 };
+use wayland_protocols::xdg::foreign::zv2::client::{
+    zxdg_exported_v2::ZxdgExportedV2, zxdg_exporter_v2::ZxdgExporterV2,
+    zxdg_imported_v2::ZxdgImportedV2, zxdg_importer_v2::ZxdgImporterV2,
+};
 use wayland_protocols::xdg::shell::client::{
     xdg_popup::XdgPopup, xdg_positioner::XdgPositioner, xdg_surface::XdgSurface,
     xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
@@ -233,7 +237,45 @@ delegate_noop!(TestClient: ignore ExtDataControlManagerV1);
 delegate_noop!(TestClient: ignore ExtDataControlDeviceV1);
 delegate_noop!(TestClient: ignore ExtDataControlOfferV1);
 delegate_noop!(TestClient: ignore ExtDataControlSourceV1);
+delegate_noop!(TestClient: ignore ZxdgExporterV2);
+delegate_noop!(TestClient: ignore ZxdgImporterV2);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
+
+impl Dispatch<ZxdgExportedV2, mpsc::Sender<String>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZxdgExportedV2,
+        event: wayland_protocols::xdg::foreign::zv2::client::zxdg_exported_v2::Event,
+        handle: &mpsc::Sender<String>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if let wayland_protocols::xdg::foreign::zv2::client::zxdg_exported_v2::Event::Handle {
+            handle: value,
+        } = event
+        {
+            let _ = handle.send(value);
+        }
+    }
+}
+
+impl Dispatch<ZxdgImportedV2, mpsc::Sender<()>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZxdgImportedV2,
+        event: wayland_protocols::xdg::foreign::zv2::client::zxdg_imported_v2::Event,
+        destroyed: &mpsc::Sender<()>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if matches!(
+            event,
+            wayland_protocols::xdg::foreign::zv2::client::zxdg_imported_v2::Event::Destroyed
+        ) {
+            let _ = destroyed.send(());
+        }
+    }
+}
 
 impl Dispatch<WpPresentationFeedback, mpsc::Sender<bool>> for TestClient {
     fn event(
@@ -2073,6 +2115,121 @@ fn xdg_dialog_tracks_modal_parent_and_can_be_recreated() {
     dispatch_until(&mut display, &mut state, |state| !dialog_state(state).0);
     done_tx.send(()).unwrap();
     client.join().unwrap();
+}
+
+#[test]
+fn xdg_foreign_links_cross_client_parent_and_revokes_it_with_export() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (parent_server, parent_client) = UnixStream::pair().unwrap();
+    let (child_server, child_client) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(parent_server, Arc::new(ClientState::default()))
+        .unwrap();
+    display
+        .handle()
+        .insert_client(child_server, Arc::new(ClientState::default()))
+        .unwrap();
+
+    let (handle_tx, handle_rx) = mpsc::channel();
+    let (revoke_tx, revoke_rx) = mpsc::sync_channel(0);
+    let (parent_done_tx, parent_done_rx) = mpsc::sync_channel(0);
+    let parent = thread::spawn(move || {
+        let connection = Connection::from_socket(parent_client).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let exporter = globals
+            .bind::<ZxdgExporterV2, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+        toplevel.set_app_id("org.astera.Parent".into());
+        let exported = exporter.export_toplevel(&surface, &queue, handle_tx);
+        surface.commit();
+        connection.flush().unwrap();
+        events.blocking_dispatch(&mut TestClient).unwrap();
+        revoke_rx.recv().unwrap();
+        exported.destroy();
+        connection.flush().unwrap();
+        parent_done_rx.recv().unwrap();
+    });
+
+    let handle = loop {
+        display.dispatch_clients(&mut state).unwrap();
+        display.flush_clients().unwrap();
+        if let Ok(handle) = handle_rx.try_recv() {
+            break handle;
+        }
+        thread::yield_now();
+    };
+    let (linked_tx, linked_rx) = mpsc::sync_channel(0);
+    let (check_tx, check_rx) = mpsc::sync_channel(0);
+    let (destroyed_tx, destroyed_rx) = mpsc::channel();
+    let (observed_tx, observed_rx) = mpsc::sync_channel(0);
+    let child = thread::spawn(move || {
+        let connection = Connection::from_socket(child_client).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let importer = globals
+            .bind::<ZxdgImporterV2, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+        toplevel.set_app_id("org.astera.Child".into());
+        let imported = importer.import_toplevel(handle, &queue, destroyed_tx);
+        imported.set_parent_of(&surface);
+        surface.commit();
+        connection.flush().unwrap();
+        linked_tx.send(()).unwrap();
+        check_rx.recv().unwrap();
+        loop {
+            if destroyed_rx.try_recv().is_ok() {
+                observed_tx.send(true).unwrap();
+                break;
+            }
+            events.blocking_dispatch(&mut TestClient).unwrap();
+        }
+    });
+
+    dispatch_until(&mut display, &mut state, |_| linked_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 2);
+    let parent_surface = state.windows[0].surface.wl_surface().clone();
+    let child_surface = state.windows[1].surface.wl_surface().clone();
+    let foreign_parent = || {
+        with_states(&child_surface, |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .parent
+                .clone()
+        })
+    };
+    dispatch_until(&mut display, &mut state, |_| {
+        foreign_parent().as_ref() == Some(&parent_surface)
+    });
+
+    revoke_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| foreign_parent().is_none());
+    display.flush_clients().unwrap();
+    check_tx.send(()).unwrap();
+    assert!(observed_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+    parent_done_tx.send(()).unwrap();
+    parent.join().unwrap();
+    child.join().unwrap();
 }
 
 #[test]

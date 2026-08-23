@@ -142,6 +142,7 @@ dependencies = [
  "astera-ipc",
  "clap",
  "input",
+ "rand",
  "rustix 1.1.4",
  "serde_json",
  "smithay",

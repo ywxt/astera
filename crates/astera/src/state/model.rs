@@ -50,7 +50,7 @@ use smithay::{
     },
 };
 
-use super::Astera;
+use super::{Astera, xdg_foreign::XdgForeignState};
 
 /// Wayland protocol objects are grouped separately from desktop and interaction state. Keeping
 /// this ownership boundary explicit makes protocol delegate additions independent of `Astera`'s
@@ -87,6 +87,7 @@ pub struct ProtocolState {
     pub(super) _commit_timing_manager_state: CommitTimingManagerState,
     pub(super) _security_context_state: SecurityContextState,
     pub(super) _presentation_state: PresentationState,
+    pub(super) xdg_foreign_state: XdgForeignState,
     pub(super) dmabuf_state: DmabufState,
     pub(super) popup_manager: PopupManager,
     pub(super) seat: Seat<Astera>,

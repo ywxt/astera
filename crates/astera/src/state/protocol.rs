@@ -574,6 +574,10 @@ impl XdgShellHandler for Astera {
         tracing::debug!(window = ?id, "toplevel role created");
     }
 
+    fn parent_changed(&mut self, _surface: ToplevelSurface) {
+        self.mark_public_dirty();
+    }
+
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
         let geometry = self.constrain_popup_geometry(&surface, positioner);
         surface.with_pending_state(|state| {

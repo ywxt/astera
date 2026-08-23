@@ -31,6 +31,7 @@ mod session_lock;
 mod snapshot;
 mod tablet_input;
 mod touch;
+mod xdg_foreign;
 
 use activation::ActivationTracker;
 use clock::{Clock, SystemClock};
@@ -477,6 +478,7 @@ impl Astera {
                 .is_some_and(|state| state.security_context.is_none())
         });
         let presentation_state = PresentationState::new::<Self>(display, 1);
+        let xdg_foreign_state = xdg_foreign::XdgForeignState::new(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -526,6 +528,7 @@ impl Astera {
                 _commit_timing_manager_state: commit_timing_manager_state,
                 _security_context_state: security_context_state,
                 _presentation_state: presentation_state,
+                xdg_foreign_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
