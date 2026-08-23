@@ -1369,14 +1369,14 @@ impl Astera {
                     self.mark_public_dirty();
                 }
                 self.sync_keyboard_focus();
-            } else if let Some((layer, target, interactivity)) =
+            } else if let Some((layer, _target, interactivity)) =
                 self.layer_keyboard_target(&surface)
             {
                 self.on_demand_layer_focus =
                     (interactivity == KeyboardInteractivity::OnDemand).then_some(layer);
-                let keyboard = self.keyboard.clone();
-                let serial = self.next_serial();
-                keyboard.set_focus(self, Some(target), serial);
+                // Route every click through the common arbiter. A top/overlay exclusive layer
+                // must remain focused even when another on-demand layer is clicked.
+                self.sync_keyboard_focus();
             }
         }
         // Scene-changing IPC/workspace actions may have changed the surface below a stationary

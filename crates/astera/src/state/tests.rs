@@ -762,6 +762,7 @@ fn session_lock_revokes_a_silent_virtual_keyboard() {
         .insert_client(server_socket, Arc::new(ClientState::trusted_input()))
         .unwrap();
     let (created_tx, created_rx) = mpsc::sync_channel(0);
+    let (check_tx, check_rx) = mpsc::sync_channel(0);
     let (revoked_tx, revoked_rx) = mpsc::sync_channel(0);
     let client = thread::spawn(move || {
         let connection = Connection::from_socket(client_socket).unwrap();
@@ -776,6 +777,7 @@ fn session_lock_revokes_a_silent_virtual_keyboard() {
         let _keyboard = manager.create_virtual_keyboard(&seat, &queue, ());
         connection.flush().unwrap();
         created_tx.send(()).unwrap();
+        check_rx.recv().unwrap();
         revoked_tx
             .send(events.roundtrip(&mut TestClient).is_err())
             .unwrap();
@@ -787,6 +789,7 @@ fn session_lock_revokes_a_silent_virtual_keyboard() {
     });
     state.secure_input_for_lock();
     display.flush_clients().unwrap();
+    check_tx.send(()).unwrap();
     let mut revoked = false;
     dispatch_until(&mut display, &mut state, |_| match revoked_rx.try_recv() {
         Ok(value) => {
@@ -1687,6 +1690,19 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
         layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
         surface.commit();
 
+        let exclusive_surface = compositor.create_surface(&queue, ());
+        let exclusive_layer = shell.get_layer_surface(
+            &exclusive_surface,
+            None,
+            Layer::Overlay,
+            "exclusive-test".into(),
+            &queue,
+            (),
+        );
+        exclusive_layer.set_size(1, 1);
+        exclusive_layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        exclusive_surface.commit();
+
         let popup_surface = compositor.create_surface(&queue, ());
         let popup_xdg_surface = xdg.get_xdg_surface(&popup_surface, &queue, ());
         let positioner = xdg.create_positioner(&queue, ());
@@ -1753,17 +1769,15 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
     assert_eq!(state.keyboard.current_focus(), Some(layer_surface.clone()));
     state.sync_keyboard_focus();
     assert_eq!(state.keyboard.current_focus(), Some(layer_surface));
-    with_states(state.layers[0].surface.wl_surface(), |states| {
-        states
-            .cached_state
-            .get::<LayerSurfaceCachedState>()
-            .current()
-            .keyboard_interactivity =
-            smithay::wayland::shell::wlr_layer::KeyboardInteractivity::Exclusive;
-    });
-    state.on_demand_layer_focus = None;
+    assert_eq!(state.layers.len(), 2);
+    state.layers[1].mapped = true;
+    state.on_demand_layer_focus = Some(state.layers[0].id);
     state.sync_keyboard_focus();
     assert!(state.exclusive_layer_has_keyboard_focus());
+    assert_eq!(
+        state.keyboard.current_focus(),
+        Some(state.layers[1].surface.wl_surface().clone())
+    );
     state.key_repeat.register(
         smithay::backend::input::Keycode::new(30),
         BindingModifiers::default(),
@@ -1773,9 +1787,15 @@ fn layer_exclusive_zone_reduces_usable_viewport() {
     );
     state.process_key_repeats();
     assert!(state.key_repeat.deadline().is_none());
-    state.layers[0].mapped = false;
+    state.layers[1].mapped = false;
     state.sync_keyboard_focus();
     assert!(!state.exclusive_layer_has_keyboard_focus());
+    assert_eq!(
+        state.keyboard.current_focus(),
+        Some(state.layers[0].surface.wl_surface().clone())
+    );
+    state.layers[0].mapped = false;
+    state.sync_keyboard_focus();
     assert_eq!(state.on_demand_layer_focus, None);
     let generation = state.render_generation();
     destroy_popup_tx.send(()).unwrap();
