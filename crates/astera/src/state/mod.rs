@@ -74,12 +74,12 @@ use smithay::{
         },
     },
     delegate_alpha_modifier, delegate_compositor, delegate_content_type, delegate_cursor_shape,
-    delegate_dmabuf, delegate_fifo, delegate_foreign_toplevel_list, delegate_fractional_scale,
-    delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit, delegate_layer_shell,
-    delegate_pointer_constraints, delegate_pointer_gestures, delegate_presentation,
-    delegate_relative_pointer, delegate_seat, delegate_shm, delegate_single_pixel_buffer,
-    delegate_tablet_manager, delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration,
-    delegate_xdg_dialog, delegate_xdg_shell,
+    delegate_dmabuf, delegate_ext_data_control, delegate_fifo, delegate_foreign_toplevel_list,
+    delegate_fractional_scale, delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit,
+    delegate_layer_shell, delegate_pointer_constraints, delegate_pointer_gestures,
+    delegate_presentation, delegate_relative_pointer, delegate_seat, delegate_shm,
+    delegate_single_pixel_buffer, delegate_tablet_manager, delegate_viewporter,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_dialog, delegate_xdg_shell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -146,6 +146,10 @@ use smithay::{
             data_device::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
                 set_data_device_focus,
+            },
+            ext_data_control::{
+                DataControlHandler as ExtDataControlHandler,
+                DataControlState as ExtDataControlState,
             },
             primary_selection::{
                 PrimarySelectionHandler, PrimarySelectionState, set_primary_focus,
@@ -451,6 +455,15 @@ impl Astera {
         let touch = touch::add_touch(&mut seat);
         let data_device_state = DataDeviceState::new::<Self>(display);
         let primary_selection_state = PrimarySelectionState::new::<Self>(display);
+        let ext_data_control_state = ExtDataControlState::new::<Self, _>(
+            display,
+            Some(&primary_selection_state),
+            |client| {
+                client
+                    .get_data::<ClientState>()
+                    .is_some_and(|state| state.security_context.is_none())
+            },
+        );
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(display);
         let alpha_modifier_state = AlphaModifierState::new::<Self>(display);
         let foreign_toplevel_list_state = ForeignToplevelListState::new::<Self>(display);
@@ -503,6 +516,7 @@ impl Astera {
                 seat_state,
                 data_device_state,
                 primary_selection_state,
+                ext_data_control_state,
                 _single_pixel_buffer_state: single_pixel_buffer_state,
                 _alpha_modifier_state: alpha_modifier_state,
                 foreign_toplevel_list_state,

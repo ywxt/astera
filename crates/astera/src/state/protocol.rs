@@ -1376,6 +1376,12 @@ impl SelectionHandler for Astera {
     type SelectionUserData = ();
 }
 
+impl ExtDataControlHandler for Astera {
+    fn data_control_state(&self) -> &ExtDataControlState {
+        &self.ext_data_control_state
+    }
+}
+
 impl SecurityContextHandler for Astera {
     fn context_created(&mut self, source: SecurityContextListenerSource, context: SecurityContext) {
         self.pending_security_contexts.push((source, context));
@@ -2126,6 +2132,7 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
 delegate_dmabuf!(Astera);
 smithay::delegate_security_context!(Astera);
 delegate_presentation!(Astera);
+delegate_ext_data_control!(Astera);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
     smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::WpCommitTimingManagerV1: bool
 ] => smithay::wayland::commit_timing::CommitTimingManagerState);

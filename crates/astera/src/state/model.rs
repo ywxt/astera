@@ -28,7 +28,11 @@ use smithay::{
         pointer_gestures::PointerGesturesState,
         presentation::PresentationState,
         security_context::SecurityContextState,
-        selection::{data_device::DataDeviceState, primary_selection::PrimarySelectionState},
+        selection::{
+            data_device::DataDeviceState,
+            ext_data_control::DataControlState as ExtDataControlState,
+            primary_selection::PrimarySelectionState,
+        },
         shell::{
             wlr_layer::{Layer, WlrLayerShellState},
             xdg::{
@@ -73,6 +77,7 @@ pub struct ProtocolState {
     pub(super) seat_state: SeatState<Astera>,
     pub(super) data_device_state: DataDeviceState,
     pub(super) primary_selection_state: PrimarySelectionState,
+    pub(super) ext_data_control_state: ExtDataControlState,
     pub(super) _single_pixel_buffer_state: SinglePixelBufferState,
     pub(super) _alpha_modifier_state: AlphaModifierState,
     pub(super) foreign_toplevel_list_state: ForeignToplevelListState,

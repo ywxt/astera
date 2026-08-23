@@ -21,6 +21,12 @@ use wayland_client::{
         wl_shm_pool::WlShmPool, wl_surface::WlSurface,
     },
 };
+use wayland_protocols::ext::data_control::v1::client::{
+    ext_data_control_device_v1::ExtDataControlDeviceV1,
+    ext_data_control_manager_v1::ExtDataControlManagerV1,
+    ext_data_control_offer_v1::ExtDataControlOfferV1,
+    ext_data_control_source_v1::ExtDataControlSourceV1,
+};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::{
     ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1,
     ext_foreign_toplevel_list_v1::ExtForeignToplevelListV1,
@@ -223,6 +229,10 @@ delegate_noop!(TestClient: ignore WpCommitTimerV1);
 delegate_noop!(TestClient: ignore WpSecurityContextManagerV1);
 delegate_noop!(TestClient: ignore WpSecurityContextV1);
 delegate_noop!(TestClient: ignore WpPresentation);
+delegate_noop!(TestClient: ignore ExtDataControlManagerV1);
+delegate_noop!(TestClient: ignore ExtDataControlDeviceV1);
+delegate_noop!(TestClient: ignore ExtDataControlOfferV1);
+delegate_noop!(TestClient: ignore ExtDataControlSourceV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
 
 impl Dispatch<WpPresentationFeedback, mpsc::Sender<bool>> for TestClient {
@@ -524,7 +534,7 @@ fn attach_one_pixel_buffer(
 }
 
 #[test]
-fn security_context_accepts_sandboxed_clients_and_hides_its_manager() {
+fn security_context_accepts_clients_and_hides_privileged_managers() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
     let (server_socket, client_socket) = UnixStream::pair().unwrap();
@@ -550,6 +560,17 @@ fn security_context_accepts_sandboxed_clients_and_hides_its_manager() {
         let manager = globals
             .bind::<WpSecurityContextManagerV1, _, _>(&queue, 1..=1, ())
             .unwrap();
+        let data_control = globals
+            .bind::<ExtDataControlManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let source = data_control.create_data_source(&queue, ());
+        source.offer("text/plain;charset=utf-8".into());
+        let primary_source = data_control.create_data_source(&queue, ());
+        primary_source.offer("text/plain".into());
+        let device = data_control.get_data_device(&seat, &queue, ());
+        device.set_selection(Some(&source));
+        device.set_primary_selection(Some(&primary_source));
         let context = manager.create_listener(listener.as_fd(), close_read.as_fd(), &queue, ());
         context.set_sandbox_engine("bubblewrap".into());
         context.set_app_id("org.example.App".into());
@@ -608,13 +629,16 @@ fn security_context_accepts_sandboxed_clients_and_hides_its_manager() {
                 globals
                     .bind::<WpSecurityContextManagerV1, _, _>(&queue, 1..=1, ())
                     .is_err(),
+                globals
+                    .bind::<ExtDataControlManagerV1, _, _>(&queue, 1..=1, ())
+                    .is_err(),
             ))
             .unwrap();
     });
     dispatch_until(&mut display, &mut state, |_| {
         visibility_rx
             .try_recv()
-            .is_ok_and(|visible| visible == (true, true))
+            .is_ok_and(|visible| visible == (true, true, true))
     });
 
     sandbox.join().unwrap();
