@@ -165,6 +165,14 @@ impl DmabufHandler for Astera {
         notifier: ImportNotifier,
     ) {
         // Renderer ownership lives in the backend, so validation is deferred until its next tick.
+        if !dmabuf_import_queue_has_capacity(self.pending_dmabufs.len()) {
+            tracing::warn!(
+                pending = self.pending_dmabufs.len(),
+                "rejecting dmabuf import because the validation queue is full"
+            );
+            notifier.failed();
+            return;
+        }
         self.pending_dmabufs.push((dmabuf, notifier));
     }
 
@@ -176,6 +184,12 @@ impl DmabufHandler for Astera {
         self.dmabuf_feedback_surfaces.insert(surface.clone());
         self.dmabuf_feedback_for_surface(surface)
     }
+}
+
+const MAX_PENDING_DMABUF_IMPORTS: usize = 256;
+
+fn dmabuf_import_queue_has_capacity(pending: usize) -> bool {
+    pending < MAX_PENDING_DMABUF_IMPORTS
 }
 
 impl Astera {
@@ -1459,8 +1473,9 @@ fn popup_grab_source(pointer: bool, touch: bool) -> Option<PopupGrabSource> {
 #[cfg(test)]
 mod data_device_tests {
     use super::{
-        PopupGrabSource, implicit_grab_authorizes_origin, implicit_grab_authorizes_surface,
-        popup_grab_source, select_interactive_grab,
+        MAX_PENDING_DMABUF_IMPORTS, PopupGrabSource, dmabuf_import_queue_has_capacity,
+        implicit_grab_authorizes_origin, implicit_grab_authorizes_surface, popup_grab_source,
+        select_interactive_grab,
     };
 
     #[test]
@@ -1521,6 +1536,17 @@ mod data_device_tests {
         );
         assert_eq!(popup_grab_source(false, true), Some(PopupGrabSource::Touch));
         assert_eq!(popup_grab_source(false, false), None);
+    }
+
+    #[test]
+    fn dmabuf_import_queue_rejects_the_first_excess_resource() {
+        assert!(dmabuf_import_queue_has_capacity(
+            MAX_PENDING_DMABUF_IMPORTS - 1
+        ));
+        assert!(!dmabuf_import_queue_has_capacity(
+            MAX_PENDING_DMABUF_IMPORTS
+        ));
+        assert!(!dmabuf_import_queue_has_capacity(usize::MAX));
     }
 }
 
