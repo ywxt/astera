@@ -76,9 +76,9 @@ fn capability_is_valid<C: PartialEq>(
 ) -> bool {
     inputs.retain(|(_, _, issued)| now.saturating_duration_since(*issued) <= ACTIVATION_TIMEOUT);
     now.saturating_duration_since(token_timestamp) <= ACTIVATION_TIMEOUT
-        && inputs
-            .iter()
-            .any(|(known, recipient, _)| *known == serial && recipient == client)
+        && inputs.iter().any(|(known, recipient, issued)| {
+            *known == serial && recipient == client && *issued <= token_timestamp
+        })
 }
 
 #[cfg(test)]
@@ -121,6 +121,21 @@ mod tests {
         let mut inputs = VecDeque::from([(7.into(), 1_u8, old)]);
         assert!(!capability_is_valid(&mut inputs, 7.into(), &1, old, now,));
         assert!(inputs.is_empty());
+    }
+
+    #[test]
+    fn token_cannot_be_authorized_by_an_input_issued_after_it_was_committed() {
+        let now = Instant::now();
+        let token_timestamp = now - Duration::from_millis(1);
+        let mut inputs = VecDeque::from([(7.into(), "focused", now)]);
+
+        assert!(!capability_is_valid(
+            &mut inputs,
+            7.into(),
+            &"focused",
+            token_timestamp,
+            now,
+        ));
     }
 
     #[test]
