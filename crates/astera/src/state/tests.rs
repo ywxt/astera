@@ -1247,6 +1247,8 @@ fn decoration_and_activation_globals_are_advertised() {
     state.request_activation(token.clone(), data, target);
     assert!(state.windows[0].urgent);
     assert!(state.xdg_activation_state.data_for_token(&token).is_none());
+    state.cursor_image_status =
+        smithay::input::pointer::CursorImageStatus::Surface(constrained.clone());
     destroy_surface_tx.send(()).unwrap();
     dispatch_until(&mut display, &mut state, |_| {
         surface_destroyed_rx.try_recv().is_ok()
@@ -1257,6 +1259,11 @@ fn decoration_and_activation_globals_are_advertised() {
     assert!(
         state.idle_inhibitors.is_empty(),
         "idle inhibitors must stop affecting compositor state when their surface is destroyed"
+    );
+    assert_eq!(
+        state.cursor_image_status,
+        smithay::input::pointer::CursorImageStatus::Hidden,
+        "destroying the current cursor surface must release the stale resource"
     );
     done_tx.send(()).unwrap();
     client.join().unwrap();

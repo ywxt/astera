@@ -348,6 +348,22 @@ impl CompositorHandler for Astera {
         if self.dnd_icon.as_ref() == Some(surface) {
             self.dnd_icon = None;
         }
+        if matches!(
+            &self.cursor_image_status,
+            smithay::input::pointer::CursorImageStatus::Surface(current) if current == surface
+        ) {
+            // wl_pointer leaves the image undefined after its cursor surface disappears.  Do not
+            // retain and repeatedly try to render a dead Wayland resource.
+            self.cursor_image_status = smithay::input::pointer::CursorImageStatus::Hidden;
+        }
+        for runtime in self.tablet_tools.values_mut() {
+            if matches!(
+                &runtime.cursor_image,
+                smithay::input::pointer::CursorImageStatus::Surface(current) if current == surface
+            ) {
+                runtime.cursor_image = smithay::input::pointer::CursorImageStatus::Hidden;
+            }
+        }
         // An idle inhibitor can outlive its wl_surface object. The protocol no longer allows it
         // to suppress idle once that surface has left the visible scene, so resume timers now
         // instead of waiting for the inhibitor object itself to be destroyed.
