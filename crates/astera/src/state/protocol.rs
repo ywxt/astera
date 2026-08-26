@@ -325,6 +325,7 @@ impl CompositorHandler for Astera {
         let was_entered = entered_output.is_some();
         on_commit_buffer_handler::<Self>(surface);
         self.apply_pending_toplevel_icon(surface);
+        self.apply_pending_tearing_hint(surface);
         self.track_fifo_barrier(surface, entered_output.unwrap_or(self.active_output));
         self.validate_lock_surface_commit(surface);
         self.popup_manager.commit(surface);
@@ -438,6 +439,7 @@ impl CompositorHandler for Astera {
     fn destroyed(&mut self, surface: &WlSurface) {
         self.dmabuf_feedback_surfaces.remove(surface);
         self.pending_toplevel_icons.remove(surface);
+        self.remove_tearing_control_surface(surface);
         self.commit_timer_surfaces.remove(surface);
         let was_visible = self
             .output_runtime

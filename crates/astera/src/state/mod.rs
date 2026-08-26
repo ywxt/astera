@@ -30,6 +30,7 @@ mod session_lock;
 #[cfg(test)]
 mod snapshot;
 mod tablet_input;
+mod tearing_control;
 mod touch;
 mod xdg_foreign;
 mod xdg_toplevel_icon;
@@ -286,6 +287,9 @@ pub struct Astera {
     pending_security_contexts: Vec<(SecurityContextListenerSource, SecurityContext)>,
     pending_toplevel_icons: HashMap<WlSurface, Option<xdg_toplevel_icon::IconSnapshot>>,
     toplevel_icon_resources: Vec<smithay::reexports::wayland_protocols::xdg::toplevel_icon::v1::server::xdg_toplevel_icon_v1::XdgToplevelIconV1>,
+    tearing_controls: HashMap<WlSurface, smithay::reexports::wayland_protocols::wp::tearing_control::v1::server::wp_tearing_control_v1::WpTearingControlV1>,
+    pending_tearing_hints: HashMap<WlSurface, bool>,
+    asynchronous_surfaces: HashSet<WlSurface>,
 }
 
 impl Deref for Astera {
@@ -489,6 +493,7 @@ impl Astera {
         let xdg_system_bell_state = XdgSystemBellState::new::<Self>(display);
         let xdg_toplevel_tag_state = xdg_toplevel_tag::XdgToplevelTagState::new(display);
         let xdg_toplevel_icon_state = xdg_toplevel_icon::XdgToplevelIconState::new(display);
+        let tearing_control_state = tearing_control::TearingControlState::new(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -542,6 +547,7 @@ impl Astera {
                 _xdg_system_bell_state: xdg_system_bell_state,
                 _xdg_toplevel_tag_state: xdg_toplevel_tag_state,
                 _xdg_toplevel_icon_state: xdg_toplevel_icon_state,
+                _tearing_control_state: tearing_control_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
@@ -645,6 +651,9 @@ impl Astera {
             pending_security_contexts: Vec::new(),
             pending_toplevel_icons: HashMap::new(),
             toplevel_icon_resources: Vec::new(),
+            tearing_controls: HashMap::new(),
+            pending_tearing_hints: HashMap::new(),
+            asynchronous_surfaces: HashSet::new(),
         }
     }
 

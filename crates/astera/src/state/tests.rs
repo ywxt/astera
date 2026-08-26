@@ -99,6 +99,10 @@ use wayland_protocols::wp::{
     tablet::zv2::client::{
         zwp_tablet_manager_v2::ZwpTabletManagerV2, zwp_tablet_seat_v2::ZwpTabletSeatV2,
     },
+    tearing_control::v1::client::{
+        wp_tearing_control_manager_v1::WpTearingControlManagerV1,
+        wp_tearing_control_v1::{self, WpTearingControlV1},
+    },
     text_input::zv3::client::{
         zwp_text_input_manager_v3::ZwpTextInputManagerV3, zwp_text_input_v3::ZwpTextInputV3,
     },
@@ -248,6 +252,8 @@ delegate_noop!(TestClient: ignore XdgSystemBellV1);
 delegate_noop!(TestClient: ignore XdgToplevelTagManagerV1);
 delegate_noop!(TestClient: ignore XdgToplevelIconManagerV1);
 delegate_noop!(TestClient: ignore XdgToplevelIconV1);
+delegate_noop!(TestClient: ignore WpTearingControlManagerV1);
+delegate_noop!(TestClient: ignore WpTearingControlV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
 
 impl Dispatch<ZxdgExportedV2, mpsc::Sender<String>> for TestClient {
@@ -2459,6 +2465,124 @@ fn toplevel_icon_is_double_buffered_and_immutable_without_server_panic() {
 
     inspect_tx.send(()).unwrap();
     dispatch_until(&mut display, &mut state, |_| mutated_rx.try_recv().is_ok());
+    display.flush_clients().unwrap();
+    let mut rejected = false;
+    dispatch_until(&mut display, &mut state, |_| match error_rx.try_recv() {
+        Ok(value) => {
+            rejected = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(rejected);
+    client.join().unwrap();
+}
+
+#[test]
+fn tearing_hint_is_double_buffered_and_destroy_restores_vsync() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (set_tx, set_rx) = mpsc::sync_channel(0);
+    let (commit_tx, commit_rx) = mpsc::sync_channel(0);
+    let (destroy_tx, destroy_rx) = mpsc::sync_channel(0);
+    let (reset_tx, reset_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let manager = globals
+            .bind::<WpTearingControlManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let control = manager.get_tearing_control(&surface, &queue, ());
+        control.set_presentation_hint(wp_tearing_control_v1::PresentationHint::Async);
+        connection.flush().unwrap();
+        set_tx.send(()).unwrap();
+
+        commit_rx.recv().unwrap();
+        surface.commit();
+        connection.flush().unwrap();
+
+        destroy_rx.recv().unwrap();
+        control.destroy();
+        connection.flush().unwrap();
+
+        reset_rx.recv().unwrap();
+        surface.commit();
+        connection.flush().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| set_rx.try_recv().is_ok());
+    display.dispatch_clients(&mut state).unwrap();
+    let surface = state
+        .tearing_controls
+        .keys()
+        .next()
+        .expect("client created tearing control")
+        .clone();
+    assert_eq!(state.pending_tearing_hints.get(&surface), Some(&true));
+    assert!(!state.asynchronous_surfaces.contains(&surface));
+
+    commit_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |state| {
+        state.asynchronous_surfaces.contains(&surface)
+    });
+
+    destroy_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |state| {
+        !state.tearing_controls.contains_key(&surface)
+    });
+    assert!(state.asynchronous_surfaces.contains(&surface));
+    assert_eq!(state.pending_tearing_hints.get(&surface), Some(&false));
+
+    reset_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |state| {
+        !state.asynchronous_surfaces.contains(&surface)
+    });
+    client.join().unwrap();
+}
+
+#[test]
+fn duplicate_tearing_control_is_rejected_without_server_panic() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (sent_tx, sent_rx) = mpsc::sync_channel(0);
+    let (error_tx, error_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let manager = globals
+            .bind::<WpTearingControlManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let _first = manager.get_tearing_control(&surface, &queue, ());
+        let _duplicate = manager.get_tearing_control(&surface, &queue, ());
+        connection.flush().unwrap();
+        sent_tx.send(()).unwrap();
+        error_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| sent_rx.try_recv().is_ok());
+    display.dispatch_clients(&mut state).unwrap();
     display.flush_clients().unwrap();
     let mut rejected = false;
     dispatch_until(&mut display, &mut state, |_| match error_rx.try_recv() {
