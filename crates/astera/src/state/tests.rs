@@ -113,6 +113,9 @@ use wayland_protocols::xdg::shell::client::{
     xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
 };
 use wayland_protocols::xdg::system_bell::v1::client::xdg_system_bell_v1::XdgSystemBellV1;
+use wayland_protocols::xdg::toplevel_icon::v1::client::{
+    xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, xdg_toplevel_icon_v1::XdgToplevelIconV1,
+};
 use wayland_protocols::xdg::toplevel_tag::v1::client::xdg_toplevel_tag_manager_v1::XdgToplevelTagManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1, zxdg_output_v1::ZxdgOutputV1,
@@ -243,6 +246,8 @@ delegate_noop!(TestClient: ignore ZxdgExporterV2);
 delegate_noop!(TestClient: ignore ZxdgImporterV2);
 delegate_noop!(TestClient: ignore XdgSystemBellV1);
 delegate_noop!(TestClient: ignore XdgToplevelTagManagerV1);
+delegate_noop!(TestClient: ignore XdgToplevelIconManagerV1);
+delegate_noop!(TestClient: ignore XdgToplevelIconV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
 
 impl Dispatch<ZxdgExportedV2, mpsc::Sender<String>> for TestClient {
@@ -2352,6 +2357,118 @@ fn toplevel_tag_keeps_tag_and_accessible_description_distinct() {
     );
 
     done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn toplevel_icon_is_double_buffered_and_immutable_without_server_panic() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (set_tx, set_rx) = mpsc::sync_channel(0);
+    let (pending_tx, pending_rx) = mpsc::sync_channel(0);
+    let (commit_tx, commit_rx) = mpsc::sync_channel(0);
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (inspect_tx, inspect_rx) = mpsc::sync_channel(0);
+    let (mutated_tx, mutated_rx) = mpsc::sync_channel(0);
+    let (error_tx, error_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let shm = globals.bind::<WlShm, _, _>(&queue, 1..=1, ()).unwrap();
+        let icons = globals
+            .bind::<XdgToplevelIconManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+        surface.commit();
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+
+        set_rx.recv().unwrap();
+        let fd = rustix::fs::memfd_create("astera-icon", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+        rustix::fs::ftruncate(&fd, 16 * 16 * 4).unwrap();
+        let pool = shm.create_pool(fd.as_fd(), 16 * 16 * 4, &queue, ());
+        let buffer = pool.create_buffer(
+            0,
+            16,
+            16,
+            16 * 4,
+            wayland_client::protocol::wl_shm::Format::Argb8888,
+            &queue,
+            (),
+        );
+        let icon = icons.create_icon(&queue, ());
+        icon.set_name("org.astera.Editor".into());
+        icon.add_buffer(&buffer, 1);
+        icons.set_icon(&toplevel, Some(&icon));
+        connection.flush().unwrap();
+        pending_tx.send(()).unwrap();
+
+        commit_rx.recv().unwrap();
+        surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+        inspect_rx.recv().unwrap();
+
+        icon.set_name("must-fail".into());
+        connection.flush().unwrap();
+        mutated_tx.send(()).unwrap();
+        error_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 1);
+    set_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| pending_rx.try_recv().is_ok());
+    for _ in 0..4 {
+        display.dispatch_clients(&mut state).unwrap();
+    }
+    assert!(state.windows[0].icon_name.is_none());
+    assert!(state.windows[0].icon_buffers.is_empty());
+
+    commit_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        committed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        state.windows[0].icon_name.as_deref() == Some("org.astera.Editor")
+            && state.windows[0].icon_buffers == [(16, 1)]
+    });
+    state.map_toplevel(0);
+    assert_eq!(
+        state.public_snapshot().windows[0]
+            .metadata
+            .icon_name
+            .as_deref(),
+        Some("org.astera.Editor")
+    );
+
+    inspect_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| mutated_rx.try_recv().is_ok());
+    display.flush_clients().unwrap();
+    let mut rejected = false;
+    dispatch_until(&mut display, &mut state, |_| match error_rx.try_recv() {
+        Ok(value) => {
+            rejected = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(rejected);
     client.join().unwrap();
 }
 

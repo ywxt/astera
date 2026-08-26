@@ -32,6 +32,7 @@ mod snapshot;
 mod tablet_input;
 mod touch;
 mod xdg_foreign;
+mod xdg_toplevel_icon;
 mod xdg_toplevel_tag;
 
 use activation::ActivationTracker;
@@ -283,6 +284,8 @@ pub struct Astera {
         BTreeMap<OutputId, Vec<crate::backend::render::PresentedFifoBarrier>>,
     commit_timer_surfaces: HashSet<WlSurface>,
     pending_security_contexts: Vec<(SecurityContextListenerSource, SecurityContext)>,
+    pending_toplevel_icons: HashMap<WlSurface, Option<xdg_toplevel_icon::IconSnapshot>>,
+    toplevel_icon_resources: Vec<smithay::reexports::wayland_protocols::xdg::toplevel_icon::v1::server::xdg_toplevel_icon_v1::XdgToplevelIconV1>,
 }
 
 impl Deref for Astera {
@@ -485,6 +488,7 @@ impl Astera {
         let xdg_foreign_state = xdg_foreign::XdgForeignState::new(display);
         let xdg_system_bell_state = XdgSystemBellState::new::<Self>(display);
         let xdg_toplevel_tag_state = xdg_toplevel_tag::XdgToplevelTagState::new(display);
+        let xdg_toplevel_icon_state = xdg_toplevel_icon::XdgToplevelIconState::new(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -537,6 +541,7 @@ impl Astera {
                 xdg_foreign_state,
                 _xdg_system_bell_state: xdg_system_bell_state,
                 _xdg_toplevel_tag_state: xdg_toplevel_tag_state,
+                _xdg_toplevel_icon_state: xdg_toplevel_icon_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
@@ -638,6 +643,8 @@ impl Astera {
             pending_fifo_barriers: BTreeMap::new(),
             commit_timer_surfaces: HashSet::new(),
             pending_security_contexts: Vec::new(),
+            pending_toplevel_icons: HashMap::new(),
+            toplevel_icon_resources: Vec::new(),
         }
     }
 

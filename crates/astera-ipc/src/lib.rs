@@ -551,6 +551,8 @@ pub mod wire {
             pub tag: Option<String>,
             #[serde(default)]
             pub description: Option<String>,
+            #[serde(default)]
+            pub icon_name: Option<String>,
         }
 
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

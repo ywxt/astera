@@ -1,7 +1,9 @@
 use super::*;
 
 impl BufferHandler for Astera {
-    fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+    fn buffer_destroyed(&mut self, buffer: &wl_buffer::WlBuffer) {
+        self.icon_buffer_destroyed(buffer);
+    }
 }
 
 impl IdleInhibitHandler for Astera {
@@ -322,6 +324,7 @@ impl CompositorHandler for Astera {
         });
         let was_entered = entered_output.is_some();
         on_commit_buffer_handler::<Self>(surface);
+        self.apply_pending_toplevel_icon(surface);
         self.track_fifo_barrier(surface, entered_output.unwrap_or(self.active_output));
         self.validate_lock_surface_commit(surface);
         self.popup_manager.commit(surface);
@@ -434,6 +437,7 @@ impl CompositorHandler for Astera {
 
     fn destroyed(&mut self, surface: &WlSurface) {
         self.dmabuf_feedback_surfaces.remove(surface);
+        self.pending_toplevel_icons.remove(surface);
         self.commit_timer_surfaces.remove(surface);
         let was_visible = self
             .output_runtime
@@ -601,6 +605,8 @@ impl XdgShellHandler for Astera {
             urgent: false,
             tag: None,
             description: None,
+            icon_name: None,
+            icon_buffers: Vec::new(),
             foreign_toplevel,
         });
         tracing::debug!(window = ?id, "toplevel role created");

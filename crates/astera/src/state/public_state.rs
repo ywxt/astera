@@ -223,6 +223,7 @@ impl Astera {
                                 app_id: attributes.app_id.clone(),
                                 tag: mapped.tag.clone(),
                                 description: mapped.description.clone(),
+                                icon_name: mapped.icon_name.clone(),
                             }
                         })
                         .unwrap_or_default()
