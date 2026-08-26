@@ -599,6 +599,8 @@ impl XdgShellHandler for Astera {
             mapped: false,
             initial_mode: None,
             urgent: false,
+            tag: None,
+            description: None,
             foreign_toplevel,
         });
         tracing::debug!(window = ?id, "toplevel role created");

@@ -221,6 +221,8 @@ impl Astera {
                             WindowMetadata {
                                 title: attributes.title.clone(),
                                 app_id: attributes.app_id.clone(),
+                                tag: mapped.tag.clone(),
+                                description: mapped.description.clone(),
                             }
                         })
                         .unwrap_or_default()

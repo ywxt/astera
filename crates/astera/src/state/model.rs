@@ -51,7 +51,7 @@ use smithay::{
     },
 };
 
-use super::{Astera, xdg_foreign::XdgForeignState};
+use super::{Astera, xdg_foreign::XdgForeignState, xdg_toplevel_tag::XdgToplevelTagState};
 
 /// Wayland protocol objects are grouped separately from desktop and interaction state. Keeping
 /// this ownership boundary explicit makes protocol delegate additions independent of `Astera`'s
@@ -90,6 +90,7 @@ pub struct ProtocolState {
     pub(super) _presentation_state: PresentationState,
     pub(super) xdg_foreign_state: XdgForeignState,
     pub(super) _xdg_system_bell_state: XdgSystemBellState,
+    pub(super) _xdg_toplevel_tag_state: XdgToplevelTagState,
     pub(super) dmabuf_state: DmabufState,
     pub(super) popup_manager: PopupManager,
     pub(super) seat: Seat<Astera>,
@@ -110,6 +111,8 @@ pub(super) struct MappedWindow {
     pub(super) initial_mode: Option<WindowMode>,
     /// Set when an activation was denied; cleared once the window legitimately receives focus.
     pub(super) urgent: bool,
+    pub(super) tag: Option<String>,
+    pub(super) description: Option<String>,
     pub(super) foreign_toplevel: ForeignToplevelHandle,
 }
 

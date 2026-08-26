@@ -113,6 +113,7 @@ use wayland_protocols::xdg::shell::client::{
     xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
 };
 use wayland_protocols::xdg::system_bell::v1::client::xdg_system_bell_v1::XdgSystemBellV1;
+use wayland_protocols::xdg::toplevel_tag::v1::client::xdg_toplevel_tag_manager_v1::XdgToplevelTagManagerV1;
 use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1, zxdg_output_v1::ZxdgOutputV1,
 };
@@ -241,6 +242,7 @@ delegate_noop!(TestClient: ignore ExtDataControlSourceV1);
 delegate_noop!(TestClient: ignore ZxdgExporterV2);
 delegate_noop!(TestClient: ignore ZxdgImporterV2);
 delegate_noop!(TestClient: ignore XdgSystemBellV1);
+delegate_noop!(TestClient: ignore XdgToplevelTagManagerV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
 
 impl Dispatch<ZxdgExportedV2, mpsc::Sender<String>> for TestClient {
@@ -2295,6 +2297,58 @@ fn system_bell_marks_target_urgent_and_flash_expires_on_timer() {
     assert_ne!(
         state.next_visual_timer_deadline(),
         Some(start + Duration::from_millis(150))
+    );
+
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
+fn toplevel_tag_keeps_tag_and_accessible_description_distinct() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (updated_tx, updated_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let tags = globals
+            .bind::<XdgToplevelTagManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+        tags.set_toplevel_tag(&toplevel, "settings".into());
+        tags.set_toplevel_description(&toplevel, "Application preferences".into());
+        surface.commit();
+        connection.flush().unwrap();
+        updated_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| updated_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state.windows.len() == 1
+            && state.windows[0].tag.as_deref() == Some("settings")
+            && state.windows[0].description.as_deref() == Some("Application preferences")
+    });
+    state.map_toplevel(0);
+    let snapshot = state.public_snapshot();
+    let metadata = &snapshot.windows[0].metadata;
+    assert_eq!(metadata.tag.as_deref(), Some("settings"));
+    assert_eq!(
+        metadata.description.as_deref(),
+        Some("Application preferences")
     );
 
     done_tx.send(()).unwrap();

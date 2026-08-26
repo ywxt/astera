@@ -547,6 +547,10 @@ pub mod wire {
         pub struct WindowMetadata {
             pub title: Option<String>,
             pub app_id: Option<String>,
+            #[serde(default)]
+            pub tag: Option<String>,
+            #[serde(default)]
+            pub description: Option<String>,
         }
 
         #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
