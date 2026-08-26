@@ -78,6 +78,7 @@ use wayland_protocols::wp::{
         zwp_pointer_gesture_swipe_v1::ZwpPointerGestureSwipeV1,
         zwp_pointer_gestures_v1::ZwpPointerGesturesV1,
     },
+    pointer_warp::v1::client::wp_pointer_warp_v1::WpPointerWarpV1,
     presentation_time::client::{
         wp_presentation::WpPresentation, wp_presentation_feedback::WpPresentationFeedback,
     },
@@ -254,7 +255,23 @@ delegate_noop!(TestClient: ignore XdgToplevelIconManagerV1);
 delegate_noop!(TestClient: ignore XdgToplevelIconV1);
 delegate_noop!(TestClient: ignore WpTearingControlManagerV1);
 delegate_noop!(TestClient: ignore WpTearingControlV1);
+delegate_noop!(TestClient: ignore WpPointerWarpV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
+
+impl Dispatch<WlPointer, mpsc::Sender<u32>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlPointer,
+        event: wayland_client::protocol::wl_pointer::Event,
+        serials: &mpsc::Sender<u32>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_pointer::Event::Enter { serial, .. } = event {
+            serials.send(serial).unwrap();
+        }
+    }
+}
 
 impl Dispatch<ZxdgExportedV2, mpsc::Sender<String>> for TestClient {
     fn event(
@@ -2593,6 +2610,107 @@ fn duplicate_tearing_control_is_rejected_without_server_panic() {
         Err(_) => false,
     });
     assert!(rejected);
+    client.join().unwrap();
+}
+
+#[test]
+fn pointer_warp_requires_current_enter_serial_and_surface_bounds() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (read_enter_tx, read_enter_rx) = mpsc::sync_channel(0);
+    let (serial_tx, serial_rx) = mpsc::sync_channel(0);
+    let (invalid_go_tx, invalid_go_rx) = mpsc::sync_channel(0);
+    let (invalid_done_tx, invalid_done_rx) = mpsc::sync_channel(0);
+    let (valid_go_tx, valid_go_rx) = mpsc::sync_channel(0);
+    let (valid_done_tx, valid_done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let warp = globals
+            .bind::<WpPointerWarpV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let shm = globals.bind::<WlShm, _, _>(&queue, 1..=1, ()).unwrap();
+        let (enter_tx, enter_rx) = mpsc::channel();
+        let pointer = seat.get_pointer(&queue, enter_tx);
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let _toplevel = xdg_surface.get_toplevel(&queue, ());
+        surface.commit();
+        events.roundtrip(&mut TestClient).unwrap();
+        let fd = rustix::fs::memfd_create("astera-warp", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+        rustix::fs::ftruncate(&fd, 100 * 100 * 4).unwrap();
+        let pool = shm.create_pool(fd.as_fd(), 100 * 100 * 4, &queue, ());
+        let buffer = pool.create_buffer(
+            0,
+            100,
+            100,
+            100 * 4,
+            wayland_client::protocol::wl_shm::Format::Argb8888,
+            &queue,
+            (),
+        );
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, 100, 100);
+        surface.commit();
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+
+        read_enter_rx.recv().unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        let serial = enter_rx.recv().unwrap();
+        serial_tx.send(serial).unwrap();
+
+        invalid_go_rx.recv().unwrap();
+        warp.warp_pointer(&surface, &pointer, 30.0, 40.0, serial.wrapping_add(1));
+        warp.warp_pointer(&surface, &pointer, 10_000.0, 10_000.0, serial);
+        connection.flush().unwrap();
+        invalid_done_tx.send(()).unwrap();
+
+        valid_go_rx.recv().unwrap();
+        warp.warp_pointer(&surface, &pointer, 30.0, 40.0, serial);
+        connection.flush().unwrap();
+        valid_done_tx.send(()).unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state.windows.len() == 1 && state.windows[0].mapped
+    });
+    let window = state.windows[0].id;
+    let (origin, _, _, _) = state.visual_geometry(window).unwrap();
+    let initial = (origin.x as f64 + 5.0, origin.y as f64 + 5.0).into();
+    state.handle_pointer_motion(initial, 1);
+    display.flush_clients().unwrap();
+
+    read_enter_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| serial_rx.try_recv().is_ok());
+    invalid_go_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        invalid_done_rx.try_recv().is_ok()
+    });
+    display.dispatch_clients(&mut state).unwrap();
+    assert_eq!(state.pointer_location, initial);
+
+    valid_go_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        valid_done_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        state.pointer_location
+            == SmithayPoint::from((origin.x as f64 + 30.0, origin.y as f64 + 40.0))
+    });
     client.join().unwrap();
 }
 

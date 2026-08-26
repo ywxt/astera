@@ -21,6 +21,7 @@ mod model;
 mod output;
 mod output_power;
 mod pointer_constraints;
+mod pointer_warp;
 mod popup_touch;
 mod process;
 pub(crate) use process::{InputServiceExit, InputServiceSupervisor};
@@ -223,6 +224,7 @@ pub struct Astera {
         SmithayPoint<f64, smithay::utils::Logical>,
         f64,
     )>,
+    pointer_enter_serial: Option<(ClientId, Serial)>,
     drag: Option<DragState>,
     key_repeat: KeyRepeatState,
     active_shortcut_inhibitor: Option<KeyboardShortcutsInhibitor>,
@@ -275,6 +277,7 @@ pub struct Astera {
     pending_output_power: VecDeque<(OutputId, bool)>,
     _relative_pointer_state: RelativePointerManagerState,
     _pointer_constraints_state: PointerConstraintsState,
+    _pointer_warp_state: pointer_warp::PointerWarpState,
     idle_runtime: IdleRuntime,
     idle_notifications: BTreeMap<u64, smithay::reexports::wayland_protocols::ext::idle_notify::v1::server::ext_idle_notification_v1::ExtIdleNotificationV1>,
     next_idle_notification: u64,
@@ -430,6 +433,7 @@ impl Astera {
         );
         let relative_pointer_state = RelativePointerManagerState::new::<Self>(display);
         let pointer_constraints_state = PointerConstraintsState::new::<Self>(display);
+        let pointer_warp_state = pointer_warp::PointerWarpState::new(display);
         let output_manager_state = OutputManagerState::new();
         display.create_global::<Self, smithay::reexports::wayland_protocols::xdg::xdg_output::zv1::server::zxdg_output_manager_v1::ZxdgOutputManagerV1, _>(3, ());
         let wayland_output = SmithayOutput::new(
@@ -593,6 +597,7 @@ impl Astera {
             )]),
             active_tablet_cursor: None,
             pointer_focus_origin: None,
+            pointer_enter_serial: None,
             drag: None,
             key_repeat: KeyRepeatState::default(),
             active_shortcut_inhibitor: None,
@@ -640,6 +645,7 @@ impl Astera {
             pending_output_power: VecDeque::new(),
             _relative_pointer_state: relative_pointer_state,
             _pointer_constraints_state: pointer_constraints_state,
+            _pointer_warp_state: pointer_warp_state,
             idle_runtime: IdleRuntime::default(),
             idle_notifications: BTreeMap::new(),
             next_idle_notification: 1,
@@ -1344,14 +1350,15 @@ impl Astera {
         }
         let focus = self.surface_under(location);
         let pointer = self.pointer.clone();
-        if let Some(previous) = pointer.current_focus()
-            && focus.as_ref().is_none_or(|(next, _, _)| *next != previous)
+        let previous_focus = pointer.current_focus();
+        if let Some(previous) = previous_focus.as_ref()
+            && focus.as_ref().is_none_or(|(next, _, _)| next != previous)
         {
             // Constraints are surface-focus scoped. Scene changes can move or hide a surface
             // beneath a stationary pointer, so end its old constraint before sending wl_pointer
             // leave/enter. Otherwise a locked pointer can remain attached to an invisible surface
             // and suppress every future motion event.
-            self.deactivate_pointer_constraint(&previous);
+            self.deactivate_pointer_constraint(previous);
         }
         let serial = self.next_serial();
         let focus_origin = focus.as_ref().map(|(surface, origin, window)| {
@@ -1369,6 +1376,13 @@ impl Astera {
                 time,
             },
         );
+        let current_focus = pointer.current_focus();
+        if current_focus != previous_focus {
+            self.pointer_enter_serial = current_focus
+                .as_ref()
+                .and_then(Resource::client)
+                .map(|client| (client.id(), serial));
+        }
         self.pointer_focus_origin = pointer
             .current_focus()
             .and_then(|current| focus_origin.filter(|(surface, _, _)| *surface == current));
@@ -1577,6 +1591,7 @@ impl Astera {
             .and_then(|(surface, _, _)| surface.client())
             .map(|client| client.id());
         let pointer = self.pointer.clone();
+        let previous_focus = pointer.current_focus();
         let serial = self.next_serial();
         if state == BackendButtonState::Pressed
             && let Some(recipient) = recipient
@@ -1593,6 +1608,13 @@ impl Astera {
                 time,
             },
         );
+        let current_focus = pointer.current_focus();
+        if current_focus != previous_focus {
+            self.pointer_enter_serial = current_focus
+                .as_ref()
+                .and_then(Resource::client)
+                .map(|client| (client.id(), serial));
+        }
         pointer.button(
             self,
             &ButtonEvent {
