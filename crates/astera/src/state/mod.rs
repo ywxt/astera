@@ -34,6 +34,7 @@ mod snapshot;
 mod tablet_input;
 mod tearing_control;
 mod touch;
+mod transient_seat;
 mod xdg_foreign;
 mod xdg_toplevel_drag;
 mod xdg_toplevel_icon;
@@ -299,6 +300,8 @@ pub struct Astera {
     used_selection_sources: HashSet<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
     used_dnd_sources: HashSet<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
     workspace_managers: Vec<ext_workspace::WorkspaceManagerInstance>,
+    transient_seats: Vec<transient_seat::TransientSeatRuntime>,
+    next_transient_seat: u64,
 }
 
 impl Deref for Astera {
@@ -506,6 +509,7 @@ impl Astera {
         let xdg_toplevel_drag_state = xdg_toplevel_drag::XdgToplevelDragState::new(display);
         let tearing_control_state = tearing_control::TearingControlState::new(display);
         let ext_workspace_state = ext_workspace::ExtWorkspaceState::new(display);
+        let transient_seat_state = transient_seat::TransientSeatState::new(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -562,6 +566,7 @@ impl Astera {
                 _xdg_toplevel_drag_state: xdg_toplevel_drag_state,
                 _tearing_control_state: tearing_control_state,
                 _ext_workspace_state: ext_workspace_state,
+                _transient_seat_state: transient_seat_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
@@ -674,6 +679,8 @@ impl Astera {
             used_selection_sources: HashSet::new(),
             used_dnd_sources: HashSet::new(),
             workspace_managers: Vec::new(),
+            transient_seats: Vec::new(),
+            next_transient_seat: 1,
         }
     }
 

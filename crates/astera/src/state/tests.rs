@@ -37,6 +37,10 @@ use wayland_protocols::ext::idle_notify::v1::client::{
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1::ExtSessionLockManagerV1, ext_session_lock_v1::ExtSessionLockV1,
 };
+use wayland_protocols::ext::transient_seat::v1::client::{
+    ext_transient_seat_manager_v1::ExtTransientSeatManagerV1,
+    ext_transient_seat_v1::{self, ExtTransientSeatV1},
+};
 use wayland_protocols::ext::workspace::v1::client::{
     ext_workspace_group_handle_v1::{self, ExtWorkspaceGroupHandleV1},
     ext_workspace_handle_v1::{self, ExtWorkspaceHandleV1},
@@ -165,6 +169,21 @@ use super::*;
 
 struct TestClient;
 
+impl Dispatch<ExtTransientSeatV1, mpsc::Sender<u32>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtTransientSeatV1,
+        event: ext_transient_seat_v1::Event,
+        data: &mpsc::Sender<u32>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if let ext_transient_seat_v1::Event::Ready { global_name } = event {
+            data.send(global_name).unwrap();
+        }
+    }
+}
+
 #[derive(Default)]
 struct WorkspaceClientState {
     groups: Vec<ExtWorkspaceGroupHandleV1>,
@@ -283,6 +302,7 @@ delegate_noop!(TestClient: ignore WlCompositor);
 delegate_noop!(TestClient: ignore WlSurface);
 delegate_noop!(TestClient: ignore WlCallback);
 delegate_noop!(TestClient: ignore WlSeat);
+delegate_noop!(TestClient: ignore ExtTransientSeatManagerV1);
 delegate_noop!(TestClient: ignore WlOutput);
 delegate_noop!(TestClient: ignore WlPointer);
 delegate_noop!(TestClient: ignore WlShm);
@@ -920,6 +940,50 @@ fn presentation_feedback_is_committed_and_completed_once() {
 }
 
 #[test]
+fn transient_seat_advertises_bindable_global_and_removes_it_on_destroy() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::trusted_input()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (destroy_tx, destroy_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let manager = globals
+            .bind::<ExtTransientSeatManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let (name_tx, name_rx) = mpsc::channel();
+        let transient = manager.create(&queue, name_tx);
+        connection.flush().unwrap();
+        events.blocking_dispatch(&mut TestClient).unwrap();
+        let global_name = name_rx.recv().unwrap();
+        let seat: WlSeat = globals.registry().bind(global_name, 9, &queue, ());
+        connection.flush().unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        ready_tx.send(()).unwrap();
+        destroy_rx.recv().unwrap();
+        transient.destroy();
+        seat.release();
+        connection.flush().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |state| {
+        ready_rx.try_recv().is_ok() && state.transient_seats.len() == 1
+    });
+    assert_eq!(state.transient_seats.len(), 1);
+    destroy_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |state| {
+        state.transient_seats.is_empty()
+    });
+    client.join().unwrap();
+}
+
+#[test]
 fn output_power_allows_multiple_controls_and_coalesces_backend_requests() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
@@ -1014,6 +1078,9 @@ fn privileged_input_globals_are_hidden_from_ordinary_clients() {
                 globals
                     .bind::<ZwpTextInputManagerV3, _, _>(&handle, 1..=1, ())
                     .is_ok(),
+                globals
+                    .bind::<ExtTransientSeatManagerV1, _, _>(&handle, 1..=1, ())
+                    .is_err(),
             ))
             .unwrap();
     });
@@ -1025,7 +1092,7 @@ fn privileged_input_globals_are_hidden_from_ordinary_clients() {
         }
         Err(_) => false,
     });
-    assert_eq!(result, Some((true, true, true)));
+    assert_eq!(result, Some((true, true, true, true)));
     client.join().unwrap();
 }
 
