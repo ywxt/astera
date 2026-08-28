@@ -10,6 +10,7 @@ use std::{
 
 mod activation;
 mod clock;
+mod color_representation;
 mod config_watcher;
 pub(crate) mod cursor;
 mod event_hub;
@@ -295,6 +296,9 @@ pub struct Astera {
     toplevel_icon_resources: Vec<smithay::reexports::wayland_protocols::xdg::toplevel_icon::v1::server::xdg_toplevel_icon_v1::XdgToplevelIconV1>,
     tearing_controls: HashMap<WlSurface, smithay::reexports::wayland_protocols::wp::tearing_control::v1::server::wp_tearing_control_v1::WpTearingControlV1>,
     pending_tearing_hints: HashMap<WlSurface, bool>,
+    color_representations: HashMap<WlSurface, smithay::reexports::wayland_protocols::wp::color_representation::v1::server::wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1>,
+    pending_color_alpha: HashMap<WlSurface, Option<()>>,
+    electrical_alpha_surfaces: HashSet<WlSurface>,
     asynchronous_surfaces: HashSet<WlSurface>,
     toplevel_drags: HashMap<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource, xdg_toplevel_drag::ToplevelDragRuntime>,
     used_selection_sources: HashSet<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
@@ -510,6 +514,8 @@ impl Astera {
         let tearing_control_state = tearing_control::TearingControlState::new(display);
         let ext_workspace_state = ext_workspace::ExtWorkspaceState::new(display);
         let transient_seat_state = transient_seat::TransientSeatState::new(display);
+        let color_representation_state =
+            color_representation::ColorRepresentationState::new(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -567,6 +573,7 @@ impl Astera {
                 _tearing_control_state: tearing_control_state,
                 _ext_workspace_state: ext_workspace_state,
                 _transient_seat_state: transient_seat_state,
+                _color_representation_state: color_representation_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
@@ -674,6 +681,9 @@ impl Astera {
             toplevel_icon_resources: Vec::new(),
             tearing_controls: HashMap::new(),
             pending_tearing_hints: HashMap::new(),
+            color_representations: HashMap::new(),
+            pending_color_alpha: HashMap::new(),
+            electrical_alpha_surfaces: HashSet::new(),
             asynchronous_surfaces: HashSet::new(),
             toplevel_drags: HashMap::new(),
             used_selection_sources: HashSet::new(),

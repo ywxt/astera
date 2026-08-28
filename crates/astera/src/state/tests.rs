@@ -54,6 +54,10 @@ use wayland_protocols::wp::{
         wp_alpha_modifier_surface_v1::WpAlphaModifierSurfaceV1,
         wp_alpha_modifier_v1::WpAlphaModifierV1,
     },
+    color_representation::v1::client::{
+        wp_color_representation_manager_v1::{self, WpColorRepresentationManagerV1},
+        wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1,
+    },
     commit_timing::v1::client::{
         wp_commit_timer_v1::WpCommitTimerV1, wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
     },
@@ -168,6 +172,36 @@ use super::clock::testing::ManualClock;
 use super::*;
 
 struct TestClient;
+
+impl Dispatch<WpColorRepresentationManagerV1, mpsc::Sender<(bool, bool, bool)>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WpColorRepresentationManagerV1,
+        event: wp_color_representation_manager_v1::Event,
+        data: &mpsc::Sender<(bool, bool, bool)>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        match event {
+            wp_color_representation_manager_v1::Event::SupportedAlphaMode { alpha_mode } => {
+                let electrical = matches!(
+                    alpha_mode,
+                    wayland_client::WEnum::Value(
+                        wayland_protocols::wp::color_representation::v1::client::wp_color_representation_surface_v1::AlphaMode::PremultipliedElectrical
+                    )
+                );
+                data.send((electrical, false, false)).unwrap();
+            }
+            wp_color_representation_manager_v1::Event::SupportedCoefficientsAndRanges {
+                ..
+            } => data.send((false, true, false)).unwrap(),
+            wp_color_representation_manager_v1::Event::Done => {
+                data.send((false, false, true)).unwrap();
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<ExtTransientSeatV1, mpsc::Sender<u32>> for TestClient {
     fn event(
@@ -303,6 +337,7 @@ delegate_noop!(TestClient: ignore WlSurface);
 delegate_noop!(TestClient: ignore WlCallback);
 delegate_noop!(TestClient: ignore WlSeat);
 delegate_noop!(TestClient: ignore ExtTransientSeatManagerV1);
+delegate_noop!(TestClient: ignore WpColorRepresentationSurfaceV1);
 delegate_noop!(TestClient: ignore WlOutput);
 delegate_noop!(TestClient: ignore WlPointer);
 delegate_noop!(TestClient: ignore WlShm);
@@ -979,6 +1014,86 @@ fn transient_seat_advertises_bindable_global_and_removes_it_on_destroy() {
     destroy_tx.send(()).unwrap();
     dispatch_until(&mut display, &mut state, |state| {
         state.transient_seats.is_empty()
+    });
+    client.join().unwrap();
+}
+
+#[test]
+fn color_representation_advertises_only_supported_alpha_and_commits_atomically() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (created_tx, created_rx) = mpsc::sync_channel(0);
+    let (commit_tx, commit_rx) = mpsc::sync_channel(0);
+    let (committed_tx, committed_rx) = mpsc::sync_channel(0);
+    let (destroy_tx, destroy_rx) = mpsc::sync_channel(0);
+    let (destroyed_tx, destroyed_rx) = mpsc::sync_channel(0);
+    let (final_commit_tx, final_commit_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let (capability_tx, capability_rx) = mpsc::channel();
+        let manager = globals
+            .bind::<WpColorRepresentationManagerV1, _, _>(&queue, 1..=1, capability_tx)
+            .unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        let capabilities = capability_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            capabilities,
+            vec![(true, false, false), (false, false, true)]
+        );
+
+        let surface = compositor.create_surface(&queue, ());
+        let representation = manager.get_surface(&surface, &queue, ());
+        representation.set_alpha_mode(
+            wayland_protocols::wp::color_representation::v1::client::wp_color_representation_surface_v1::AlphaMode::PremultipliedElectrical,
+        );
+        connection.flush().unwrap();
+        created_tx.send(()).unwrap();
+
+        commit_rx.recv().unwrap();
+        surface.commit();
+        connection.flush().unwrap();
+        committed_tx.send(()).unwrap();
+
+        destroy_rx.recv().unwrap();
+        representation.destroy();
+        connection.flush().unwrap();
+        destroyed_tx.send(()).unwrap();
+
+        final_commit_rx.recv().unwrap();
+        surface.commit();
+        connection.flush().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |state| {
+        created_rx.try_recv().is_ok() && !state.pending_color_alpha.is_empty()
+    });
+    let surface = state.color_representations.keys().next().unwrap().clone();
+    assert!(!state.electrical_alpha_surfaces.contains(&surface));
+
+    commit_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |state| {
+        committed_rx.try_recv().is_ok() && state.electrical_alpha_surfaces.contains(&surface)
+    });
+
+    destroy_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |state| {
+        destroyed_rx.try_recv().is_ok() && state.pending_color_alpha.contains_key(&surface)
+    });
+    assert!(state.electrical_alpha_surfaces.contains(&surface));
+
+    final_commit_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |state| {
+        !state.electrical_alpha_surfaces.contains(&surface)
     });
     client.join().unwrap();
 }
