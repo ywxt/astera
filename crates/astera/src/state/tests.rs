@@ -11,7 +11,7 @@ use std::{
 use astera_core::{Scale120, WorkspaceTransaction};
 use smithay::reexports::wayland_server::Display;
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, delegate_noop,
+    Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     globals::registry_queue_init,
     protocol::{
         wl_buffer::WlBuffer, wl_callback::WlCallback, wl_compositor::WlCompositor,
@@ -36,6 +36,11 @@ use wayland_protocols::ext::idle_notify::v1::client::{
 };
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1::ExtSessionLockManagerV1, ext_session_lock_v1::ExtSessionLockV1,
+};
+use wayland_protocols::ext::workspace::v1::client::{
+    ext_workspace_group_handle_v1::{self, ExtWorkspaceGroupHandleV1},
+    ext_workspace_handle_v1::{self, ExtWorkspaceHandleV1},
+    ext_workspace_manager_v1::{self, ExtWorkspaceManagerV1},
 };
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
@@ -160,6 +165,27 @@ use super::*;
 
 struct TestClient;
 
+#[derive(Default)]
+struct WorkspaceClientState {
+    groups: Vec<ExtWorkspaceGroupHandleV1>,
+    workspaces: Vec<ExtWorkspaceHandleV1>,
+    names: HashMap<wayland_client::backend::ObjectId, String>,
+    active: HashSet<wayland_client::backend::ObjectId>,
+    memberships: Vec<(
+        wayland_client::backend::ObjectId,
+        wayland_client::backend::ObjectId,
+    )>,
+    done: usize,
+}
+
+thread_local! {
+    static WORKSPACE_CLIENT_STATE: std::cell::RefCell<Option<Arc<std::sync::Mutex<WorkspaceClientState>>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn workspace_client_state() -> Arc<std::sync::Mutex<WorkspaceClientState>> {
+    WORKSPACE_CLIENT_STATE.with(|state| state.borrow().as_ref().unwrap().clone())
+}
+
 impl Dispatch<WlRegistry, wayland_client::globals::GlobalListContents> for TestClient {
     fn event(
         _state: &mut Self,
@@ -169,6 +195,87 @@ impl Dispatch<WlRegistry, wayland_client::globals::GlobalListContents> for TestC
         _connection: &Connection,
         _queue: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<ExtWorkspaceManagerV1, ()> for TestClient {
+    wayland_client::event_created_child!(TestClient, ExtWorkspaceManagerV1, [
+        0 => (ExtWorkspaceGroupHandleV1, workspace_client_state()),
+        1 => (ExtWorkspaceHandleV1, workspace_client_state())
+    ]);
+
+    fn event(
+        _state: &mut Self,
+        _proxy: &ExtWorkspaceManagerV1,
+        event: ext_workspace_manager_v1::Event,
+        _data: &(),
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        let shared = workspace_client_state();
+        let mut state = shared.lock().unwrap();
+        match event {
+            ext_workspace_manager_v1::Event::WorkspaceGroup { workspace_group } => {
+                state.groups.push(workspace_group);
+            }
+            ext_workspace_manager_v1::Event::Workspace { workspace } => {
+                state.workspaces.push(workspace);
+            }
+            ext_workspace_manager_v1::Event::Done => state.done += 1,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtWorkspaceGroupHandleV1, Arc<std::sync::Mutex<WorkspaceClientState>>>
+    for TestClient
+{
+    fn event(
+        _state: &mut Self,
+        proxy: &ExtWorkspaceGroupHandleV1,
+        event: ext_workspace_group_handle_v1::Event,
+        data: &Arc<std::sync::Mutex<WorkspaceClientState>>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if let ext_workspace_group_handle_v1::Event::WorkspaceEnter { workspace } = event {
+            data.lock()
+                .unwrap()
+                .memberships
+                .push((proxy.id(), workspace.id()));
+        }
+    }
+}
+
+impl Dispatch<ExtWorkspaceHandleV1, Arc<std::sync::Mutex<WorkspaceClientState>>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        proxy: &ExtWorkspaceHandleV1,
+        event: ext_workspace_handle_v1::Event,
+        data: &Arc<std::sync::Mutex<WorkspaceClientState>>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        let mut state = data.lock().unwrap();
+        match event {
+            ext_workspace_handle_v1::Event::Name { name } => {
+                state.names.insert(proxy.id(), name);
+            }
+            ext_workspace_handle_v1::Event::State {
+                state: workspace_state,
+            } => {
+                if matches!(
+                    workspace_state,
+                    wayland_client::WEnum::Value(state)
+                        if state.contains(ext_workspace_handle_v1::State::Active)
+                ) {
+                    state.active.insert(proxy.id());
+                } else {
+                    state.active.remove(&proxy.id());
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2937,6 +3044,121 @@ fn toplevel_drag_source_cannot_be_used_as_clipboard_selection() {
         Err(_) => false,
     });
     assert!(rejected);
+    client.join().unwrap();
+}
+
+#[test]
+fn ext_workspace_publishes_groups_and_commits_requests_atomically() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    state
+        .connect_output(Output::new(
+            OutputId(1),
+            "workspace-second-output",
+            Size::new(1024, 768),
+        ))
+        .unwrap();
+    let first = state.desktop.active_workspace_id(OutputId(0)).unwrap();
+    let second = state.desktop.active_workspace_id(OutputId(1)).unwrap();
+    state
+        .desktop
+        .apply(WorkspaceTransaction::SetName {
+            workspace: first,
+            name: Some("one".into()),
+        })
+        .unwrap();
+    state
+        .desktop
+        .apply(WorkspaceTransaction::SetName {
+            workspace: second,
+            name: Some("two".into()),
+        })
+        .unwrap();
+
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let shared = Arc::new(std::sync::Mutex::new(WorkspaceClientState::default()));
+    let client_shared = shared.clone();
+    let (initial_tx, initial_rx) = mpsc::sync_channel(0);
+    let (request_tx, request_rx) = mpsc::sync_channel(0);
+    let (requested_tx, requested_rx) = mpsc::sync_channel(0);
+    let (observe_tx, observe_rx) = mpsc::sync_channel(0);
+    let (observed_tx, observed_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        WORKSPACE_CLIENT_STATE.with(|slot| *slot.borrow_mut() = Some(client_shared.clone()));
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let manager = globals
+            .bind::<ExtWorkspaceManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        initial_tx.send(()).unwrap();
+
+        request_rx.recv().unwrap();
+        let (workspace, target_group) = {
+            let state = client_shared.lock().unwrap();
+            let workspace = state
+                .workspaces
+                .iter()
+                .find(|workspace| {
+                    state
+                        .names
+                        .get(&workspace.id())
+                        .is_some_and(|name| name == "one")
+                })
+                .unwrap()
+                .clone();
+            (workspace, state.groups[1].clone())
+        };
+        workspace.assign(&target_group);
+        workspace.activate();
+        manager.commit();
+        connection.flush().unwrap();
+        requested_tx.send(()).unwrap();
+
+        observe_rx.recv().unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        observed_tx.send(()).unwrap();
+        WORKSPACE_CLIENT_STATE.with(|slot| slot.borrow_mut().take());
+    });
+
+    dispatch_until(&mut display, &mut state, |_| initial_rx.try_recv().is_ok());
+    {
+        let observed = shared.lock().unwrap();
+        assert_eq!(observed.groups.len(), 2);
+        // The core keeps one empty trailing workspace per output for the next insertion.
+        assert_eq!(observed.workspaces.len(), 4);
+        assert_eq!(observed.memberships.len(), 4);
+        assert_eq!(observed.done, 1);
+        assert!(observed.names.values().any(|name| name == "one"));
+        assert!(observed.names.values().any(|name| name == "two"));
+        assert_eq!(observed.active.len(), 2);
+    }
+
+    request_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        requested_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        state
+            .desktop
+            .workspace_location(first)
+            .is_ok_and(|location| location.output == Some(OutputId(1)))
+            && state.active_output == OutputId(1)
+    });
+    assert_eq!(state.desktop.active_workspace_id(OutputId(1)), Some(first));
+
+    observe_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| observed_rx.try_recv().is_ok());
+    {
+        let observed = shared.lock().unwrap();
+        assert!(observed.memberships.len() >= 3);
+        assert!(observed.done >= 2);
+    }
     client.join().unwrap();
 }
 

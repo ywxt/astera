@@ -271,6 +271,7 @@ impl Astera {
         if !self.public_dirty {
             return self.event_hub.clean_tick();
         }
+        self.sync_workspace_protocol();
         self.public_dirty = false;
         #[cfg(test)]
         {

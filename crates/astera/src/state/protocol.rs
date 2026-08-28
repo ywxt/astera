@@ -282,7 +282,11 @@ impl Astera {
     }
 }
 
-impl OutputHandler for Astera {}
+impl OutputHandler for Astera {
+    fn output_bound(&mut self, output: SmithayOutput, wl_output: WlOutput) {
+        self.workspace_output_bound(&output, wl_output);
+    }
+}
 
 impl FractionalScaleHandler for Astera {
     fn new_fractional_scale(&mut self, surface: WlSurface) {

@@ -52,9 +52,9 @@ use smithay::{
 };
 
 use super::{
-    Astera, tearing_control::TearingControlState, xdg_foreign::XdgForeignState,
-    xdg_toplevel_drag::XdgToplevelDragState, xdg_toplevel_icon::XdgToplevelIconState,
-    xdg_toplevel_tag::XdgToplevelTagState,
+    Astera, ext_workspace::ExtWorkspaceState, tearing_control::TearingControlState,
+    xdg_foreign::XdgForeignState, xdg_toplevel_drag::XdgToplevelDragState,
+    xdg_toplevel_icon::XdgToplevelIconState, xdg_toplevel_tag::XdgToplevelTagState,
 };
 
 /// Wayland protocol objects are grouped separately from desktop and interaction state. Keeping
@@ -98,6 +98,7 @@ pub struct ProtocolState {
     pub(super) _xdg_toplevel_icon_state: XdgToplevelIconState,
     pub(super) _xdg_toplevel_drag_state: XdgToplevelDragState,
     pub(super) _tearing_control_state: TearingControlState,
+    pub(super) _ext_workspace_state: ExtWorkspaceState,
     pub(super) dmabuf_state: DmabufState,
     pub(super) popup_manager: PopupManager,
     pub(super) seat: Seat<Astera>,

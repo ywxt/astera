@@ -13,6 +13,7 @@ mod clock;
 mod config_watcher;
 pub(crate) mod cursor;
 mod event_hub;
+mod ext_workspace;
 mod geometry;
 mod idle;
 mod input_method;
@@ -297,6 +298,7 @@ pub struct Astera {
     toplevel_drags: HashMap<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource, xdg_toplevel_drag::ToplevelDragRuntime>,
     used_selection_sources: HashSet<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
     used_dnd_sources: HashSet<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
+    workspace_managers: Vec<ext_workspace::WorkspaceManagerInstance>,
 }
 
 impl Deref for Astera {
@@ -503,6 +505,7 @@ impl Astera {
         let xdg_toplevel_icon_state = xdg_toplevel_icon::XdgToplevelIconState::new(display);
         let xdg_toplevel_drag_state = xdg_toplevel_drag::XdgToplevelDragState::new(display);
         let tearing_control_state = tearing_control::TearingControlState::new(display);
+        let ext_workspace_state = ext_workspace::ExtWorkspaceState::new(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -558,6 +561,7 @@ impl Astera {
                 _xdg_toplevel_icon_state: xdg_toplevel_icon_state,
                 _xdg_toplevel_drag_state: xdg_toplevel_drag_state,
                 _tearing_control_state: tearing_control_state,
+                _ext_workspace_state: ext_workspace_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
                 seat,
@@ -669,6 +673,7 @@ impl Astera {
             toplevel_drags: HashMap::new(),
             used_selection_sources: HashSet::new(),
             used_dnd_sources: HashSet::new(),
+            workspace_managers: Vec::new(),
         }
     }
 
