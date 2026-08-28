@@ -34,6 +34,7 @@ mod tablet_input;
 mod tearing_control;
 mod touch;
 mod xdg_foreign;
+mod xdg_toplevel_drag;
 mod xdg_toplevel_icon;
 mod xdg_toplevel_tag;
 
@@ -293,6 +294,9 @@ pub struct Astera {
     tearing_controls: HashMap<WlSurface, smithay::reexports::wayland_protocols::wp::tearing_control::v1::server::wp_tearing_control_v1::WpTearingControlV1>,
     pending_tearing_hints: HashMap<WlSurface, bool>,
     asynchronous_surfaces: HashSet<WlSurface>,
+    toplevel_drags: HashMap<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource, xdg_toplevel_drag::ToplevelDragRuntime>,
+    used_selection_sources: HashSet<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
+    used_dnd_sources: HashSet<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
 }
 
 impl Deref for Astera {
@@ -497,6 +501,7 @@ impl Astera {
         let xdg_system_bell_state = XdgSystemBellState::new::<Self>(display);
         let xdg_toplevel_tag_state = xdg_toplevel_tag::XdgToplevelTagState::new(display);
         let xdg_toplevel_icon_state = xdg_toplevel_icon::XdgToplevelIconState::new(display);
+        let xdg_toplevel_drag_state = xdg_toplevel_drag::XdgToplevelDragState::new(display);
         let tearing_control_state = tearing_control::TearingControlState::new(display);
 
         let active_output = OutputId(0);
@@ -551,6 +556,7 @@ impl Astera {
                 _xdg_system_bell_state: xdg_system_bell_state,
                 _xdg_toplevel_tag_state: xdg_toplevel_tag_state,
                 _xdg_toplevel_icon_state: xdg_toplevel_icon_state,
+                _xdg_toplevel_drag_state: xdg_toplevel_drag_state,
                 _tearing_control_state: tearing_control_state,
                 dmabuf_state: DmabufState::new(),
                 popup_manager: PopupManager::default(),
@@ -660,6 +666,9 @@ impl Astera {
             tearing_controls: HashMap::new(),
             pending_tearing_hints: HashMap::new(),
             asynchronous_surfaces: HashSet::new(),
+            toplevel_drags: HashMap::new(),
+            used_selection_sources: HashSet::new(),
+            used_dnd_sources: HashSet::new(),
         }
     }
 
@@ -1348,6 +1357,9 @@ impl Astera {
             self.update_drag(location);
             return;
         }
+        if self.drag.is_some_and(|drag| drag.source == DragSource::Dnd) {
+            self.update_drag(location);
+        }
         let focus = self.surface_under(location);
         let pointer = self.pointer.clone();
         let previous_focus = pointer.current_focus();
@@ -1896,6 +1908,7 @@ impl Astera {
                 let touch = self.touch.clone();
                 touch.unset_grab(self);
             }
+            DragSource::Dnd => {}
             _ => {}
         }
         let Ok(workspace) = self.desktop.find_window(drag.window) else {
@@ -1968,6 +1981,7 @@ impl Astera {
                 let touch = self.touch.clone();
                 touch.unset_grab(self);
             }
+            DragSource::Dnd => {}
             _ => {}
         }
         self.mark_render_dirty();
@@ -2459,6 +2473,7 @@ impl Astera {
             tracing::warn!(?id, ?mode, %error, "could not apply initial toplevel mode");
         }
         self.windows[index].mapped = true;
+        let mapped_surface = self.windows[index].surface.wl_surface().clone();
         self.mark_public_dirty();
         self.windows[index].surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
@@ -2471,6 +2486,16 @@ impl Astera {
         tracing::info!(window = ?id, workspace = ?workspace_id, output = ?self.active_output, "toplevel mapped");
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
+        let source = self.toplevel_drags.iter().find_map(|(source, runtime)| {
+            runtime
+                .attached
+                .as_ref()
+                .is_some_and(|attached| attached.surface == mapped_surface)
+                .then(|| source.clone())
+        });
+        if let Some(source) = source {
+            self.maybe_begin_toplevel_drag(&source);
+        }
     }
 
     fn unmap_toplevel(&mut self, index: usize) {
@@ -2485,6 +2510,8 @@ impl Astera {
             return;
         }
         self.windows[index].mapped = false;
+        let unmapped_surface = self.windows[index].surface.wl_surface().clone();
+        self.detach_toplevel_drag_surface(&unmapped_surface);
         self.mark_public_dirty();
         if self.drag.is_some_and(|drag| drag.window == id) {
             self.cancel_drag();

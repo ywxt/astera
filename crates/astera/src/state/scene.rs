@@ -46,6 +46,12 @@ impl Astera {
         // popups, floating/fullscreen windows and layer surfaces resolve deterministically.
         let mut candidates = Vec::new();
         for (index, mapped) in self.windows.iter().enumerate() {
+            if self
+                .drag
+                .is_some_and(|drag| drag.source == DragSource::Dnd && drag.window == mapped.id)
+            {
+                continue;
+            }
             let Some((origin, size, scale, mode)) = self.visual_geometry(mapped.id) else {
                 continue;
             };

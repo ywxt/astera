@@ -440,6 +440,7 @@ impl CompositorHandler for Astera {
         self.dmabuf_feedback_surfaces.remove(surface);
         self.pending_toplevel_icons.remove(surface);
         self.remove_tearing_control_surface(surface);
+        self.detach_toplevel_drag_surface(surface);
         self.commit_timer_surfaces.remove(surface);
         let was_visible = self
             .output_runtime
@@ -972,6 +973,7 @@ impl XdgShellHandler for Astera {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         self.cancel_surface_bound_input();
+        self.detach_toplevel_drag_surface(surface.wl_surface());
         let Some(index) = self
             .windows
             .iter()
@@ -1616,6 +1618,14 @@ impl
                 None
             };
         }
+        if let Request::SetSelection {
+            source: Some(source),
+            ..
+        } = &request
+            && state.reject_toplevel_drag_selection(source)
+        {
+            return;
+        }
         if let Request::SetSelection { serial, .. } = &request {
             let serial = Serial::from(*serial);
             let client_id = client.id();
@@ -1640,6 +1650,13 @@ impl
                 return;
             }
             state.last_selection_serial = Some(serial);
+        }
+        if let Request::SetSelection {
+            source: Some(source),
+            ..
+        } = &request
+        {
+            state.used_selection_sources.insert(source.clone());
         }
         <DataDeviceState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
             state, client, resource, request, data, display, data_init,
@@ -1788,20 +1805,57 @@ mod data_device_tests {
 impl ClientDndGrabHandler for Astera {
     fn started(
         &mut self,
-        _source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
+        source: Option<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
         icon: Option<WlSurface>,
         _seat: Seat<Self>,
     ) {
         self.dnd_icon = icon;
         self.mark_render_dirty();
         self.refresh_visible_scales();
+        if let Some(source) = source {
+            self.start_toplevel_drag(&source);
+        }
     }
 
     fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+        self.finish_toplevel_drag();
         self.dnd_icon = None;
         self.dnd_touch_icon = None;
         self.mark_render_dirty();
         self.refresh_visible_scales();
+    }
+}
+
+impl
+    smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource,
+        smithay::wayland::selection::data_device::DataSourceUserData,
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        resource: &smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource,
+        request: smithay::reexports::wayland_server::protocol::wl_data_source::Request,
+        data: &smithay::wayland::selection::data_device::DataSourceUserData,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        <DataDeviceState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, resource, request, data, display, data_init,
+        );
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        client: ClientId,
+        resource: &smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource,
+        data: &smithay::wayland::selection::data_device::DataSourceUserData,
+    ) {
+        state.remove_toplevel_drag_source(resource);
+        <DataDeviceState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::destroyed(
+            state, client, resource, data,
+        );
     }
 }
 
@@ -2157,10 +2211,6 @@ smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
 ] => smithay::wayland::selection::data_device::DataDeviceState);
 smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
     smithay::reexports::wayland_server::protocol::wl_data_device_manager::WlDataDeviceManager: ()
-] => smithay::wayland::selection::data_device::DataDeviceState);
-smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
-    smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource:
-    smithay::wayland::selection::data_device::DataSourceUserData
 ] => smithay::wayland::selection::data_device::DataDeviceState);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
     smithay::reexports::wayland_protocols::wp::primary_selection::zv1::server::zwp_primary_selection_device_manager_v1::ZwpPrimarySelectionDeviceManagerV1:

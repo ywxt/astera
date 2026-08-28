@@ -118,6 +118,9 @@ use wayland_protocols::xdg::shell::client::{
     xdg_toplevel::XdgToplevel, xdg_wm_base::XdgWmBase,
 };
 use wayland_protocols::xdg::system_bell::v1::client::xdg_system_bell_v1::XdgSystemBellV1;
+use wayland_protocols::xdg::toplevel_drag::v1::client::{
+    xdg_toplevel_drag_manager_v1::XdgToplevelDragManagerV1, xdg_toplevel_drag_v1::XdgToplevelDragV1,
+};
 use wayland_protocols::xdg::toplevel_icon::v1::client::{
     xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1, xdg_toplevel_icon_v1::XdgToplevelIconV1,
 };
@@ -256,6 +259,8 @@ delegate_noop!(TestClient: ignore XdgToplevelIconV1);
 delegate_noop!(TestClient: ignore WpTearingControlManagerV1);
 delegate_noop!(TestClient: ignore WpTearingControlV1);
 delegate_noop!(TestClient: ignore WpPointerWarpV1);
+delegate_noop!(TestClient: ignore XdgToplevelDragManagerV1);
+delegate_noop!(TestClient: ignore XdgToplevelDragV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
 
 impl Dispatch<WlPointer, mpsc::Sender<u32>> for TestClient {
@@ -269,6 +274,29 @@ impl Dispatch<WlPointer, mpsc::Sender<u32>> for TestClient {
     ) {
         if let wayland_client::protocol::wl_pointer::Event::Enter { serial, .. } = event {
             serials.send(serial).unwrap();
+        }
+    }
+}
+
+struct PointerButtonSerial(mpsc::Sender<u32>);
+
+impl Dispatch<WlPointer, PointerButtonSerial> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &WlPointer,
+        event: wayland_client::protocol::wl_pointer::Event,
+        serial: &PointerButtonSerial,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_pointer::Event::Button {
+            serial: value,
+            state:
+                wayland_client::WEnum::Value(wayland_client::protocol::wl_pointer::ButtonState::Pressed),
+            ..
+        } = event
+        {
+            serial.0.send(value).unwrap();
         }
     }
 }
@@ -2711,6 +2739,204 @@ fn pointer_warp_requires_current_enter_serial_and_surface_bounds() {
         state.pointer_location
             == SmithayPoint::from((origin.x as f64 + 30.0, origin.y as f64 + 40.0))
     });
+    client.join().unwrap();
+}
+
+#[test]
+fn xdg_toplevel_drag_moves_window_with_data_device_grab() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (start_tx, start_rx) = mpsc::sync_channel(0);
+    let (started_tx, started_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let (cleanup_tx, cleanup_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let shm = globals.bind::<WlShm, _, _>(&queue, 1..=1, ()).unwrap();
+        let data_manager = globals
+            .bind::<WlDataDeviceManager, _, _>(&queue, 1..=3, ())
+            .unwrap();
+        let drag_manager = globals
+            .bind::<XdgToplevelDragManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let (button_tx, button_rx) = mpsc::channel();
+        let pointer = seat.get_pointer(&queue, PointerButtonSerial(button_tx));
+        let device = data_manager.get_data_device(&seat, &queue, mpsc::channel().0);
+        let source = data_manager.create_data_source(&queue, ());
+        source.offer("application/x-astera-tab".into());
+        let drag = drag_manager.get_xdg_toplevel_drag(&source, &queue, ());
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+        drag.attach(&toplevel, 20, 25);
+        surface.commit();
+        events.roundtrip(&mut TestClient).unwrap();
+        let fd = rustix::fs::memfd_create("astera-drag", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+        rustix::fs::ftruncate(&fd, 100 * 100 * 4).unwrap();
+        let pool = shm.create_pool(fd.as_fd(), 100 * 100 * 4, &queue, ());
+        let buffer = pool.create_buffer(
+            0,
+            100,
+            100,
+            100 * 4,
+            wayland_client::protocol::wl_shm::Format::Argb8888,
+            &queue,
+            (),
+        );
+        surface.attach(Some(&buffer), 0, 0);
+        surface.damage_buffer(0, 0, 100, 100);
+        surface.commit();
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+
+        start_rx.recv().unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        let serial = button_rx.recv().unwrap();
+        device.start_drag(Some(&source), &surface, None, serial);
+        connection.flush().unwrap();
+        started_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+        drag.destroy();
+        connection.flush().unwrap();
+        cleanup_tx.send(()).unwrap();
+        drop(pointer);
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state.windows.len() == 1 && state.windows[0].mapped && state.toplevel_drags.len() == 1
+    });
+    let window = state.windows[0].id;
+    let dragged_surface = state.windows[0].surface.wl_surface().clone();
+    let workspace = state.desktop.find_window(window).unwrap();
+    state
+        .desktop
+        .apply_window(
+            workspace,
+            WindowTransaction::SetMode {
+                id: window,
+                mode: WindowMode::Floating,
+                viewport_size: state.desktop.outputs[&state.active_output]
+                    .output
+                    .logical_size,
+            },
+        )
+        .unwrap();
+    let (origin, _, _, _) = state.visual_geometry(window).unwrap();
+    state.handle_pointer_motion((origin.x as f64 + 5.0, origin.y as f64 + 5.0).into(), 1);
+    let pointer = state.pointer.clone();
+    let press_serial = state.next_serial();
+    pointer.button(
+        &mut state,
+        &ButtonEvent {
+            serial: press_serial,
+            time: 2,
+            button: 0x110,
+            state: smithay::backend::input::ButtonState::Pressed,
+        },
+    );
+    pointer.frame(&mut state);
+    display.flush_clients().unwrap();
+    start_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| started_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state
+            .drag
+            .is_some_and(|drag| drag.window == window && drag.source == DragSource::Dnd)
+    });
+
+    state.handle_pointer_motion((origin.x as f64 + 80.0, origin.y as f64 + 70.0).into(), 3);
+    let preview = state.drag.unwrap().target;
+    assert_eq!(preview.origin, Point::new(origin.x + 60, origin.y + 45));
+    assert_ne!(
+        state.pointer.current_focus().as_ref(),
+        Some(&dragged_surface)
+    );
+    let release_serial = state.next_serial();
+    pointer.button(
+        &mut state,
+        &ButtonEvent {
+            serial: release_serial,
+            time: 4,
+            button: 0x110,
+            state: smithay::backend::input::ButtonState::Released,
+        },
+    );
+    pointer.frame(&mut state);
+    assert!(state.drag.is_none());
+    assert_eq!(
+        state.desktop.workspace(workspace).unwrap().floating[&window]
+            .viewport
+            .rect,
+        preview
+    );
+
+    done_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| cleanup_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state.toplevel_drags.is_empty()
+    });
+    client.join().unwrap();
+}
+
+#[test]
+fn toplevel_drag_source_cannot_be_used_as_clipboard_selection() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (sent_tx, sent_rx) = mpsc::sync_channel(0);
+    let (error_tx, error_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let data_manager = globals
+            .bind::<WlDataDeviceManager, _, _>(&queue, 1..=3, ())
+            .unwrap();
+        let drag_manager = globals
+            .bind::<XdgToplevelDragManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let device = data_manager.get_data_device(&seat, &queue, mpsc::channel().0);
+        let source = data_manager.create_data_source(&queue, ());
+        let _drag = drag_manager.get_xdg_toplevel_drag(&source, &queue, ());
+        device.set_selection(Some(&source), 0);
+        connection.flush().unwrap();
+        sent_tx.send(()).unwrap();
+        error_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| sent_rx.try_recv().is_ok());
+    display.dispatch_clients(&mut state).unwrap();
+    display.flush_clients().unwrap();
+    let mut rejected = false;
+    dispatch_until(&mut display, &mut state, |_| match error_rx.try_recv() {
+        Ok(value) => {
+            rejected = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(rejected);
     client.join().unwrap();
 }
 
