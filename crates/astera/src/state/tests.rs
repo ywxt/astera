@@ -889,6 +889,73 @@ fn input_timestamps_report_nanoseconds_and_drop_destroyed_subscriptions() {
 }
 
 #[test]
+fn input_timestamps_do_not_leak_to_transient_seat_resources() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    let server_client = display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::trusted_input()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (receive_tx, receive_rx) = mpsc::sync_channel(0);
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let main_seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let transient_manager = globals
+            .bind::<ExtTransientSeatManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let timestamp_manager = globals
+            .bind::<ZwpInputTimestampsManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let (name_tx, name_rx) = mpsc::channel();
+        let _transient = transient_manager.create(&queue, name_tx);
+        connection.flush().unwrap();
+        events.blocking_dispatch(&mut TestClient).unwrap();
+        let global_name = name_rx.recv().unwrap();
+        let transient_seat: WlSeat = globals.registry().bind(global_name, 9, &queue, ());
+        let main_pointer = main_seat.get_pointer(&queue, ());
+        let transient_pointer = transient_seat.get_pointer(&queue, ());
+        let (main_tx, main_rx) = mpsc::channel();
+        let (transient_tx, transient_rx) = mpsc::channel();
+        let _main_timestamps =
+            timestamp_manager.get_pointer_timestamps(&main_pointer, &queue, main_tx);
+        let _transient_timestamps =
+            timestamp_manager.get_pointer_timestamps(&transient_pointer, &queue, transient_tx);
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+
+        receive_rx.recv().unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        result_tx
+            .send((main_rx.try_recv().is_ok(), transient_rx.try_recv().is_ok()))
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state.input_timestamp_subscriptions.len() == 2
+    });
+    state.send_input_timestamp(
+        input_timestamps::InputTimestampKind::Pointer,
+        Some(&server_client.id()),
+        2_500_125,
+    );
+    display.flush_clients().unwrap();
+    receive_tx.send(()).unwrap();
+    let mut result = None;
+    dispatch_until(&mut display, &mut state, |_| {
+        result = result_rx.try_recv().ok();
+        result.is_some()
+    });
+    assert_eq!(result, Some((true, false)));
+    client.join().unwrap();
+}
+
+#[test]
 fn security_context_accepts_clients_and_hides_privileged_managers() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());

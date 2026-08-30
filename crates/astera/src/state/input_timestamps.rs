@@ -1,12 +1,15 @@
-use smithay::reexports::{
-    wayland_protocols::wp::input_timestamps::zv1::server::{
-        zwp_input_timestamps_manager_v1::{self, ZwpInputTimestampsManagerV1},
-        zwp_input_timestamps_v1::{self, ZwpInputTimestampsV1},
-    },
-    wayland_server::{
-        Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
-        backend::{ClientId, GlobalId},
-        protocol::{wl_keyboard::WlKeyboard, wl_pointer::WlPointer, wl_touch::WlTouch},
+use smithay::{
+    input::{keyboard::KeyboardHandle, pointer::PointerHandle, touch::TouchHandle},
+    reexports::{
+        wayland_protocols::wp::input_timestamps::zv1::server::{
+            zwp_input_timestamps_manager_v1::{self, ZwpInputTimestampsManagerV1},
+            zwp_input_timestamps_v1::{self, ZwpInputTimestampsV1},
+        },
+        wayland_server::{
+            Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
+            backend::{ClientId, GlobalId},
+            protocol::{wl_keyboard::WlKeyboard, wl_pointer::WlPointer, wl_touch::WlTouch},
+        },
     },
 };
 
@@ -48,6 +51,23 @@ impl InputTimestampTarget {
             Self::Keyboard(resource) => resource.client(),
             Self::Pointer(resource) => resource.client(),
             Self::Touch(resource) => resource.client(),
+        }
+    }
+
+    fn belongs_to_main_seat(
+        &self,
+        keyboard: &KeyboardHandle<Astera>,
+        pointer: &PointerHandle<Astera>,
+        touch: &TouchHandle<Astera>,
+    ) -> bool {
+        match self {
+            Self::Keyboard(resource) => {
+                KeyboardHandle::from_resource(resource).as_ref() == Some(keyboard)
+            }
+            Self::Pointer(resource) => {
+                PointerHandle::from_resource(resource).as_ref() == Some(pointer)
+            }
+            Self::Touch(resource) => TouchHandle::from_resource(resource).as_ref() == Some(touch),
         }
     }
 }
@@ -161,11 +181,17 @@ impl Astera {
         let Some(client) = client else {
             return;
         };
+        let keyboard = self.keyboard.clone();
+        let pointer = self.pointer.clone();
+        let touch = self.touch.clone();
         self.input_timestamp_subscriptions.retain(|subscription| {
             if !subscription.protocol.is_alive() || !subscription.target.alive() {
                 return false;
             }
             if subscription.target.kind() == kind
+                && subscription
+                    .target
+                    .belongs_to_main_seat(&keyboard, &pointer, &touch)
                 && subscription
                     .target
                     .client()
