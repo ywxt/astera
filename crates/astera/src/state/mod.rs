@@ -913,7 +913,7 @@ impl Astera {
                     .and_then(|surface| surface.client())
                     .map(|client| client.id());
                 let timestamp_recipient = recipient.clone();
-                let timestamp = event.time_msec();
+                let timestamp = event.time();
                 let intercepted = keyboard.input::<(), _>(
                     self,
                     key_code,
@@ -993,11 +993,19 @@ impl Astera {
                 let location = event.position_transformed(
                     (saturating_i32(size.width), saturating_i32(size.height)).into(),
                 );
-                self.handle_absolute_pointer_motion(location, event.time_msec());
+                self.handle_absolute_pointer_motion_precise(
+                    location,
+                    event.time_msec(),
+                    event.time(),
+                );
             }
             InputEvent::PointerMotion { event } => self.handle_relative_pointer_motion(event),
             InputEvent::GestureSwipeBegin { event } => {
-                self.handle_absolute_pointer_motion(self.pointer_location, event.time_msec());
+                self.handle_absolute_pointer_motion_precise(
+                    self.pointer_location,
+                    event.time_msec(),
+                    event.time(),
+                );
                 self.start_swipe_gesture(event.time_msec(), event.fingers());
             }
             InputEvent::GestureSwipeUpdate { event } => {
@@ -1035,7 +1043,11 @@ impl Astera {
             }
             InputEvent::GesturePinchBegin { event } => {
                 self.cancel_pointer_gesture(event.time_msec());
-                self.handle_absolute_pointer_motion(self.pointer_location, event.time_msec());
+                self.handle_absolute_pointer_motion_precise(
+                    self.pointer_location,
+                    event.time_msec(),
+                    event.time(),
+                );
                 let pointer = self.pointer.clone();
                 let Some(surface) = pointer.current_focus() else {
                     return;
@@ -1090,7 +1102,11 @@ impl Astera {
             }
             InputEvent::GestureHoldBegin { event } => {
                 self.cancel_pointer_gesture(event.time_msec());
-                self.handle_absolute_pointer_motion(self.pointer_location, event.time_msec());
+                self.handle_absolute_pointer_motion_precise(
+                    self.pointer_location,
+                    event.time_msec(),
+                    event.time(),
+                );
                 let pointer = self.pointer.clone();
                 let Some(surface) = pointer.current_focus() else {
                     return;
@@ -1160,7 +1176,7 @@ impl Astera {
                 self.send_input_timestamp(
                     input_timestamps::InputTimestampKind::Touch,
                     recipient.as_ref(),
-                    event.time_msec(),
+                    event.time(),
                 );
                 touch.down(
                     self,
@@ -1211,7 +1227,7 @@ impl Astera {
                 self.send_input_timestamp(
                     input_timestamps::InputTimestampKind::Touch,
                     recipient.as_ref(),
-                    event.time_msec(),
+                    event.time(),
                 );
                 touch.motion(
                     self,
@@ -1243,7 +1259,7 @@ impl Astera {
                 self.send_input_timestamp(
                     input_timestamps::InputTimestampKind::Touch,
                     recipient.as_ref(),
-                    event.time_msec(),
+                    event.time(),
                 );
                 touch.up(
                     self,
@@ -1271,6 +1287,7 @@ impl Astera {
                 event.button_code(),
                 event.state(),
                 event.time_msec(),
+                event.time(),
             ),
             InputEvent::PointerAxis { event } => self.handle_pointer_axis(event),
             _ => {}
@@ -1415,7 +1432,7 @@ impl Astera {
         self.active_pointer_gesture = Some(ActivePointerGesture::Swipe(surface));
     }
 
-    fn forward_keyboard_event(&mut self, client: Option<&ClientId>, time: u32) -> FilterResult<()> {
+    fn forward_keyboard_event(&mut self, client: Option<&ClientId>, time: u64) -> FilterResult<()> {
         self.send_input_timestamp(input_timestamps::InputTimestampKind::Keyboard, client, time);
         FilterResult::Forward
     }
@@ -1424,6 +1441,15 @@ impl Astera {
         &mut self,
         location: SmithayPoint<f64, smithay::utils::Logical>,
         time: u32,
+    ) {
+        self.handle_pointer_motion_precise(location, time, u64::from(time) * 1_000);
+    }
+
+    fn handle_pointer_motion_precise(
+        &mut self,
+        location: SmithayPoint<f64, smithay::utils::Logical>,
+        time: u32,
+        time_usec: u64,
     ) {
         self.pointer_location = location;
         let changed_owner = self.active_tablet_cursor.take().is_some();
@@ -1469,7 +1495,7 @@ impl Astera {
         self.send_input_timestamp(
             input_timestamps::InputTimestampKind::Pointer,
             timestamp_recipient.as_ref(),
-            time,
+            time_usec,
         );
         pointer.motion(
             self,
@@ -1499,10 +1525,19 @@ impl Astera {
         target: SmithayPoint<f64, smithay::utils::Logical>,
         time: u32,
     ) {
+        self.handle_absolute_pointer_motion_precise(target, time, u64::from(time) * 1_000);
+    }
+
+    fn handle_absolute_pointer_motion_precise(
+        &mut self,
+        target: SmithayPoint<f64, smithay::utils::Logical>,
+        time: u32,
+        time_usec: u64,
+    ) {
         match self.constrain_pointer_target(target) {
             pointer_constraints::ConstrainedPointerTarget::Locked => {}
             pointer_constraints::ConstrainedPointerTarget::Motion(location) => {
-                self.handle_pointer_motion(location, time);
+                self.handle_pointer_motion_precise(location, time, time_usec);
             }
         }
     }
@@ -1553,7 +1588,7 @@ impl Astera {
             pointer_constraints::ConstrainedPointerTarget::Motion(location) => location,
         };
         pointer.relative_motion(self, relative_focus, &relative);
-        self.handle_pointer_motion(location, event.time_msec());
+        self.handle_pointer_motion_precise(location, event.time_msec(), event.time());
     }
 
     fn handle_pointer_axis<B: InputBackend, E: PointerAxisEvent<B>>(&mut self, event: E) {
@@ -1562,7 +1597,11 @@ impl Astera {
             self.refresh_visible_scales();
         }
         if self.session_is_locked() {
-            self.handle_pointer_motion(self.pointer_location, event.time_msec());
+            self.handle_pointer_motion_precise(
+                self.pointer_location,
+                event.time_msec(),
+                event.time(),
+            );
         }
         let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
         for axis in [Axis::Horizontal, Axis::Vertical] {
@@ -1587,7 +1626,7 @@ impl Astera {
         self.send_input_timestamp(
             input_timestamps::InputTimestampKind::Pointer,
             timestamp_recipient.as_ref(),
-            event.time_msec(),
+            event.time(),
         );
         pointer.axis(self, frame);
         pointer.frame(self);
@@ -1671,6 +1710,7 @@ impl Astera {
         button_code: u32,
         state: BackendButtonState,
         time: u32,
+        time_usec: u64,
     ) {
         if self.active_tablet_cursor.take().is_some() {
             self.mark_render_dirty();
@@ -1715,7 +1755,7 @@ impl Astera {
         self.send_input_timestamp(
             input_timestamps::InputTimestampKind::Pointer,
             recipient.as_ref(),
-            time,
+            time_usec,
         );
         pointer.motion(
             self,
@@ -1740,7 +1780,7 @@ impl Astera {
         self.send_input_timestamp(
             input_timestamps::InputTimestampKind::Pointer,
             button_recipient.as_ref(),
-            time,
+            time_usec,
         );
         pointer.button(
             self,

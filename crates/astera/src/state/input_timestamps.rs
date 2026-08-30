@@ -156,7 +156,7 @@ impl Astera {
         &mut self,
         kind: InputTimestampKind,
         client: Option<&ClientId>,
-        time_msec: u32,
+        time_usec: u64,
     ) {
         let Some(client) = client else {
             return;
@@ -171,11 +171,11 @@ impl Astera {
                     .client()
                     .is_some_and(|target| &target.id() == client)
             {
-                let seconds = u64::from(time_msec / 1000);
+                let seconds = time_usec / 1_000_000;
                 subscription.protocol.timestamp(
                     (seconds >> 32) as u32,
                     seconds as u32,
-                    (time_msec % 1000) * 1_000_000,
+                    ((time_usec % 1_000_000) * 1_000) as u32,
                 );
             }
             true

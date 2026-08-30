@@ -867,7 +867,7 @@ fn input_timestamps_report_nanoseconds_and_drop_destroyed_subscriptions() {
     state.send_input_timestamp(
         input_timestamps::InputTimestampKind::Pointer,
         Some(&server_client.id()),
-        1_234,
+        1_234_567,
     );
     display.flush_clients().unwrap();
     receive_tx.send(()).unwrap();
@@ -876,7 +876,7 @@ fn input_timestamps_report_nanoseconds_and_drop_destroyed_subscriptions() {
         timestamp = timestamp_rx.try_recv().ok();
         timestamp.is_some()
     });
-    assert_eq!(timestamp.unwrap(), (0, 1, 234_000_000));
+    assert_eq!(timestamp.unwrap(), (0, 1, 234_567_000));
 
     destroy_tx.send(()).unwrap();
     dispatch_until(&mut display, &mut state, |_| {
