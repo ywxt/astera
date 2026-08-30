@@ -68,6 +68,7 @@ use wayland_protocols::wp::{
         wp_cursor_shape_device_v1::WpCursorShapeDeviceV1,
         wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
     },
+    drm_lease::v1::client::wp_drm_lease_device_v1::WpDrmLeaseDeviceV1,
     fifo::v1::client::{wp_fifo_manager_v1::WpFifoManagerV1, wp_fifo_v1::WpFifoV1},
     fractional_scale::v1::client::{
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
@@ -340,6 +341,7 @@ delegate_noop!(TestClient: ignore WlSeat);
 delegate_noop!(TestClient: ignore ExtTransientSeatManagerV1);
 delegate_noop!(TestClient: ignore WpColorRepresentationSurfaceV1);
 delegate_noop!(TestClient: ignore WpLinuxDrmSyncobjManagerV1);
+delegate_noop!(TestClient: ignore WpDrmLeaseDeviceV1);
 delegate_noop!(TestClient: ignore WlOutput);
 delegate_noop!(TestClient: ignore WlPointer);
 delegate_noop!(TestClient: ignore WlShm);
@@ -1076,20 +1078,26 @@ fn color_representation_advertises_only_supported_alpha_and_commits_atomically()
         connection.flush().unwrap();
     });
 
+    let mut created = false;
     dispatch_until(&mut display, &mut state, |state| {
-        created_rx.try_recv().is_ok() && !state.pending_color_alpha.is_empty()
+        created |= created_rx.try_recv().is_ok();
+        created && !state.pending_color_alpha.is_empty()
     });
     let surface = state.color_representations.keys().next().unwrap().clone();
     assert!(!state.electrical_alpha_surfaces.contains(&surface));
 
     commit_tx.send(()).unwrap();
+    let mut committed = false;
     dispatch_until(&mut display, &mut state, |state| {
-        committed_rx.try_recv().is_ok() && state.electrical_alpha_surfaces.contains(&surface)
+        committed |= committed_rx.try_recv().is_ok();
+        committed && state.electrical_alpha_surfaces.contains(&surface)
     });
 
     destroy_tx.send(()).unwrap();
+    let mut destroyed = false;
     dispatch_until(&mut display, &mut state, |state| {
-        destroyed_rx.try_recv().is_ok() && state.pending_color_alpha.contains_key(&surface)
+        destroyed |= destroyed_rx.try_recv().is_ok();
+        destroyed && state.pending_color_alpha.contains_key(&surface)
     });
     assert!(state.electrical_alpha_surfaces.contains(&surface));
 
@@ -1301,7 +1309,7 @@ fn dmabuf_with_a_render_node_advertises_version_four_feedback() {
 }
 
 #[test]
-fn drm_syncobj_is_not_advertised_without_a_capable_native_device() {
+fn native_drm_protocols_are_not_advertised_without_a_capable_device() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
     let (server_socket, client_socket) = UnixStream::pair().unwrap();
@@ -1315,14 +1323,17 @@ fn drm_syncobj_is_not_advertised_without_a_capable_native_device() {
         let (globals, queue) = registry_queue_init::<TestClient>(&connection).unwrap();
         let handle = queue.handle();
         result_tx
-            .send(
+            .send((
                 globals
                     .bind::<WpLinuxDrmSyncobjManagerV1, _, _>(&handle, 1..=1, ())
                     .is_err(),
-            )
+                globals
+                    .bind::<WpDrmLeaseDeviceV1, _, _>(&handle, 1..=1, ())
+                    .is_err(),
+            ))
             .unwrap();
     });
-    let mut hidden = false;
+    let mut hidden = (false, false);
     dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
         Ok(value) => {
             hidden = value;
@@ -1330,7 +1341,7 @@ fn drm_syncobj_is_not_advertised_without_a_capable_native_device() {
         }
         Err(_) => false,
     });
-    assert!(hidden);
+    assert_eq!(hidden, (true, true));
     assert!(state.pending_drm_syncobj_sources.is_empty());
     client.join().unwrap();
 }

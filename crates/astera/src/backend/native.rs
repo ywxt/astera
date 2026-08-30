@@ -378,6 +378,7 @@ impl NativeLoop {
             }
             NativeEvent::Session(SessionEvent::PauseSession) => {
                 self.session_active = false;
+                self.state.suspend_drm_leases();
                 self.libinput.suspend();
                 self.scheduler.pause();
                 for device in self.devices.values_mut() {
@@ -423,6 +424,7 @@ impl NativeLoop {
                         }
                     }
                 }
+                self.state.resume_drm_leases();
                 for (node, path) in std::mem::take(&mut self.deferred_devices) {
                     if let Err(error) = self.device_added(node, &path) {
                         tracing::error!(?node, ?path, %error, "could not add deferred DRM device");
@@ -557,6 +559,14 @@ impl NativeLoop {
         )?;
         let fd = DrmDeviceFd::new(DeviceFd::from(fd));
         let (drm, notifier) = DrmDevice::new(fd.clone(), true)?;
+        match DrmDevice::new(fd.clone(), true) {
+            Ok((lease_device, _notifier)) => {
+                if let Err(error) = self.state.register_drm_lease_device(node, lease_device) {
+                    tracing::warn!(?node, %error, "could not advertise DRM lease device");
+                }
+            }
+            Err(error) => tracing::warn!(?node, %error, "could not create DRM lease device"),
+        }
         let gbm = GbmDevice::new(fd.clone())?;
         self.gpus.as_mut().add_node(node, gbm.clone())?;
         let allocator = GbmAllocator::new(
@@ -622,8 +632,24 @@ impl NativeLoop {
                         connector_is_non_desktop(device.output_manager.device(), connector.handle())
                     });
                     if non_desktop {
+                        let name = format!(
+                            "{}-{}",
+                            connector.interface().as_str(),
+                            connector.interface_id()
+                        );
                         if let Some(device) = self.devices.get_mut(&node) {
                             device.lease_connectors.insert(connector.handle());
+                        }
+                        if let Some(crtc) = crtc {
+                            self.state.add_drm_lease_connector(
+                                node,
+                                connector.handle(),
+                                crtc,
+                                name.clone(),
+                                format!("Non-desktop connector {name}"),
+                            );
+                        } else {
+                            tracing::warn!(?node, connector = ?connector.handle(), "non-desktop connector has no free CRTC and cannot be leased");
                         }
                         tracing::info!(
                             ?node,
@@ -761,6 +787,8 @@ impl NativeLoop {
                     }
                 }
                 DrmScanEvent::Disconnected { connector, crtc } => {
+                    self.state
+                        .remove_drm_lease_connector(node, connector.handle());
                     if let Some(device) = self.devices.get_mut(&node) {
                         device.lease_connectors.remove(&connector.handle());
                     }
@@ -797,6 +825,7 @@ impl NativeLoop {
         // Rebase feedback after Desktop has selected replacement outputs so unmapped surfaces
         // using the active-output fallback receive the new main device as well.
         self.state.unregister_dmabuf_device(node.dev_id());
+        self.state.unregister_drm_lease_device(node);
         if let Some(device) = self.devices.remove(&node) {
             self.handle.remove(device.registration);
             self.gpus.as_mut().remove_node(&node);

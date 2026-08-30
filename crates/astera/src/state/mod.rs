@@ -13,6 +13,7 @@ mod clock;
 mod color_representation;
 mod config_watcher;
 pub(crate) mod cursor;
+mod drm_lease;
 mod event_hub;
 mod ext_workspace;
 mod geometry;
@@ -272,6 +273,7 @@ pub struct Astera {
     dmabuf_feedback_surfaces: HashSet<WlSurface>,
     drm_syncobj_device: Option<u64>,
     pending_drm_syncobj_sources: Vec<(Client, DrmSyncPointSource)>,
+    drm_leases: HashMap<smithay::backend::drm::DrmNode, drm_lease::DrmLeaseRuntime>,
     serial: u32,
     session_lock_manager: SessionLockManagerState,
     session_lock_advertised: Arc<AtomicBool>,
@@ -674,6 +676,7 @@ impl Astera {
             dmabuf_feedback_surfaces: HashSet::new(),
             drm_syncobj_device: None,
             pending_drm_syncobj_sources: Vec::new(),
+            drm_leases: HashMap::new(),
             serial: 1,
             session_lock_manager,
             session_lock_advertised,
