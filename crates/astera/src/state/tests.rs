@@ -81,6 +81,7 @@ use wayland_protocols::wp::{
         zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
         zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
     },
+    linux_drm_syncobj::v1::client::wp_linux_drm_syncobj_manager_v1::WpLinuxDrmSyncobjManagerV1,
     pointer_constraints::zv1::client::{
         zwp_locked_pointer_v1::ZwpLockedPointerV1,
         zwp_pointer_constraints_v1::{self, ZwpPointerConstraintsV1},
@@ -338,6 +339,7 @@ delegate_noop!(TestClient: ignore WlCallback);
 delegate_noop!(TestClient: ignore WlSeat);
 delegate_noop!(TestClient: ignore ExtTransientSeatManagerV1);
 delegate_noop!(TestClient: ignore WpColorRepresentationSurfaceV1);
+delegate_noop!(TestClient: ignore WpLinuxDrmSyncobjManagerV1);
 delegate_noop!(TestClient: ignore WlOutput);
 delegate_noop!(TestClient: ignore WlPointer);
 delegate_noop!(TestClient: ignore WlShm);
@@ -1295,6 +1297,41 @@ fn dmabuf_with_a_render_node_advertises_version_four_feedback() {
         Err(_) => false,
     });
     assert_eq!(advertised, Some(true));
+    client.join().unwrap();
+}
+
+#[test]
+fn drm_syncobj_is_not_advertised_without_a_capable_native_device() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, queue) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let handle = queue.handle();
+        result_tx
+            .send(
+                globals
+                    .bind::<WpLinuxDrmSyncobjManagerV1, _, _>(&handle, 1..=1, ())
+                    .is_err(),
+            )
+            .unwrap();
+    });
+    let mut hidden = false;
+    dispatch_until(&mut display, &mut state, |_| match result_rx.try_recv() {
+        Ok(value) => {
+            hidden = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(hidden);
+    assert!(state.pending_drm_syncobj_sources.is_empty());
     client.join().unwrap();
 }
 

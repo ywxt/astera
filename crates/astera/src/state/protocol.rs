@@ -239,10 +239,25 @@ impl DmabufHandler for Astera {
     }
 }
 
+impl smithay::wayland::drm_syncobj::DrmSyncobjHandler for Astera {
+    fn drm_syncobj_state(&mut self) -> Option<&mut smithay::wayland::drm_syncobj::DrmSyncobjState> {
+        self.drm_syncobj_state.as_mut()
+    }
+}
+
 const MAX_PENDING_DMABUF_IMPORTS: usize = 256;
 
 fn dmabuf_import_queue_has_capacity(pending: usize) -> bool {
     pending < MAX_PENDING_DMABUF_IMPORTS
+}
+
+#[derive(Debug)]
+struct CancelledCommitBlocker;
+
+impl smithay::wayland::compositor::Blocker for CancelledCommitBlocker {
+    fn state(&self) -> smithay::wayland::compositor::BlockerState {
+        smithay::wayland::compositor::BlockerState::Cancelled
+    }
 }
 
 impl Astera {
@@ -317,6 +332,36 @@ impl CompositorHandler for Astera {
             .get_data::<ClientState>()
             .expect("all Astera clients have compositor state")
             .compositor_state
+    }
+
+    fn new_surface(&mut self, surface: &WlSurface) {
+        smithay::wayland::compositor::add_pre_commit_hook::<Self, _>(
+            surface,
+            |state, _display, surface| {
+                let acquire = with_states(surface, |states| {
+                    let mut sync = states.cached_state.get::<DrmSyncobjCachedState>();
+                    sync.pending().acquire_point.clone()
+                });
+                let Some(acquire) = acquire else {
+                    return;
+                };
+                match acquire.generate_blocker() {
+                    Ok((blocker, source)) => {
+                        smithay::wayland::compositor::add_blocker(surface, blocker);
+                        if let Some(client) = surface.client() {
+                            state.pending_drm_syncobj_sources.push((client, source));
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to create DRM syncobj commit blocker");
+                        // Never apply a buffer whose acquire fence could not be observed. A
+                        // cancelled transaction is safer than sampling potentially incomplete
+                        // client rendering after a device removal or timeline failure.
+                        smithay::wayland::compositor::add_blocker(surface, CancelledCommitBlocker);
+                    }
+                }
+            },
+        );
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -2230,6 +2275,7 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
     smithay::wayland::selection::primary_selection::PrimarySourceUserData
 ] => smithay::wayland::selection::primary_selection::PrimarySelectionState);
 delegate_dmabuf!(Astera);
+delegate_drm_syncobj!(Astera);
 smithay::delegate_security_context!(Astera);
 delegate_presentation!(Astera);
 delegate_ext_data_control!(Astera);

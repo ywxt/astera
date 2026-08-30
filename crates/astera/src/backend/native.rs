@@ -46,7 +46,10 @@ use smithay::{
         wayland_server::Display,
     },
     utils::{DeviceFd, Physical, Point},
-    wayland::{presentation::Refresh, security_context::SecurityContext},
+    wayland::{
+        drm_syncobj::supports_syncobj_eventfd, presentation::Refresh,
+        security_context::SecurityContext,
+    },
 };
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 
@@ -160,6 +163,7 @@ fn edid_blob(device: &impl ControlDevice, connector: connector::Handle) -> Optio
 }
 
 struct NativeDevice {
+    fd: DrmDeviceFd,
     output_manager: NativeOutputManager,
     scanner: DrmScanner,
     registration: RegistrationToken,
@@ -550,6 +554,9 @@ impl NativeLoop {
         let render_formats = self.gpus.single_renderer(&node)?.dmabuf_formats();
         self.state
             .enable_dmabuf(Some(node.dev_id()), render_formats.clone());
+        if supports_syncobj_eventfd(&fd) {
+            self.state.enable_drm_syncobj(node.dev_id(), fd.clone());
+        }
         let output_manager = DrmOutputManager::new(
             drm,
             allocator,
@@ -566,6 +573,7 @@ impl NativeLoop {
         self.devices.insert(
             node,
             NativeDevice {
+                fd,
                 output_manager,
                 scanner: DrmScanner::new(),
                 registration,
@@ -761,6 +769,13 @@ impl NativeLoop {
             self.handle.remove(device.registration);
             self.gpus.as_mut().remove_node(&node);
         }
+        let replacement = self
+            .devices
+            .iter()
+            .find(|(_, device)| supports_syncobj_eventfd(&device.fd))
+            .map(|(node, device)| (node.dev_id(), device.fd.clone()));
+        self.state
+            .remove_drm_syncobj_device(node.dev_id(), replacement);
     }
 
     fn frame_submitted(&mut self, node: DrmNode, crtc: crtc::Handle) {
@@ -1534,6 +1549,15 @@ pub fn run(config: Config, config_path: std::path::PathBuf) -> Result<()> {
                 .handle
                 .insert_source(source, move |stream, _, runtime| {
                     runtime.enqueue(NativeEvent::SandboxedClient(stream, context.clone()));
+                })
+                .map_err(|error| anyhow!(error.to_string()))?;
+        }
+        for (client, source) in runtime.state.take_pending_drm_syncobj_sources() {
+            runtime
+                .handle
+                .insert_source(source, move |(), _, runtime| {
+                    runtime.state.notify_drm_syncobj_ready(&client);
+                    Ok(())
                 })
                 .map_err(|error| anyhow!(error.to_string()))?;
         }

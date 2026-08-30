@@ -105,6 +105,41 @@ impl Dispatch<ZxdgOutputV1, AsteraXdgOutputData> for Astera {
 }
 
 impl Astera {
+    pub(crate) fn enable_drm_syncobj(
+        &mut self,
+        device: u64,
+        fd: smithay::backend::drm::DrmDeviceFd,
+    ) {
+        if self.drm_syncobj_state.is_some() {
+            return;
+        }
+        self.drm_syncobj_state = Some(DrmSyncobjState::new::<Self>(&self.display, fd));
+        self.drm_syncobj_device = Some(device);
+    }
+
+    pub(crate) fn remove_drm_syncobj_device(
+        &mut self,
+        removed: u64,
+        replacement: Option<(u64, smithay::backend::drm::DrmDeviceFd)>,
+    ) {
+        if self.drm_syncobj_device != Some(removed) {
+            return;
+        }
+        if let Some((device, fd)) = replacement {
+            if let Some(state) = self.drm_syncobj_state.as_mut() {
+                state.update_device(fd);
+                self.drm_syncobj_device = Some(device);
+            }
+            return;
+        }
+        if let Some(state) = self.drm_syncobj_state.take() {
+            let global = state.into_global();
+            self.display.disable_global::<Self>(global.clone());
+            self.display.remove_global::<Self>(global);
+        }
+        self.drm_syncobj_device = None;
+    }
+
     fn send_xdg_output_state(&self, output: OutputId, instance: &ZxdgOutputV1, initial: bool) {
         let Some(runtime) = self.output_runtime.get(&output) else {
             return;

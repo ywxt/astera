@@ -83,11 +83,11 @@ use smithay::{
         },
     },
     delegate_alpha_modifier, delegate_compositor, delegate_content_type, delegate_cursor_shape,
-    delegate_dmabuf, delegate_ext_data_control, delegate_fifo, delegate_foreign_toplevel_list,
-    delegate_fractional_scale, delegate_idle_inhibit, delegate_keyboard_shortcuts_inhibit,
-    delegate_layer_shell, delegate_pointer_constraints, delegate_pointer_gestures,
-    delegate_presentation, delegate_relative_pointer, delegate_seat, delegate_shm,
-    delegate_single_pixel_buffer, delegate_tablet_manager, delegate_viewporter,
+    delegate_dmabuf, delegate_drm_syncobj, delegate_ext_data_control, delegate_fifo,
+    delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_inhibit,
+    delegate_keyboard_shortcuts_inhibit, delegate_layer_shell, delegate_pointer_constraints,
+    delegate_pointer_gestures, delegate_presentation, delegate_relative_pointer, delegate_seat,
+    delegate_shm, delegate_single_pixel_buffer, delegate_tablet_manager, delegate_viewporter,
     delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_dialog, delegate_xdg_shell,
     delegate_xdg_system_bell,
     desktop::{
@@ -129,6 +129,7 @@ use smithay::{
             DmabufFeedback, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
             SurfaceDmabufFeedbackState,
         },
+        drm_syncobj::{DrmSyncPointSource, DrmSyncobjCachedState, DrmSyncobjState},
         fifo::FifoManagerState,
         foreign_toplevel_list::{ForeignToplevelListHandler, ForeignToplevelListState},
         fractional_scale::{
@@ -269,6 +270,8 @@ pub struct Astera {
     dmabuf_output_devices: BTreeMap<OutputId, u64>,
     dmabuf_output_feedback: BTreeMap<OutputId, DmabufFeedback>,
     dmabuf_feedback_surfaces: HashSet<WlSurface>,
+    drm_syncobj_device: Option<u64>,
+    pending_drm_syncobj_sources: Vec<(Client, DrmSyncPointSource)>,
     serial: u32,
     session_lock_manager: SessionLockManagerState,
     session_lock_advertised: Arc<AtomicBool>,
@@ -323,6 +326,19 @@ impl DerefMut for Astera {
 }
 
 impl Astera {
+    pub(crate) fn take_pending_drm_syncobj_sources(&mut self) -> Vec<(Client, DrmSyncPointSource)> {
+        std::mem::take(&mut self.pending_drm_syncobj_sources)
+    }
+
+    pub(crate) fn notify_drm_syncobj_ready(&mut self, client: &Client) {
+        let display = self.display.clone();
+        if let Some(client_state) = client.get_data::<ClientState>() {
+            client_state
+                .compositor_state
+                .blocker_cleared(self, &display);
+        }
+    }
+
     pub(crate) fn take_pending_security_contexts(
         &mut self,
     ) -> Vec<(SecurityContextListenerSource, SecurityContext)> {
@@ -575,6 +591,7 @@ impl Astera {
                 _transient_seat_state: transient_seat_state,
                 _color_representation_state: color_representation_state,
                 dmabuf_state: DmabufState::new(),
+                drm_syncobj_state: None,
                 popup_manager: PopupManager::default(),
                 seat,
                 keyboard,
@@ -655,6 +672,8 @@ impl Astera {
             dmabuf_output_devices: BTreeMap::new(),
             dmabuf_output_feedback: BTreeMap::new(),
             dmabuf_feedback_surfaces: HashSet::new(),
+            drm_syncobj_device: None,
+            pending_drm_syncobj_sources: Vec::new(),
             serial: 1,
             session_lock_manager,
             session_lock_advertised,
