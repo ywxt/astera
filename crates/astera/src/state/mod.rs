@@ -19,6 +19,7 @@ mod ext_workspace;
 mod geometry;
 mod idle;
 mod input_method;
+mod input_timestamps;
 mod key_repeat;
 mod model;
 mod output;
@@ -238,6 +239,7 @@ pub struct Astera {
     output_aliases: HashMap<String, OutputId>,
     ambiguous_output_aliases: HashSet<String>,
     touch_slots: HashMap<(String, i32), (OutputId, smithay::backend::input::TouchSlot)>,
+    touch_timestamp_clients: HashMap<smithay::backend::input::TouchSlot, ClientId>,
     next_touch_slot: u32,
     tablets: HashMap<String, (smithay::wayland::tablet_manager::TabletDescriptor, smithay::wayland::tablet_manager::TabletHandle)>,
     tablet_tools: HashMap<
@@ -310,6 +312,7 @@ pub struct Astera {
     used_dnd_sources: HashSet<smithay::reexports::wayland_server::protocol::wl_data_source::WlDataSource>,
     workspace_managers: Vec<ext_workspace::WorkspaceManagerInstance>,
     transient_seats: Vec<transient_seat::TransientSeatRuntime>,
+    input_timestamp_subscriptions: Vec<input_timestamps::InputTimestampSubscription>,
     next_transient_seat: u64,
 }
 
@@ -534,6 +537,7 @@ impl Astera {
         let transient_seat_state = transient_seat::TransientSeatState::new(display);
         let color_representation_state =
             color_representation::ColorRepresentationState::new(display);
+        let input_timestamp_state = input_timestamps::InputTimestampState::new(display);
 
         let active_output = OutputId(0);
         let mut desktop = Desktop::new(config.gap);
@@ -592,6 +596,7 @@ impl Astera {
                 _ext_workspace_state: ext_workspace_state,
                 _transient_seat_state: transient_seat_state,
                 _color_representation_state: color_representation_state,
+                _input_timestamp_state: input_timestamp_state,
                 dmabuf_state: DmabufState::new(),
                 drm_syncobj_state: None,
                 popup_manager: PopupManager::default(),
@@ -646,6 +651,7 @@ impl Astera {
             output_aliases: HashMap::new(),
             ambiguous_output_aliases: HashSet::new(),
             touch_slots: HashMap::new(),
+            touch_timestamp_clients: HashMap::new(),
             next_touch_slot: 0,
             tablets: HashMap::new(),
             tablet_tools: HashMap::new(),
@@ -712,6 +718,7 @@ impl Astera {
             used_dnd_sources: HashSet::new(),
             workspace_managers: Vec::new(),
             transient_seats: Vec::new(),
+            input_timestamp_subscriptions: Vec::new(),
             next_transient_seat: 1,
         }
     }
@@ -905,6 +912,8 @@ impl Astera {
                     .current_focus()
                     .and_then(|surface| surface.client())
                     .map(|client| client.id());
+                let timestamp_recipient = recipient.clone();
+                let timestamp = event.time_msec();
                 let intercepted = keyboard.input::<(), _>(
                     self,
                     key_code,
@@ -924,7 +933,8 @@ impl Astera {
                             {
                                 return FilterResult::Intercept(());
                             }
-                            return FilterResult::Forward;
+                            return state
+                                .forward_keyboard_event(timestamp_recipient.as_ref(), timestamp);
                         }
                         if state.seat.keyboard_shortcuts_inhibited()
                             || state.exclusive_layer_has_keyboard_focus()
@@ -942,7 +952,8 @@ impl Astera {
                             {
                                 return FilterResult::Intercept(());
                             }
-                            return FilterResult::Forward;
+                            return state
+                                .forward_keyboard_event(timestamp_recipient.as_ref(), timestamp);
                         }
                         if !pressed {
                             return if state.key_repeat.release(
@@ -952,7 +963,8 @@ impl Astera {
                             ) {
                                 FilterResult::Intercept(())
                             } else {
-                                FilterResult::Forward
+                                state
+                                    .forward_keyboard_event(timestamp_recipient.as_ref(), timestamp)
                             };
                         }
                         let symbol = key
@@ -962,7 +974,7 @@ impl Astera {
                             state.key_repeat.intercept(key_code);
                             FilterResult::Intercept(())
                         } else {
-                            FilterResult::Forward
+                            state.forward_keyboard_event(timestamp_recipient.as_ref(), timestamp)
                         }
                     },
                 );
@@ -1141,6 +1153,15 @@ impl Astera {
                     .map(|client| client.id());
                 let touch = self.touch.clone();
                 let serial = self.next_serial();
+                if let Some(recipient) = recipient.as_ref() {
+                    self.touch_timestamp_clients
+                        .insert(synthetic_slot, recipient.clone());
+                }
+                self.send_input_timestamp(
+                    input_timestamps::InputTimestampKind::Touch,
+                    recipient.as_ref(),
+                    event.time_msec(),
+                );
                 touch.down(
                     self,
                     focus,
@@ -1186,6 +1207,12 @@ impl Astera {
                     .map(|(surface, origin, _)| (surface, origin));
                 self.active_output = previous_output;
                 let touch = self.touch.clone();
+                let recipient = self.touch_timestamp_clients.get(&synthetic_slot).cloned();
+                self.send_input_timestamp(
+                    input_timestamps::InputTimestampKind::Touch,
+                    recipient.as_ref(),
+                    event.time_msec(),
+                );
                 touch.motion(
                     self,
                     focus,
@@ -1203,6 +1230,7 @@ impl Astera {
                 else {
                     return;
                 };
+                let recipient = self.touch_timestamp_clients.remove(&synthetic_slot);
                 if self
                     .drag
                     .is_some_and(|drag| drag.source == DragSource::Touch(synthetic_slot))
@@ -1212,6 +1240,11 @@ impl Astera {
                 }
                 let touch = self.touch.clone();
                 let serial = self.next_serial();
+                self.send_input_timestamp(
+                    input_timestamps::InputTimestampKind::Touch,
+                    recipient.as_ref(),
+                    event.time_msec(),
+                );
                 touch.up(
                     self,
                     &UpEvent {
@@ -1222,6 +1255,7 @@ impl Astera {
                 );
             }
             InputEvent::TouchCancel { .. } => {
+                self.touch_timestamp_clients.clear();
                 self.cancel_touch_sequences();
             }
             InputEvent::TouchFrame { .. } => {
@@ -1381,6 +1415,11 @@ impl Astera {
         self.active_pointer_gesture = Some(ActivePointerGesture::Swipe(surface));
     }
 
+    fn forward_keyboard_event(&mut self, client: Option<&ClientId>, time: u32) -> FilterResult<()> {
+        self.send_input_timestamp(input_timestamps::InputTimestampKind::Keyboard, client, time);
+        FilterResult::Forward
+    }
+
     fn handle_pointer_motion(
         &mut self,
         location: SmithayPoint<f64, smithay::utils::Logical>,
@@ -1405,6 +1444,10 @@ impl Astera {
             self.update_drag(location);
         }
         let focus = self.surface_under(location);
+        let timestamp_recipient = focus
+            .as_ref()
+            .and_then(|(surface, _, _)| surface.client())
+            .map(|client| client.id());
         let pointer = self.pointer.clone();
         let previous_focus = pointer.current_focus();
         if let Some(previous) = previous_focus.as_ref()
@@ -1423,6 +1466,11 @@ impl Astera {
                 .unwrap_or(1.0);
             (surface.clone(), *origin, scale)
         });
+        self.send_input_timestamp(
+            input_timestamps::InputTimestampKind::Pointer,
+            timestamp_recipient.as_ref(),
+            time,
+        );
         pointer.motion(
             self,
             focus.map(|(surface, origin, _)| (surface, origin)),
@@ -1532,6 +1580,15 @@ impl Astera {
             }
         }
         let pointer = self.pointer.clone();
+        let timestamp_recipient = pointer
+            .current_focus()
+            .and_then(|surface| surface.client())
+            .map(|client| client.id());
+        self.send_input_timestamp(
+            input_timestamps::InputTimestampKind::Pointer,
+            timestamp_recipient.as_ref(),
+            event.time_msec(),
+        );
         pointer.axis(self, frame);
         pointer.frame(self);
     }
@@ -1650,11 +1707,16 @@ impl Astera {
         let previous_focus = pointer.current_focus();
         let serial = self.next_serial();
         if state == BackendButtonState::Pressed
-            && let Some(recipient) = recipient
+            && let Some(recipient) = recipient.as_ref()
         {
             self.activation_tracker
-                .remember(serial, recipient, self.clock.now());
+                .remember(serial, recipient.clone(), self.clock.now());
         }
+        self.send_input_timestamp(
+            input_timestamps::InputTimestampKind::Pointer,
+            recipient.as_ref(),
+            time,
+        );
         pointer.motion(
             self,
             focus.map(|(surface, origin, _)| (surface, origin)),
@@ -1671,6 +1733,15 @@ impl Astera {
                 .and_then(Resource::client)
                 .map(|client| (client.id(), serial));
         }
+        let button_recipient = current_focus
+            .as_ref()
+            .and_then(Resource::client)
+            .map(|client| client.id());
+        self.send_input_timestamp(
+            input_timestamps::InputTimestampKind::Pointer,
+            button_recipient.as_ref(),
+            time,
+        );
         pointer.button(
             self,
             &ButtonEvent {

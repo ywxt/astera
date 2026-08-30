@@ -78,6 +78,10 @@ use wayland_protocols::wp::{
         zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
         zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
     },
+    input_timestamps::zv1::client::{
+        zwp_input_timestamps_manager_v1::ZwpInputTimestampsManagerV1,
+        zwp_input_timestamps_v1::{self, ZwpInputTimestampsV1},
+    },
     keyboard_shortcuts_inhibit::zv1::client::{
         zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1,
         zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1,
@@ -344,6 +348,7 @@ delegate_noop!(TestClient: ignore WpLinuxDrmSyncobjManagerV1);
 delegate_noop!(TestClient: ignore WpDrmLeaseDeviceV1);
 delegate_noop!(TestClient: ignore WlOutput);
 delegate_noop!(TestClient: ignore WlPointer);
+delegate_noop!(TestClient: ignore ZwpInputTimestampsManagerV1);
 delegate_noop!(TestClient: ignore WlShm);
 delegate_noop!(TestClient: ignore WlShmPool);
 delegate_noop!(TestClient: ignore WlBuffer);
@@ -428,6 +433,26 @@ delegate_noop!(TestClient: ignore WpPointerWarpV1);
 delegate_noop!(TestClient: ignore XdgToplevelDragManagerV1);
 delegate_noop!(TestClient: ignore XdgToplevelDragV1);
 delegate_noop!(TestClient: ignore ExtForeignToplevelHandleV1);
+
+impl Dispatch<ZwpInputTimestampsV1, mpsc::Sender<(u32, u32, u32)>> for TestClient {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZwpInputTimestampsV1,
+        event: zwp_input_timestamps_v1::Event,
+        timestamps: &mpsc::Sender<(u32, u32, u32)>,
+        _connection: &Connection,
+        _queue: &QueueHandle<Self>,
+    ) {
+        if let zwp_input_timestamps_v1::Event::Timestamp {
+            tv_sec_hi,
+            tv_sec_lo,
+            tv_nsec,
+        } = event
+        {
+            timestamps.send((tv_sec_hi, tv_sec_lo, tv_nsec)).unwrap();
+        }
+    }
+}
 
 impl Dispatch<WlPointer, mpsc::Sender<u32>> for TestClient {
     fn event(
@@ -799,6 +824,68 @@ fn attach_one_pixel_buffer(
         (),
     );
     surface.attach(Some(&buffer), 0, 0);
+}
+
+#[test]
+fn input_timestamps_report_nanoseconds_and_drop_destroyed_subscriptions() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    let server_client = display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (timestamp_tx, timestamp_rx) = mpsc::channel();
+    let (receive_tx, receive_rx) = mpsc::sync_channel(0);
+    let (destroy_tx, destroy_rx) = mpsc::sync_channel(0);
+    let (destroyed_tx, destroyed_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let manager = globals
+            .bind::<ZwpInputTimestampsManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let pointer = seat.get_pointer(&queue, ());
+        let timestamps = manager.get_pointer_timestamps(&pointer, &queue, timestamp_tx);
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+        receive_rx.recv().unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        destroy_rx.recv().unwrap();
+        timestamps.destroy();
+        connection.flush().unwrap();
+        destroyed_tx.send(()).unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state.input_timestamp_subscriptions.len() == 1
+    });
+    state.send_input_timestamp(
+        input_timestamps::InputTimestampKind::Pointer,
+        Some(&server_client.id()),
+        1_234,
+    );
+    display.flush_clients().unwrap();
+    receive_tx.send(()).unwrap();
+    let mut timestamp = None;
+    dispatch_until(&mut display, &mut state, |_| {
+        timestamp = timestamp_rx.try_recv().ok();
+        timestamp.is_some()
+    });
+    assert_eq!(timestamp.unwrap(), (0, 1, 234_000_000));
+
+    destroy_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        destroyed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        state.input_timestamp_subscriptions.is_empty()
+    });
+    client.join().unwrap();
 }
 
 #[test]
