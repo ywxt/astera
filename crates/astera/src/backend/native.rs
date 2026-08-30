@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -162,12 +162,25 @@ fn edid_blob(device: &impl ControlDevice, connector: connector::Handle) -> Optio
     None
 }
 
+fn connector_is_non_desktop(device: &impl ControlDevice, connector: connector::Handle) -> bool {
+    let Ok(properties) = device.get_properties(connector) else {
+        return false;
+    };
+    properties.iter().any(|(handle, raw)| {
+        *raw != 0
+            && device
+                .get_property(*handle)
+                .is_ok_and(|info| info.name().to_bytes() == b"non-desktop")
+    })
+}
+
 struct NativeDevice {
     fd: DrmDeviceFd,
     output_manager: NativeOutputManager,
     scanner: DrmScanner,
     registration: RegistrationToken,
     outputs: HashMap<crtc::Handle, NativeSurface>,
+    lease_connectors: HashSet<connector::Handle>,
     active: bool,
 }
 
@@ -578,6 +591,7 @@ impl NativeLoop {
                 scanner: DrmScanner::new(),
                 registration,
                 outputs: HashMap::new(),
+                lease_connectors: HashSet::new(),
                 active: true,
             },
         );
@@ -604,6 +618,20 @@ impl NativeLoop {
         for event in events {
             match event {
                 DrmScanEvent::Connected { connector, crtc } => {
+                    let non_desktop = self.devices.get(&node).is_some_and(|device| {
+                        connector_is_non_desktop(device.output_manager.device(), connector.handle())
+                    });
+                    if non_desktop {
+                        if let Some(device) = self.devices.get_mut(&node) {
+                            device.lease_connectors.insert(connector.handle());
+                        }
+                        tracing::info!(
+                            ?node,
+                            connector = ?connector.handle(),
+                            "reserved non-desktop DRM connector for leasing"
+                        );
+                        continue;
+                    }
                     let Some(crtc) = crtc else {
                         tracing::warn!(?node, connector = ?connector.handle(), "connector has no usable CRTC or mode");
                         continue;
@@ -638,6 +666,7 @@ impl NativeLoop {
                         connector: fallback_key,
                         edid,
                         modes: candidates.clone(),
+                        non_desktop: false,
                     }]))
                     .expect("snapshot source cannot fail")
                     .pop()
@@ -732,6 +761,9 @@ impl NativeLoop {
                     }
                 }
                 DrmScanEvent::Disconnected { connector, crtc } => {
+                    if let Some(device) = self.devices.get_mut(&node) {
+                        device.lease_connectors.remove(&connector.handle());
+                    }
                     let Some(id) = self.connectors.remove(&(node, connector.handle())) else {
                         continue;
                     };

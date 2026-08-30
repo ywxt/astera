@@ -45,6 +45,7 @@ pub struct ConnectorSnapshot {
     pub connector: String,
     pub edid: Option<Vec<u8>>,
     pub modes: Vec<ModeCandidate>,
+    pub non_desktop: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,6 +79,9 @@ pub fn scan_outputs<I: NativeDeviceIo>(io: &I) -> Result<Vec<PlannedOutput>, I::
         .connector_snapshots()?
         .into_iter()
         .filter_map(|connector| {
+            if connector.non_desktop {
+                return None;
+            }
             let mode = connector.modes.get(select_mode(&connector.modes)?)?;
             Some(PlannedOutput {
                 stable_key: stable_output_key(connector.edid.as_deref(), &connector.connector),
@@ -176,6 +180,7 @@ mod tests {
                     connector: "HDMI-A-1".into(),
                     edid: None,
                     modes: Vec::new(),
+                    non_desktop: false,
                 },
                 ConnectorSnapshot {
                     connector: "DP-1".into(),
@@ -189,6 +194,7 @@ mod tests {
                         },
                         preferred,
                     ],
+                    non_desktop: false,
                 },
             ],
         };
@@ -217,10 +223,30 @@ mod tests {
                 connector: "eDP-1".into(),
                 edid: None,
                 modes: vec![mode],
+                non_desktop: false,
             }],
         })
         .unwrap();
         assert_eq!(outputs[0].stable_key, "eDP-1");
         assert_eq!(outputs[0].mode, mode);
+    }
+
+    #[test]
+    fn non_desktop_connector_is_reserved_instead_of_planned_as_output() {
+        let outputs = scan_outputs(&MockDevice {
+            connectors: vec![ConnectorSnapshot {
+                connector: "DP-2".into(),
+                edid: None,
+                modes: vec![ModeCandidate {
+                    width: 2160,
+                    height: 1200,
+                    refresh_millihz: 90_000,
+                    preferred: true,
+                }],
+                non_desktop: true,
+            }],
+        })
+        .unwrap();
+        assert!(outputs.is_empty());
     }
 }
