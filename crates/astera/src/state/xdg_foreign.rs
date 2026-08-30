@@ -84,6 +84,21 @@ impl Dispatch<ZxdgExporterV2, ()> for Astera {
     ) {
         match request {
             zxdg_exporter_v2::Request::ExportToplevel { id, surface } => {
+                let handle = loop {
+                    let candidate = Alphanumeric.sample_string(&mut rand::rng(), 32);
+                    if !state.xdg_foreign_state.exported.contains_key(&candidate) {
+                        break candidate;
+                    }
+                };
+                // export_toplevel carries a new_id. Initialize it before reporting an invalid
+                // surface so wayland-server can tear down the offending client without finding
+                // an uninitialized child object and panicking.
+                let exported = data_init.init(
+                    id,
+                    ExportedData {
+                        handle: handle.clone(),
+                    },
+                );
                 if !is_toplevel_equivalent(&surface) {
                     resource.post_error(
                         zxdg_exporter_v2::Error::InvalidSurface,
@@ -91,18 +106,6 @@ impl Dispatch<ZxdgExporterV2, ()> for Astera {
                     );
                     return;
                 }
-                let handle = loop {
-                    let candidate = Alphanumeric.sample_string(&mut rand::rng(), 32);
-                    if !state.xdg_foreign_state.exported.contains_key(&candidate) {
-                        break candidate;
-                    }
-                };
-                let exported = data_init.init(
-                    id,
-                    ExportedData {
-                        handle: handle.clone(),
-                    },
-                );
                 state.xdg_foreign_state.exported.insert(
                     handle.clone(),
                     Exported {

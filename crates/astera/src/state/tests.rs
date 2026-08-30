@@ -2602,6 +2602,50 @@ fn xdg_dialog_tracks_modal_parent_and_can_be_recreated() {
 }
 
 #[test]
+fn xdg_foreign_invalid_export_disconnects_client_without_server_panic() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (requested_tx, requested_rx) = mpsc::sync_channel(0);
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let exporter = globals
+            .bind::<ZxdgExporterV2, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let (handle_tx, _handle_rx) = mpsc::channel();
+        let _exported = exporter.export_toplevel(&surface, &queue, handle_tx);
+        connection.flush().unwrap();
+        requested_tx.send(()).unwrap();
+
+        result_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        requested_rx.try_recv().is_ok()
+    });
+    let mut result = None;
+    dispatch_until(&mut display, &mut state, |_| {
+        result = result_rx.try_recv().ok();
+        result.is_some()
+    });
+    assert_eq!(result, Some(true));
+    client.join().unwrap();
+}
+
+#[test]
 fn xdg_foreign_links_cross_client_parent_and_revokes_it_with_export() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
