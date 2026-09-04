@@ -64,7 +64,8 @@
             shellHook = ''
               export PATH="''${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 
-              if ! rustup toolchain list | grep -q "^$RUSTC_VERSION"; then
+              if ! rustup run "$RUSTC_VERSION" rustc --version >/dev/null 2>&1 \
+                || ! rustup run "$RUSTC_VERSION" cargo --version >/dev/null 2>&1; then
                 rustup toolchain install "$RUSTC_VERSION" --profile minimal
               fi
             '';
