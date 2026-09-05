@@ -1476,12 +1476,20 @@ impl Astera {
             self.update_drag(location);
         }
         let focus = self.surface_under(location);
-        let timestamp_recipient = focus
-            .as_ref()
-            .and_then(|(surface, _, _)| surface.client())
-            .map(|client| client.id());
         let pointer = self.pointer.clone();
         let previous_focus = pointer.current_focus();
+        let dnd_pointer_grab = pointer.is_grabbed() && previous_focus.is_none();
+        // Client DnD installs a Focus::Clear pointer grab. Its motion callback drives
+        // wl_data_device motion and deliberately emits no wl_pointer.motion, so there must be no
+        // input-timestamps event for the surface merely located below the cursor.
+        let timestamp_recipient = if dnd_pointer_grab {
+            None
+        } else {
+            focus
+                .as_ref()
+                .and_then(|(surface, _, _)| surface.client())
+                .map(|client| client.id())
+        };
         if let Some(previous) = previous_focus.as_ref()
             && focus.as_ref().is_none_or(|(next, _, _)| next != previous)
         {
@@ -1751,6 +1759,7 @@ impl Astera {
             .map(|client| client.id());
         let pointer = self.pointer.clone();
         let previous_focus = pointer.current_focus();
+        let dnd_pointer_grab = pointer.is_grabbed() && previous_focus.is_none();
         let serial = self.next_serial();
         if state == BackendButtonState::Pressed
             && let Some(recipient) = recipient.as_ref()
@@ -1758,11 +1767,13 @@ impl Astera {
             self.activation_tracker
                 .remember(serial, recipient.clone(), self.clock.now());
         }
-        self.send_input_timestamp(
-            input_timestamps::InputTimestampKind::Pointer,
-            recipient.as_ref(),
-            time_usec,
-        );
+        if !dnd_pointer_grab {
+            self.send_input_timestamp(
+                input_timestamps::InputTimestampKind::Pointer,
+                recipient.as_ref(),
+                time_usec,
+            );
+        }
         pointer.motion(
             self,
             focus.map(|(surface, origin, _)| (surface, origin)),

@@ -3399,6 +3399,8 @@ fn xdg_toplevel_drag_moves_window_with_data_device_grab() {
     let (ready_tx, ready_rx) = mpsc::sync_channel(0);
     let (start_tx, start_rx) = mpsc::sync_channel(0);
     let (started_tx, started_rx) = mpsc::sync_channel(0);
+    let (check_timestamp_tx, check_timestamp_rx) = mpsc::sync_channel(0);
+    let (timestamp_result_tx, timestamp_result_rx) = mpsc::sync_channel(0);
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     let (cleanup_tx, cleanup_rx) = mpsc::sync_channel(0);
     let client = thread::spawn(move || {
@@ -3417,8 +3419,13 @@ fn xdg_toplevel_drag_moves_window_with_data_device_grab() {
         let drag_manager = globals
             .bind::<XdgToplevelDragManagerV1, _, _>(&queue, 1..=1, ())
             .unwrap();
+        let timestamp_manager = globals
+            .bind::<ZwpInputTimestampsManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
         let (button_tx, button_rx) = mpsc::channel();
         let pointer = seat.get_pointer(&queue, PointerButtonSerial(button_tx));
+        let (timestamp_tx, timestamp_rx) = mpsc::channel();
+        let _timestamps = timestamp_manager.get_pointer_timestamps(&pointer, &queue, timestamp_tx);
         let device = data_manager.get_data_device(&seat, &queue, mpsc::channel().0);
         let source = data_manager.create_data_source(&queue, ());
         source.offer("application/x-astera-tab".into());
@@ -3450,9 +3457,15 @@ fn xdg_toplevel_drag_moves_window_with_data_device_grab() {
         start_rx.recv().unwrap();
         events.roundtrip(&mut TestClient).unwrap();
         let serial = button_rx.recv().unwrap();
+        while timestamp_rx.try_recv().is_ok() {}
         device.start_drag(Some(&source), &surface, None, serial);
         connection.flush().unwrap();
         started_tx.send(()).unwrap();
+        check_timestamp_rx.recv().unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        timestamp_result_tx
+            .send(timestamp_rx.try_recv().is_ok())
+            .unwrap();
         done_rx.recv().unwrap();
         drag.destroy();
         connection.flush().unwrap();
@@ -3510,6 +3523,14 @@ fn xdg_toplevel_drag_moves_window_with_data_device_grab() {
         state.pointer.current_focus().as_ref(),
         Some(&dragged_surface)
     );
+    display.flush_clients().unwrap();
+    check_timestamp_tx.send(()).unwrap();
+    let mut timestamp_received = None;
+    dispatch_until(&mut display, &mut state, |_| {
+        timestamp_received = timestamp_result_rx.try_recv().ok();
+        timestamp_received.is_some()
+    });
+    assert_eq!(timestamp_received, Some(false));
     let release_serial = state.next_serial();
     pointer.button(
         &mut state,
