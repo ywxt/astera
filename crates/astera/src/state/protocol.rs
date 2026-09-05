@@ -48,6 +48,95 @@ impl XdgDialogHandler for Astera {
     }
 }
 
+impl
+    smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_protocols::xdg::dialog::v1::server::xdg_wm_dialog_v1::XdgWmDialogV1,
+        (),
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        manager: &smithay::reexports::wayland_protocols::xdg::dialog::v1::server::xdg_wm_dialog_v1::XdgWmDialogV1,
+        request: smithay::reexports::wayland_protocols::xdg::dialog::v1::server::xdg_wm_dialog_v1::Request,
+        data: &(),
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols::xdg::dialog::v1::server::xdg_wm_dialog_v1::{
+            Error, Request,
+        };
+
+        match request {
+            Request::GetXdgDialog { id, toplevel } => {
+                let Some(handle) = state.xdg_shell_state.get_toplevel(&toplevel) else {
+                    return;
+                };
+                if state.xdg_dialog_toplevels.contains(&toplevel) {
+                    data_init.init(id, handle);
+                    manager.post_error(
+                        Error::AlreadyUsed,
+                        "toplevel dialog is already constructed",
+                    );
+                    return;
+                }
+                <XdgDialogState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                    state,
+                    client,
+                    manager,
+                    Request::GetXdgDialog {
+                        id,
+                        toplevel: toplevel.clone(),
+                    },
+                    data,
+                    display,
+                    data_init,
+                );
+                state.xdg_dialog_toplevels.insert(toplevel);
+            }
+            request => {
+                <XdgDialogState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                    state, client, manager, request, data, display, data_init,
+                );
+            }
+        }
+    }
+}
+
+impl
+    smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_protocols::xdg::dialog::v1::server::xdg_dialog_v1::XdgDialogV1,
+        ToplevelSurface,
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        dialog: &smithay::reexports::wayland_protocols::xdg::dialog::v1::server::xdg_dialog_v1::XdgDialogV1,
+        request: smithay::reexports::wayland_protocols::xdg::dialog::v1::server::xdg_dialog_v1::Request,
+        toplevel: &ToplevelSurface,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols::xdg::dialog::v1::server::xdg_dialog_v1::Request;
+        if matches!(request, Request::Destroy) {
+            state.xdg_dialog_toplevels.remove(toplevel.xdg_toplevel());
+        }
+        <XdgDialogState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, dialog, request, toplevel, display, data_init,
+        );
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        _dialog: &smithay::reexports::wayland_protocols::xdg::dialog::v1::server::xdg_dialog_v1::XdgDialogV1,
+        toplevel: &ToplevelSurface,
+    ) {
+        state.xdg_dialog_toplevels.remove(toplevel.xdg_toplevel());
+    }
+}
+
 impl XdgSystemBellHandler for Astera {
     fn ring(&mut self, surface: Option<WlSurface>) {
         const FLASH_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
@@ -1955,7 +2044,9 @@ impl ForeignToplevelListHandler for Astera {
 delegate_xdg_shell!(Astera);
 delegate_foreign_toplevel_list!(Astera);
 delegate_xdg_decoration!(Astera);
-delegate_xdg_dialog!(Astera);
+smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols::xdg::dialog::v1::server::xdg_wm_dialog_v1::XdgWmDialogV1: ()
+] => smithay::wayland::shell::xdg::dialog::XdgDialogState);
 delegate_xdg_activation!(Astera);
 delegate_idle_inhibit!(Astera);
 delegate_keyboard_shortcuts_inhibit!(Astera);

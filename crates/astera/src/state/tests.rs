@@ -2773,6 +2773,55 @@ fn commit_timing_rejects_invalid_nanoseconds() {
 }
 
 #[test]
+fn duplicate_xdg_dialog_is_rejected_without_server_panic() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (sent_tx, sent_rx) = mpsc::sync_channel(0);
+    let (error_tx, error_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let dialogs = globals
+            .bind::<XdgWmDialogV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+        let _first = dialogs.get_xdg_dialog(&toplevel, &queue, ());
+        let _duplicate = dialogs.get_xdg_dialog(&toplevel, &queue, ());
+        connection.flush().unwrap();
+        sent_tx.send(()).unwrap();
+        error_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| sent_rx.try_recv().is_ok());
+    display.dispatch_clients(&mut state).unwrap();
+    display.flush_clients().unwrap();
+    let mut rejected = false;
+    dispatch_until(&mut display, &mut state, |_| match error_rx.try_recv() {
+        Ok(value) => {
+            rejected = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(rejected);
+    client.join().unwrap();
+}
+
+#[test]
 fn xdg_dialog_tracks_modal_parent_and_can_be_recreated() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());

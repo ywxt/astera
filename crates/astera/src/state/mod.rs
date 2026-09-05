@@ -90,8 +90,7 @@ use smithay::{
     delegate_keyboard_shortcuts_inhibit, delegate_layer_shell, delegate_pointer_constraints,
     delegate_pointer_gestures, delegate_presentation, delegate_relative_pointer, delegate_seat,
     delegate_shm, delegate_single_pixel_buffer, delegate_tablet_manager, delegate_viewporter,
-    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_dialog, delegate_xdg_shell,
-    delegate_xdg_system_bell,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell, delegate_xdg_system_bell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -301,6 +300,9 @@ pub struct Astera {
     pending_fifo_barriers:
         BTreeMap<OutputId, Vec<crate::backend::render::PresentedFifoBarrier>>,
     commit_timer_surfaces: HashSet<WlSurface>,
+    xdg_dialog_toplevels: HashSet<
+        smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel,
+    >,
     pending_security_contexts: Vec<(SecurityContextListenerSource, SecurityContext)>,
     pending_toplevel_icons: HashMap<WlSurface, Option<xdg_toplevel_icon::IconSnapshot>>,
     toplevel_icon_resources: Vec<smithay::reexports::wayland_protocols::xdg::toplevel_icon::v1::server::xdg_toplevel_icon_v1::XdgToplevelIconV1>,
@@ -709,6 +711,7 @@ impl Astera {
             last_primary_selection_serial: None,
             pending_fifo_barriers: BTreeMap::new(),
             commit_timer_surfaces: HashSet::new(),
+            xdg_dialog_toplevels: HashSet::new(),
             pending_security_contexts: Vec::new(),
             pending_toplevel_icons: HashMap::new(),
             toplevel_icon_resources: Vec::new(),
