@@ -13,7 +13,7 @@ use smithay::{
     },
 };
 
-use super::Astera;
+use super::{Astera, model::ClientDndInput};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InputTimestampKind {
@@ -178,6 +178,15 @@ impl Astera {
         client: Option<&ClientId>,
         time_usec: u64,
     ) {
+        if matches!(
+            (kind, self.active_client_dnd_input),
+            (InputTimestampKind::Pointer, Some(ClientDndInput::Pointer))
+                | (InputTimestampKind::Touch, Some(ClientDndInput::Touch))
+        ) {
+            // Client DnD replaces core pointer/touch delivery with wl_data_device events. The
+            // input-timestamps protocol only annotates core events, so no timestamp is emitted.
+            return;
+        }
         let Some(client) = client else {
             return;
         };

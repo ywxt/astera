@@ -18,7 +18,7 @@ use wayland_client::{
         wl_data_device::WlDataDevice, wl_data_device_manager::WlDataDeviceManager,
         wl_data_offer::WlDataOffer, wl_data_source::WlDataSource, wl_keyboard::WlKeyboard,
         wl_output::WlOutput, wl_pointer::WlPointer, wl_registry::WlRegistry, wl_seat::WlSeat,
-        wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface,
+        wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface, wl_touch::WlTouch,
     },
 };
 use wayland_protocols::ext::data_control::v1::client::{
@@ -349,6 +349,7 @@ delegate_noop!(TestClient: ignore WpDrmLeaseDeviceV1);
 delegate_noop!(TestClient: ignore WlOutput);
 delegate_noop!(TestClient: ignore WlPointer);
 delegate_noop!(TestClient: ignore WlKeyboard);
+delegate_noop!(TestClient: ignore WlTouch);
 delegate_noop!(TestClient: ignore ZwpInputTimestampsManagerV1);
 delegate_noop!(TestClient: ignore WlShm);
 delegate_noop!(TestClient: ignore WlShmPool);
@@ -1063,6 +1064,70 @@ fn keyboard_timestamps_follow_input_method_grab_delivery() {
     assert_eq!(released_received, Some(true));
     app_thread.join().unwrap();
     ime_thread.join().unwrap();
+}
+
+#[test]
+fn touch_timestamps_follow_data_device_grab_delivery() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    let server_client = display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (receive_tx, receive_rx) = mpsc::sync_channel(0);
+    let (result_tx, result_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let manager = globals
+            .bind::<ZwpInputTimestampsManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let touch = seat.get_touch(&queue, ());
+        let (timestamp_tx, timestamp_rx) = mpsc::channel();
+        let _timestamps = manager.get_touch_timestamps(&touch, &queue, timestamp_tx);
+        connection.flush().unwrap();
+        ready_tx.send(()).unwrap();
+
+        receive_rx.recv().unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        result_tx
+            .send((timestamp_rx.try_recv().ok(), timestamp_rx.try_recv().ok()))
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| ready_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state.input_timestamp_subscriptions.len() == 1
+    });
+    state.pending_client_dnd_input = Some(ClientDndInput::Touch);
+    let seat = state.seat.clone();
+    ClientDndGrabHandler::started(&mut state, None, None, seat.clone());
+    state.send_input_timestamp(
+        input_timestamps::InputTimestampKind::Touch,
+        Some(&server_client.id()),
+        5_000_125,
+    );
+    ClientDndGrabHandler::dropped(&mut state, None, false, seat);
+    state.send_input_timestamp(
+        input_timestamps::InputTimestampKind::Touch,
+        Some(&server_client.id()),
+        5_000_250,
+    );
+    display.flush_clients().unwrap();
+    receive_tx.send(()).unwrap();
+
+    let mut result = None;
+    dispatch_until(&mut display, &mut state, |_| {
+        result = result_rx.try_recv().ok();
+        result.is_some()
+    });
+    assert_eq!(result, Some((Some((0, 5, 250_000)), None)));
+    assert_eq!(state.active_client_dnd_input, None);
+    client.join().unwrap();
 }
 
 #[test]

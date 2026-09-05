@@ -158,6 +158,12 @@ pub(super) enum DragSource {
     Dnd,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ClientDndInput {
+    Pointer,
+    Touch,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) enum DragKind {
     Move,

@@ -1629,6 +1629,7 @@ impl
         use smithay::reexports::wayland_server::protocol::wl_data_device::Request;
         let mut touch_icon = None;
         let mut update_touch_icon = false;
+        let mut client_dnd_input = None;
         if let Request::StartDrag { origin, serial, .. } = &request {
             update_touch_icon = true;
             let serial = Serial::from(*serial);
@@ -1657,6 +1658,11 @@ impl
                 );
                 return;
             }
+            client_dnd_input = Some(if pointer_authorized {
+                ClientDndInput::Pointer
+            } else {
+                ClientDndInput::Touch
+            });
             touch_icon = if touch_authorized && !pointer_authorized {
                 state.touch.grab_start_data().and_then(|start| {
                     state
@@ -1709,9 +1715,11 @@ impl
         {
             state.used_selection_sources.insert(source.clone());
         }
+        state.pending_client_dnd_input = client_dnd_input;
         <DataDeviceState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
             state, client, resource, request, data, display, data_init,
         );
+        state.pending_client_dnd_input = None;
         if update_touch_icon {
             state.dnd_touch_icon = state.dnd_icon.is_some().then_some(touch_icon).flatten();
             if state.dnd_touch_icon.is_some() {
@@ -1860,6 +1868,7 @@ impl ClientDndGrabHandler for Astera {
         icon: Option<WlSurface>,
         _seat: Seat<Self>,
     ) {
+        self.active_client_dnd_input = self.pending_client_dnd_input.take();
         self.dnd_icon = icon;
         self.mark_render_dirty();
         self.refresh_visible_scales();
@@ -1869,6 +1878,7 @@ impl ClientDndGrabHandler for Astera {
     }
 
     fn dropped(&mut self, _target: Option<WlSurface>, _validated: bool, _seat: Seat<Self>) {
+        self.active_client_dnd_input = None;
         self.finish_toplevel_drag();
         self.dnd_icon = None;
         self.dnd_touch_icon = None;

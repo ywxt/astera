@@ -53,8 +53,8 @@ use geometry::{
 use idle::{IdleEvent, IdleRuntime};
 use key_repeat::KeyRepeatState;
 use model::{
-    ActivePointerGesture, DragKind, DragSource, DragState, MappedInputMethodPopup, MappedLayer,
-    MappedWindow, OutputRuntime, ProtocolState, ResizeEdges,
+    ActivePointerGesture, ClientDndInput, DragKind, DragSource, DragState, MappedInputMethodPopup,
+    MappedLayer, MappedWindow, OutputRuntime, ProtocolState, ResizeEdges,
 };
 use output_power::OutputPowerGlobalData;
 use session_lock::{LockSurfaces, SessionState};
@@ -234,6 +234,8 @@ pub struct Astera {
     )>,
     pointer_enter_serial: Option<(ClientId, Serial)>,
     drag: Option<DragState>,
+    pending_client_dnd_input: Option<ClientDndInput>,
+    active_client_dnd_input: Option<ClientDndInput>,
     key_repeat: KeyRepeatState,
     active_shortcut_inhibitor: Option<KeyboardShortcutsInhibitor>,
     touch_device_outputs: HashMap<String, OutputId>,
@@ -646,6 +648,8 @@ impl Astera {
             pointer_focus_origin: None,
             pointer_enter_serial: None,
             drag: None,
+            pending_client_dnd_input: None,
+            active_client_dnd_input: None,
             key_repeat: KeyRepeatState::default(),
             active_shortcut_inhibitor: None,
             touch_device_outputs: HashMap::new(),
@@ -1478,18 +1482,10 @@ impl Astera {
         let focus = self.surface_under(location);
         let pointer = self.pointer.clone();
         let previous_focus = pointer.current_focus();
-        let dnd_pointer_grab = pointer.is_grabbed() && previous_focus.is_none();
-        // Client DnD installs a Focus::Clear pointer grab. Its motion callback drives
-        // wl_data_device motion and deliberately emits no wl_pointer.motion, so there must be no
-        // input-timestamps event for the surface merely located below the cursor.
-        let timestamp_recipient = if dnd_pointer_grab {
-            None
-        } else {
-            focus
-                .as_ref()
-                .and_then(|(surface, _, _)| surface.client())
-                .map(|client| client.id())
-        };
+        let timestamp_recipient = focus
+            .as_ref()
+            .and_then(|(surface, _, _)| surface.client())
+            .map(|client| client.id());
         if let Some(previous) = previous_focus.as_ref()
             && focus.as_ref().is_none_or(|(next, _, _)| next != previous)
         {
@@ -1759,7 +1755,6 @@ impl Astera {
             .map(|client| client.id());
         let pointer = self.pointer.clone();
         let previous_focus = pointer.current_focus();
-        let dnd_pointer_grab = pointer.is_grabbed() && previous_focus.is_none();
         let serial = self.next_serial();
         if state == BackendButtonState::Pressed
             && let Some(recipient) = recipient.as_ref()
@@ -1767,13 +1762,11 @@ impl Astera {
             self.activation_tracker
                 .remember(serial, recipient.clone(), self.clock.now());
         }
-        if !dnd_pointer_grab {
-            self.send_input_timestamp(
-                input_timestamps::InputTimestampKind::Pointer,
-                recipient.as_ref(),
-                time_usec,
-            );
-        }
+        self.send_input_timestamp(
+            input_timestamps::InputTimestampKind::Pointer,
+            recipient.as_ref(),
+            time_usec,
+        );
         pointer.motion(
             self,
             focus.map(|(surface, origin, _)| (surface, origin)),
