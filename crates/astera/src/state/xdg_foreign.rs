@@ -260,7 +260,7 @@ impl Dispatch<ZxdgImportedV2, ImportedData> for Astera {
     }
 }
 
-fn remove_child_relationship(state: &mut Astera, child: &WlSurface) {
+pub(super) fn remove_child_relationship(state: &mut Astera, child: &WlSurface) {
     for exported in state.xdg_foreign_state.exported.values_mut() {
         for relationship in exported.imports.values_mut() {
             if relationship.as_ref() == Some(child) {

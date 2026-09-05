@@ -2676,6 +2676,7 @@ impl Astera {
         }
         self.windows[index].mapped = false;
         let unmapped_surface = self.windows[index].surface.wl_surface().clone();
+        self.reparent_children_of_unmapped_toplevel(&unmapped_surface);
         self.detach_toplevel_drag_surface(&unmapped_surface);
         self.mark_public_dirty();
         if self.drag.is_some_and(|drag| drag.window == id) {
@@ -2685,6 +2686,45 @@ impl Astera {
         self.refresh_visible_scales();
         self.sync_keyboard_focus();
         self.handle_pointer_motion(self.pointer_location, 0);
+    }
+
+    fn reparent_children_of_unmapped_toplevel(&mut self, surface: &WlSurface) {
+        let inherited_parent = with_states(surface, |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|role| role.lock().ok()?.parent.take())
+        });
+        xdg_foreign::remove_child_relationship(self, surface);
+
+        let children = self
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .filter(|toplevel| toplevel.wl_surface() != surface)
+            .filter(|toplevel| {
+                with_states(toplevel.wl_surface(), |states| {
+                    states
+                        .data_map
+                        .get::<XdgToplevelSurfaceData>()
+                        .and_then(|role| role.lock().ok())
+                        .is_some_and(|role| role.parent.as_ref() == Some(surface))
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for child in children {
+            xdg_foreign::remove_child_relationship(self, child.wl_surface());
+            with_states(child.wl_surface(), |states| {
+                if let Some(role) = states.data_map.get::<XdgToplevelSurfaceData>()
+                    && let Ok(mut role) = role.lock()
+                {
+                    role.parent = inherited_parent.clone();
+                }
+            });
+            <Self as XdgShellHandler>::parent_changed(self, child);
+        }
     }
 
     pub fn remove_dead_windows(&mut self) {

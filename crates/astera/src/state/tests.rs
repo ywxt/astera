@@ -2844,6 +2844,108 @@ fn xdg_dialog_tracks_modal_parent_and_can_be_recreated() {
 }
 
 #[test]
+fn unmapping_toplevel_reparents_children_and_forgets_its_parent() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (mapped_tx, mapped_rx) = mpsc::sync_channel(0);
+    let (unmap_tx, unmap_rx) = mpsc::sync_channel(0);
+    let (unmapped_tx, unmapped_rx) = mpsc::sync_channel(0);
+    let (done_tx, done_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let shm = globals.bind::<WlShm, _, _>(&queue, 1..=1, ()).unwrap();
+
+        let root_surface = compositor.create_surface(&queue, ());
+        let root_xdg = shell.get_xdg_surface(&root_surface, &queue, ());
+        let root = root_xdg.get_toplevel(&queue, ());
+        let middle_surface = compositor.create_surface(&queue, ());
+        let middle_xdg = shell.get_xdg_surface(&middle_surface, &queue, ());
+        let middle = middle_xdg.get_toplevel(&queue, ());
+        let leaf_surface = compositor.create_surface(&queue, ());
+        let leaf_xdg = shell.get_xdg_surface(&leaf_surface, &queue, ());
+        let leaf = leaf_xdg.get_toplevel(&queue, ());
+        middle.set_parent(Some(&root));
+        leaf.set_parent(Some(&middle));
+        root_surface.commit();
+        middle_surface.commit();
+        leaf_surface.commit();
+        events.roundtrip(&mut TestClient).unwrap();
+
+        let fd = rustix::fs::memfd_create("astera-parent-chain", rustix::fs::MemfdFlags::CLOEXEC)
+            .unwrap();
+        rustix::fs::ftruncate(&fd, 3 * 4 * 4 * 4).unwrap();
+        let pool = shm.create_pool(fd.as_fd(), 3 * 4 * 4 * 4, &queue, ());
+        for (index, surface) in [&root_surface, &middle_surface, &leaf_surface]
+            .into_iter()
+            .enumerate()
+        {
+            let buffer = pool.create_buffer(
+                (index * 4 * 4 * 4) as i32,
+                4,
+                4,
+                4 * 4,
+                wayland_client::protocol::wl_shm::Format::Argb8888,
+                &queue,
+                (),
+            );
+            surface.attach(Some(&buffer), 0, 0);
+            surface.damage_buffer(0, 0, 4, 4);
+            surface.commit();
+        }
+        connection.flush().unwrap();
+        mapped_tx.send(()).unwrap();
+
+        unmap_rx.recv().unwrap();
+        middle_surface.attach(None, 0, 0);
+        middle_surface.commit();
+        connection.flush().unwrap();
+        unmapped_tx.send(()).unwrap();
+        done_rx.recv().unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| mapped_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| {
+        state.windows.len() == 3 && state.windows.iter().all(|window| window.mapped)
+    });
+    let root = state.windows[0].surface.wl_surface().clone();
+    let middle = state.windows[1].surface.wl_surface().clone();
+    let leaf = state.windows[2].surface.wl_surface().clone();
+
+    unmap_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| unmapped_rx.try_recv().is_ok());
+    dispatch_until(&mut display, &mut state, |state| !state.windows[1].mapped);
+    let parent_of =
+        |surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface| {
+            with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<XdgToplevelSurfaceData>()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .parent
+                    .clone()
+            })
+        };
+    assert_eq!(parent_of(&middle), None);
+    assert_eq!(parent_of(&leaf), Some(root));
+
+    done_tx.send(()).unwrap();
+    client.join().unwrap();
+}
+
+#[test]
 fn xdg_foreign_invalid_export_disconnects_client_without_server_panic() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
