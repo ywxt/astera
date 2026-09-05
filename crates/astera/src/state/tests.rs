@@ -2844,7 +2844,7 @@ fn xdg_dialog_tracks_modal_parent_and_can_be_recreated() {
 }
 
 #[test]
-fn unmapping_toplevel_reparents_children_and_forgets_its_parent() {
+fn unmapping_or_destroying_toplevel_reparents_its_children() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
     let (server_socket, client_socket) = UnixStream::pair().unwrap();
@@ -2855,6 +2855,10 @@ fn unmapping_toplevel_reparents_children_and_forgets_its_parent() {
     let (mapped_tx, mapped_rx) = mpsc::sync_channel(0);
     let (unmap_tx, unmap_rx) = mpsc::sync_channel(0);
     let (unmapped_tx, unmapped_rx) = mpsc::sync_channel(0);
+    let (setup_destroy_tx, setup_destroy_rx) = mpsc::sync_channel(0);
+    let (destroy_ready_tx, destroy_ready_rx) = mpsc::sync_channel(0);
+    let (destroy_tx, destroy_rx) = mpsc::sync_channel(0);
+    let (destroyed_tx, destroyed_rx) = mpsc::sync_channel(0);
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     let client = thread::spawn(move || {
         let connection = Connection::from_socket(client_socket).unwrap();
@@ -2884,8 +2888,8 @@ fn unmapping_toplevel_reparents_children_and_forgets_its_parent() {
 
         let fd = rustix::fs::memfd_create("astera-parent-chain", rustix::fs::MemfdFlags::CLOEXEC)
             .unwrap();
-        rustix::fs::ftruncate(&fd, 3 * 4 * 4 * 4).unwrap();
-        let pool = shm.create_pool(fd.as_fd(), 3 * 4 * 4 * 4, &queue, ());
+        rustix::fs::ftruncate(&fd, 5 * 4 * 4 * 4).unwrap();
+        let pool = shm.create_pool(fd.as_fd(), 5 * 4 * 4 * 4, &queue, ());
         for (index, surface) in [&root_surface, &middle_surface, &leaf_surface]
             .into_iter()
             .enumerate()
@@ -2911,6 +2915,43 @@ fn unmapping_toplevel_reparents_children_and_forgets_its_parent() {
         middle_surface.commit();
         connection.flush().unwrap();
         unmapped_tx.send(()).unwrap();
+
+        setup_destroy_rx.recv().unwrap();
+        let destroyed_middle_surface = compositor.create_surface(&queue, ());
+        let destroyed_middle_xdg = shell.get_xdg_surface(&destroyed_middle_surface, &queue, ());
+        let destroyed_middle = destroyed_middle_xdg.get_toplevel(&queue, ());
+        let destroyed_leaf_surface = compositor.create_surface(&queue, ());
+        let destroyed_leaf_xdg = shell.get_xdg_surface(&destroyed_leaf_surface, &queue, ());
+        let destroyed_leaf = destroyed_leaf_xdg.get_toplevel(&queue, ());
+        destroyed_middle.set_parent(Some(&root));
+        destroyed_leaf.set_parent(Some(&destroyed_middle));
+        destroyed_middle_surface.commit();
+        destroyed_leaf_surface.commit();
+        events.roundtrip(&mut TestClient).unwrap();
+        for (index, surface) in [&destroyed_middle_surface, &destroyed_leaf_surface]
+            .into_iter()
+            .enumerate()
+        {
+            let buffer = pool.create_buffer(
+                ((index + 3) * 4 * 4 * 4) as i32,
+                4,
+                4,
+                4 * 4,
+                wayland_client::protocol::wl_shm::Format::Argb8888,
+                &queue,
+                (),
+            );
+            surface.attach(Some(&buffer), 0, 0);
+            surface.damage_buffer(0, 0, 4, 4);
+            surface.commit();
+        }
+        connection.flush().unwrap();
+        destroy_ready_tx.send(()).unwrap();
+
+        destroy_rx.recv().unwrap();
+        destroyed_middle.destroy();
+        connection.flush().unwrap();
+        destroyed_tx.send(()).unwrap();
         done_rx.recv().unwrap();
     });
 
@@ -2939,7 +2980,25 @@ fn unmapping_toplevel_reparents_children_and_forgets_its_parent() {
             })
         };
     assert_eq!(parent_of(&middle), None);
-    assert_eq!(parent_of(&leaf), Some(root));
+    assert_eq!(parent_of(&leaf), Some(root.clone()));
+
+    setup_destroy_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        destroy_ready_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        state.windows.len() == 5 && state.windows[3..].iter().all(|window| window.mapped)
+    });
+    let destroyed_middle = state.windows[3].surface.wl_surface().clone();
+    let destroyed_leaf = state.windows[4].surface.wl_surface().clone();
+    assert_eq!(parent_of(&destroyed_leaf), Some(destroyed_middle));
+
+    destroy_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        destroyed_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 4);
+    assert_eq!(parent_of(&destroyed_leaf), Some(root));
 
     done_tx.send(()).unwrap();
     client.join().unwrap();

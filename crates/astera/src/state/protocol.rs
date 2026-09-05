@@ -1024,6 +1024,7 @@ impl XdgShellHandler for Astera {
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         self.cancel_surface_bound_input();
+        self.reparent_children_of_unmapped_toplevel(surface.wl_surface());
         self.detach_toplevel_drag_surface(surface.wl_surface());
         let Some(index) = self
             .windows
