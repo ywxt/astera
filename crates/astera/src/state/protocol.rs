@@ -577,6 +577,7 @@ impl CompositorHandler for Astera {
 
     fn destroyed(&mut self, surface: &WlSurface) {
         self.dmabuf_feedback_surfaces.remove(surface);
+        self.active_fractional_scale_surfaces.remove(surface);
         self.pending_toplevel_icons.remove(surface);
         self.remove_tearing_control_surface(surface);
         self.remove_color_representation_surface(surface);
@@ -1600,6 +1601,92 @@ impl SecurityContextHandler for Astera {
 
 impl
     smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        (),
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        manager: &smithay::reexports::wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        request: smithay::reexports::wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::Request,
+        data: &(),
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::{Error, Request};
+        match request {
+            Request::GetFractionalScale { id, surface } => {
+                if state.active_fractional_scale_surfaces.contains(&surface) {
+                    data_init.init(id, surface.downgrade());
+                    manager.post_error(
+                        Error::FractionalScaleExists,
+                        "surface already has a fractional-scale object",
+                    );
+                    return;
+                }
+                state
+                    .active_fractional_scale_surfaces
+                    .insert(surface.clone());
+                <FractionalScaleManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                    state,
+                    client,
+                    manager,
+                    Request::GetFractionalScale { id, surface },
+                    data,
+                    display,
+                    data_init,
+                );
+            }
+            request => {
+                <FractionalScaleManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                    state, client, manager, request, data, display, data_init,
+                );
+            }
+        }
+    }
+}
+
+impl
+    smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1::WpFractionalScaleV1,
+        smithay::reexports::wayland_server::Weak<WlSurface>,
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        scale: &smithay::reexports::wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1::WpFractionalScaleV1,
+        request: smithay::reexports::wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1::Request,
+        data: &smithay::reexports::wayland_server::Weak<WlSurface>,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1::Request;
+        if matches!(request, Request::Destroy)
+            && let Ok(surface) = data.upgrade()
+        {
+            state.active_fractional_scale_surfaces.remove(&surface);
+        }
+        <FractionalScaleManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, scale, request, data, display, data_init,
+        );
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        _scale: &smithay::reexports::wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_v1::WpFractionalScaleV1,
+        data: &smithay::reexports::wayland_server::Weak<WlSurface>,
+    ) {
+        if let Ok(surface) = data.upgrade() {
+            state.active_fractional_scale_surfaces.remove(&surface);
+        }
+    }
+}
+
+impl
+    smithay::reexports::wayland_server::Dispatch<
         smithay::reexports::wayland_protocols::wp::fifo::v1::server::wp_fifo_manager_v1::WpFifoManagerV1,
         bool,
     > for Astera
@@ -2486,7 +2573,9 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
     smithay::reexports::wayland_protocols::ext::session_lock::v1::server::ext_session_lock_manager_v1::ExtSessionLockManagerV1: ()
 ] => smithay::wayland::session_lock::SessionLockManagerState);
 delegate_layer_shell!(Astera);
-delegate_fractional_scale!(Astera);
+smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols::wp::fractional_scale::v1::server::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1: ()
+] => smithay::wayland::fractional_scale::FractionalScaleManagerState);
 delegate_viewporter!(Astera);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
     smithay::reexports::wayland_server::protocol::wl_output::WlOutput:
