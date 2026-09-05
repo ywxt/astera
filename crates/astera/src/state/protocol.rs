@@ -666,7 +666,28 @@ impl XdgShellHandler for Astera {
         tracing::debug!(window = ?id, "toplevel role created");
     }
 
-    fn parent_changed(&mut self, _surface: ToplevelSurface) {
+    fn parent_changed(&mut self, surface: ToplevelSurface) {
+        let parent = with_states(surface.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .and_then(|role| role.lock().ok()?.parent.clone())
+        });
+        if parent.as_ref().is_some_and(|parent| {
+            !self
+                .windows
+                .iter()
+                .any(|window| window.mapped && window.surface.wl_surface() == parent)
+        }) {
+            with_states(surface.wl_surface(), |states| {
+                if let Some(role) = states.data_map.get::<XdgToplevelSurfaceData>()
+                    && let Ok(mut role) = role.lock()
+                {
+                    role.parent = None;
+                }
+            });
+            xdg_foreign::remove_child_relationship(self, surface.wl_surface());
+        }
         self.mark_public_dirty();
     }
 

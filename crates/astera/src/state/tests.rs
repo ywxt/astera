@@ -2787,7 +2787,7 @@ fn xdg_dialog_tracks_modal_parent_and_can_be_recreated() {
     let (done_tx, done_rx) = mpsc::sync_channel(0);
     let client = thread::spawn(move || {
         let connection = Connection::from_socket(client_socket).unwrap();
-        let (globals, events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
         let queue = events.handle();
         let compositor = globals
             .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
@@ -2796,9 +2796,17 @@ fn xdg_dialog_tracks_modal_parent_and_can_be_recreated() {
         let dialogs = globals
             .bind::<XdgWmDialogV1, _, _>(&queue, 1..=1, ())
             .unwrap();
+        let pixels = globals
+            .bind::<WpSinglePixelBufferManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
         let parent_surface = compositor.create_surface(&queue, ());
         let parent_xdg = shell.get_xdg_surface(&parent_surface, &queue, ());
         let parent = parent_xdg.get_toplevel(&queue, ());
+        parent_surface.commit();
+        events.roundtrip(&mut TestClient).unwrap();
+        let parent_buffer = pixels.create_u32_rgba_buffer(0, 0, 0, u32::MAX, &queue, ());
+        parent_surface.attach(Some(&parent_buffer), 0, 0);
+        parent_surface.commit();
         let child_surface = compositor.create_surface(&queue, ());
         let child_xdg = shell.get_xdg_surface(&child_surface, &queue, ());
         let child = child_xdg.get_toplevel(&queue, ());
@@ -2852,6 +2860,8 @@ fn unmapping_or_destroying_toplevel_reparents_its_children() {
         .handle()
         .insert_client(server_socket, Arc::new(ClientState::default()))
         .unwrap();
+    let (unmapped_parent_tx, unmapped_parent_rx) = mpsc::sync_channel(0);
+    let (map_tx, map_rx) = mpsc::sync_channel(0);
     let (mapped_tx, mapped_rx) = mpsc::sync_channel(0);
     let (unmap_tx, unmap_rx) = mpsc::sync_channel(0);
     let (unmapped_tx, unmapped_rx) = mpsc::sync_channel(0);
@@ -2879,12 +2889,15 @@ fn unmapping_or_destroying_toplevel_reparents_its_children() {
         let leaf_surface = compositor.create_surface(&queue, ());
         let leaf_xdg = shell.get_xdg_surface(&leaf_surface, &queue, ());
         let leaf = leaf_xdg.get_toplevel(&queue, ());
-        middle.set_parent(Some(&root));
-        leaf.set_parent(Some(&middle));
         root_surface.commit();
         middle_surface.commit();
         leaf_surface.commit();
         events.roundtrip(&mut TestClient).unwrap();
+
+        leaf.set_parent(Some(&middle));
+        connection.flush().unwrap();
+        unmapped_parent_tx.send(()).unwrap();
+        map_rx.recv().unwrap();
 
         let fd = rustix::fs::memfd_create("astera-parent-chain", rustix::fs::MemfdFlags::CLOEXEC)
             .unwrap();
@@ -2894,6 +2907,11 @@ fn unmapping_or_destroying_toplevel_reparents_its_children() {
             .into_iter()
             .enumerate()
         {
+            if index == 1 {
+                middle.set_parent(Some(&root));
+            } else if index == 2 {
+                leaf.set_parent(Some(&middle));
+            }
             let buffer = pool.create_buffer(
                 (index * 4 * 4 * 4) as i32,
                 4,
@@ -2923,8 +2941,6 @@ fn unmapping_or_destroying_toplevel_reparents_its_children() {
         let destroyed_leaf_surface = compositor.create_surface(&queue, ());
         let destroyed_leaf_xdg = shell.get_xdg_surface(&destroyed_leaf_surface, &queue, ());
         let destroyed_leaf = destroyed_leaf_xdg.get_toplevel(&queue, ());
-        destroyed_middle.set_parent(Some(&root));
-        destroyed_leaf.set_parent(Some(&destroyed_middle));
         destroyed_middle_surface.commit();
         destroyed_leaf_surface.commit();
         events.roundtrip(&mut TestClient).unwrap();
@@ -2932,6 +2948,11 @@ fn unmapping_or_destroying_toplevel_reparents_its_children() {
             .into_iter()
             .enumerate()
         {
+            if index == 0 {
+                destroyed_middle.set_parent(Some(&root));
+            } else {
+                destroyed_leaf.set_parent(Some(&destroyed_middle));
+            }
             let buffer = pool.create_buffer(
                 ((index + 3) * 4 * 4 * 4) as i32,
                 4,
@@ -2954,6 +2975,24 @@ fn unmapping_or_destroying_toplevel_reparents_its_children() {
         destroyed_tx.send(()).unwrap();
         done_rx.recv().unwrap();
     });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        unmapped_parent_rx.try_recv().is_ok()
+    });
+    dispatch_until(&mut display, &mut state, |state| state.windows.len() == 3);
+    let initially_unparented_leaf = state.windows[2].surface.wl_surface().clone();
+    let initial_parent = with_states(&initially_unparented_leaf, |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .parent
+            .clone()
+    });
+    assert_eq!(initial_parent, None);
+    map_tx.send(()).unwrap();
 
     dispatch_until(&mut display, &mut state, |_| mapped_rx.try_recv().is_ok());
     dispatch_until(&mut display, &mut state, |state| {
@@ -3077,14 +3116,20 @@ fn xdg_foreign_links_cross_client_parent_and_revokes_it_with_export() {
         let exporter = globals
             .bind::<ZxdgExporterV2, _, _>(&queue, 1..=1, ())
             .unwrap();
+        let pixels = globals
+            .bind::<WpSinglePixelBufferManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
         let surface = compositor.create_surface(&queue, ());
         let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
         let toplevel = xdg_surface.get_toplevel(&queue, ());
         toplevel.set_app_id("org.astera.Parent".into());
-        let exported = exporter.export_toplevel(&surface, &queue, handle_tx);
         surface.commit();
-        connection.flush().unwrap();
-        events.blocking_dispatch(&mut TestClient).unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        let buffer = pixels.create_u32_rgba_buffer(0, 0, 0, u32::MAX, &queue, ());
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        let exported = exporter.export_toplevel(&surface, &queue, handle_tx);
+        events.roundtrip(&mut TestClient).unwrap();
         revoke_rx.recv().unwrap();
         exported.destroy();
         connection.flush().unwrap();
