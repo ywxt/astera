@@ -123,19 +123,27 @@ impl Dispatch<XdgToplevelIconV1, IconData> for Astera {
         _display: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        let mut builder = data.0.lock().unwrap();
-        if builder.immutable {
-            icon.post_error(
-                xdg_toplevel_icon_v1::Error::Immutable,
-                "icon cannot be changed after set_icon",
-            );
-            return;
-        }
         match request {
             xdg_toplevel_icon_v1::Request::SetName { icon_name } => {
+                let mut builder = data.0.lock().unwrap();
+                if builder.immutable {
+                    icon.post_error(
+                        xdg_toplevel_icon_v1::Error::Immutable,
+                        "icon cannot be changed after set_icon",
+                    );
+                    return;
+                }
                 builder.name = Some(icon_name);
             }
             xdg_toplevel_icon_v1::Request::AddBuffer { buffer, scale } => {
+                let mut builder = data.0.lock().unwrap();
+                if builder.immutable {
+                    icon.post_error(
+                        xdg_toplevel_icon_v1::Error::Immutable,
+                        "icon cannot be changed after set_icon",
+                    );
+                    return;
+                }
                 let Ok(metadata) = with_buffer_contents(&buffer, |_, _, metadata| metadata) else {
                     icon.post_error(
                         xdg_toplevel_icon_v1::Error::InvalidBuffer,

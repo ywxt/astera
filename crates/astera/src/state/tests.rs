@@ -3136,6 +3136,8 @@ fn toplevel_icon_is_double_buffered_and_immutable_without_server_panic() {
     let (commit_tx, commit_rx) = mpsc::sync_channel(0);
     let (committed_tx, committed_rx) = mpsc::sync_channel(0);
     let (inspect_tx, inspect_rx) = mpsc::sync_channel(0);
+    let (destroyed_tx, destroyed_rx) = mpsc::sync_channel(0);
+    let (destroy_ok_tx, destroy_ok_rx) = mpsc::sync_channel(0);
     let (mutated_tx, mutated_rx) = mpsc::sync_channel(0);
     let (error_tx, error_rx) = mpsc::sync_channel(0);
     let client = thread::spawn(move || {
@@ -3183,7 +3185,17 @@ fn toplevel_icon_is_double_buffered_and_immutable_without_server_panic() {
         committed_tx.send(()).unwrap();
         inspect_rx.recv().unwrap();
 
-        icon.set_name("must-fail".into());
+        icon.destroy();
+        connection.flush().unwrap();
+        destroyed_tx.send(()).unwrap();
+        destroy_ok_tx
+            .send(events.roundtrip(&mut TestClient).is_ok())
+            .unwrap();
+
+        let immutable_icon = icons.create_icon(&queue, ());
+        immutable_icon.set_name("immutable".into());
+        icons.set_icon(&toplevel, Some(&immutable_icon));
+        immutable_icon.set_name("must-fail".into());
         connection.flush().unwrap();
         mutated_tx.send(()).unwrap();
         error_tx
@@ -3219,6 +3231,22 @@ fn toplevel_icon_is_double_buffered_and_immutable_without_server_panic() {
     );
 
     inspect_tx.send(()).unwrap();
+    dispatch_until(&mut display, &mut state, |_| {
+        destroyed_rx.try_recv().is_ok()
+    });
+    display.flush_clients().unwrap();
+    let mut destroy_succeeded = false;
+    dispatch_until(&mut display, &mut state, |_| {
+        match destroy_ok_rx.try_recv() {
+            Ok(value) => {
+                destroy_succeeded = value;
+                true
+            }
+            Err(_) => false,
+        }
+    });
+    assert!(destroy_succeeded);
+
     dispatch_until(&mut display, &mut state, |_| mutated_rx.try_recv().is_ok());
     display.flush_clients().unwrap();
     let mut rejected = false;
