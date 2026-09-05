@@ -155,10 +155,10 @@ impl Dispatch<XdgToplevelDragV1, ToplevelDragData> for Astera {
                 if runtime.resource != *drag {
                     return;
                 }
-                if runtime.active {
+                if runtime.active || !state.used_dnd_sources.contains(&data.source) {
                     drag.post_error(
                         xdg_toplevel_drag_v1::Error::OngoingDrag,
-                        "toplevel drag cannot be destroyed before DnD ends",
+                        "toplevel drag cannot be destroyed until DnD has ended",
                     );
                     return;
                 }

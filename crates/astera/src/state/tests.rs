@@ -3652,6 +3652,51 @@ fn xdg_toplevel_drag_moves_window_with_data_device_grab() {
 }
 
 #[test]
+fn toplevel_drag_cannot_be_destroyed_before_dnd_ends() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (sent_tx, sent_rx) = mpsc::sync_channel(0);
+    let (error_tx, error_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let data_manager = globals
+            .bind::<WlDataDeviceManager, _, _>(&queue, 1..=3, ())
+            .unwrap();
+        let drag_manager = globals
+            .bind::<XdgToplevelDragManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let source = data_manager.create_data_source(&queue, ());
+        let drag = drag_manager.get_xdg_toplevel_drag(&source, &queue, ());
+        drag.destroy();
+        connection.flush().unwrap();
+        sent_tx.send(()).unwrap();
+        error_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| sent_rx.try_recv().is_ok());
+    display.flush_clients().unwrap();
+    let mut rejected = false;
+    dispatch_until(&mut display, &mut state, |_| match error_rx.try_recv() {
+        Ok(value) => {
+            rejected = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(rejected);
+    client.join().unwrap();
+}
+
+#[test]
 fn toplevel_drag_source_cannot_be_used_as_clipboard_selection() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
