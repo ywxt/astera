@@ -42,6 +42,99 @@ impl XdgDecorationHandler for Astera {
     }
 }
 
+impl
+    smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+        (),
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        manager: &smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
+        request: smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::Request,
+        data: &(),
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::{
+            zxdg_decoration_manager_v1::Request,
+            zxdg_toplevel_decoration_v1::Error,
+        };
+        match request {
+            Request::GetToplevelDecoration { id, toplevel } => {
+                let Some(handle) = state.xdg_shell_state.get_toplevel(&toplevel) else {
+                    return;
+                };
+                if state.xdg_decoration_toplevels.contains(&toplevel) {
+                    data_init.init(id, handle);
+                    manager.post_error(
+                        Error::AlreadyConstructed,
+                        "toplevel decoration is already constructed",
+                    );
+                    return;
+                }
+                <XdgDecorationState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                    state,
+                    client,
+                    manager,
+                    Request::GetToplevelDecoration {
+                        id,
+                        toplevel: toplevel.clone(),
+                    },
+                    data,
+                    display,
+                    data_init,
+                );
+                state.xdg_decoration_toplevels.insert(toplevel);
+            }
+            request => {
+                <XdgDecorationState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                    state, client, manager, request, data, display, data_init,
+                );
+            }
+        }
+    }
+}
+
+impl
+    smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        ToplevelSurface,
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        decoration: &smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        request: smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Request,
+        toplevel: &ToplevelSurface,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Request;
+        if matches!(request, Request::Destroy) {
+            state
+                .xdg_decoration_toplevels
+                .remove(toplevel.xdg_toplevel());
+        }
+        <XdgDecorationState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, decoration, request, toplevel, display, data_init,
+        );
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        _decoration: &smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        toplevel: &ToplevelSurface,
+    ) {
+        state
+            .xdg_decoration_toplevels
+            .remove(toplevel.xdg_toplevel());
+    }
+}
+
 impl XdgDialogHandler for Astera {
     fn modal_changed(&mut self, _toplevel: ToplevelSurface, _is_modal: bool) {
         self.mark_public_dirty();
@@ -2253,7 +2346,10 @@ impl ForeignToplevelListHandler for Astera {
 
 delegate_xdg_shell!(Astera);
 delegate_foreign_toplevel_list!(Astera);
-delegate_xdg_decoration!(Astera);
+smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1:
+        smithay::wayland::shell::xdg::decoration::XdgDecorationManagerGlobalData
+] => smithay::wayland::shell::xdg::decoration::XdgDecorationState);
 smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
     smithay::reexports::wayland_protocols::xdg::dialog::v1::server::xdg_wm_dialog_v1::XdgWmDialogV1: ()
 ] => smithay::wayland::shell::xdg::dialog::XdgDialogState);

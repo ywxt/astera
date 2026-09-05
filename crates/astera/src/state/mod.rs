@@ -90,7 +90,7 @@ use smithay::{
     delegate_layer_shell, delegate_pointer_constraints, delegate_pointer_gestures,
     delegate_presentation, delegate_relative_pointer, delegate_seat, delegate_shm,
     delegate_single_pixel_buffer, delegate_tablet_manager, delegate_viewporter,
-    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell, delegate_xdg_system_bell,
+    delegate_xdg_activation, delegate_xdg_shell, delegate_xdg_system_bell,
     desktop::{
         PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, WindowSurfaceType,
         find_popup_root_surface, layer_map_for_output, utils::under_from_surface_tree,
@@ -304,6 +304,9 @@ pub struct Astera {
     commit_timer_surfaces: HashSet<WlSurface>,
     active_commit_timers: HashSet<WlSurface>,
     xdg_dialog_toplevels: HashSet<
+        smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel,
+    >,
+    xdg_decoration_toplevels: HashSet<
         smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel,
     >,
     pending_security_contexts: Vec<(SecurityContextListenerSource, SecurityContext)>,
@@ -718,6 +721,7 @@ impl Astera {
             commit_timer_surfaces: HashSet::new(),
             active_commit_timers: HashSet::new(),
             xdg_dialog_toplevels: HashSet::new(),
+            xdg_decoration_toplevels: HashSet::new(),
             pending_security_contexts: Vec::new(),
             pending_toplevel_icons: HashMap::new(),
             toplevel_icon_resources: Vec::new(),

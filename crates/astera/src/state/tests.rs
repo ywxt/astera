@@ -4399,6 +4399,81 @@ fn foreign_toplevel_list_tracks_metadata_and_role_lifetime() {
 }
 
 #[test]
+fn decoration_can_be_recreated_and_duplicate_is_rejected_without_server_panic() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (recreated_tx, recreated_rx) = mpsc::sync_channel(0);
+    let (recreate_ok_tx, recreate_ok_rx) = mpsc::sync_channel(0);
+    let (duplicate_tx, duplicate_rx) = mpsc::sync_channel(0);
+    let (error_tx, error_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let shell = globals.bind::<XdgWmBase, _, _>(&queue, 1..=6, ()).unwrap();
+        let manager = globals
+            .bind::<ZxdgDecorationManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let xdg_surface = shell.get_xdg_surface(&surface, &queue, ());
+        let toplevel = xdg_surface.get_toplevel(&queue, ());
+        let first = manager.get_toplevel_decoration(&toplevel, &queue, ());
+        first.destroy();
+        let _replacement = manager.get_toplevel_decoration(&toplevel, &queue, ());
+        connection.flush().unwrap();
+        recreated_tx.send(()).unwrap();
+        recreate_ok_tx
+            .send(events.roundtrip(&mut TestClient).is_ok())
+            .unwrap();
+
+        let _duplicate = manager.get_toplevel_decoration(&toplevel, &queue, ());
+        connection.flush().unwrap();
+        duplicate_tx.send(()).unwrap();
+        error_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        recreated_rx.try_recv().is_ok()
+    });
+    display.flush_clients().unwrap();
+    let mut recreate_succeeded = false;
+    dispatch_until(&mut display, &mut state, |_| {
+        if let Ok(value) = recreate_ok_rx.try_recv() {
+            recreate_succeeded = value;
+            true
+        } else {
+            false
+        }
+    });
+    assert!(recreate_succeeded);
+
+    dispatch_until(&mut display, &mut state, |_| {
+        duplicate_rx.try_recv().is_ok()
+    });
+    display.flush_clients().unwrap();
+    let mut rejected = false;
+    dispatch_until(&mut display, &mut state, |_| match error_rx.try_recv() {
+        Ok(value) => {
+            rejected = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(rejected);
+    client.join().unwrap();
+}
+
+#[test]
 fn decoration_and_activation_globals_are_advertised() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());
