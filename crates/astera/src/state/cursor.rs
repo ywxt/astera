@@ -56,7 +56,7 @@ fn load_theme_cursor(icon: CursorIcon, scale120: u32) -> Option<NamedCursor> {
         .min_by_key(|image| image.size.abs_diff(requested))?;
     // DRM ARGB8888 is B,G,R,A in memory on little-endian hosts; XCursor exposes RGBA.
     let mut bgra = Vec::with_capacity(image.pixels_rgba.len());
-    for pixel in image.pixels_rgba.chunks_exact(4) {
+    for pixel in image.pixels_rgba.as_chunks::<4>().0 {
         bgra.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
     }
     Some(NamedCursor {
