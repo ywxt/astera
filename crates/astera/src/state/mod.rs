@@ -85,7 +85,7 @@ use smithay::{
         },
     },
     delegate_alpha_modifier, delegate_compositor, delegate_content_type, delegate_cursor_shape,
-    delegate_dmabuf, delegate_drm_syncobj, delegate_ext_data_control, delegate_fifo,
+    delegate_dmabuf, delegate_drm_syncobj, delegate_ext_data_control,
     delegate_foreign_toplevel_list, delegate_fractional_scale, delegate_idle_inhibit,
     delegate_keyboard_shortcuts_inhibit, delegate_layer_shell, delegate_pointer_constraints,
     delegate_pointer_gestures, delegate_presentation, delegate_relative_pointer, delegate_seat,
@@ -299,6 +299,7 @@ pub struct Astera {
     last_primary_selection_serial: Option<Serial>,
     pending_fifo_barriers:
         BTreeMap<OutputId, Vec<crate::backend::render::PresentedFifoBarrier>>,
+    active_fifo_surfaces: HashSet<WlSurface>,
     commit_timer_surfaces: HashSet<WlSurface>,
     active_commit_timers: HashSet<WlSurface>,
     xdg_dialog_toplevels: HashSet<
@@ -711,6 +712,7 @@ impl Astera {
             last_selection_serial: None,
             last_primary_selection_serial: None,
             pending_fifo_barriers: BTreeMap::new(),
+            active_fifo_surfaces: HashSet::new(),
             commit_timer_surfaces: HashSet::new(),
             active_commit_timers: HashSet::new(),
             xdg_dialog_toplevels: HashSet::new(),

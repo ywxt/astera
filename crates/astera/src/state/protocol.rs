@@ -581,6 +581,7 @@ impl CompositorHandler for Astera {
         self.remove_tearing_control_surface(surface);
         self.remove_color_representation_surface(surface);
         self.detach_toplevel_drag_surface(surface);
+        self.active_fifo_surfaces.remove(surface);
         self.commit_timer_surfaces.remove(surface);
         self.active_commit_timers.remove(surface);
         let was_visible = self
@@ -1599,6 +1600,89 @@ impl SecurityContextHandler for Astera {
 
 impl
     smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_protocols::wp::fifo::v1::server::wp_fifo_manager_v1::WpFifoManagerV1,
+        bool,
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        manager: &smithay::reexports::wayland_protocols::wp::fifo::v1::server::wp_fifo_manager_v1::WpFifoManagerV1,
+        request: smithay::reexports::wayland_protocols::wp::fifo::v1::server::wp_fifo_manager_v1::Request,
+        data: &bool,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols::wp::fifo::v1::server::wp_fifo_manager_v1::{
+            Error, Request,
+        };
+        match request {
+            Request::GetFifo { id, surface } => {
+                if state.active_fifo_surfaces.contains(&surface) {
+                    data_init.init(id, surface.downgrade());
+                    manager.post_error(Error::AlreadyExists, "surface already has a FIFO object");
+                    return;
+                }
+                state.active_fifo_surfaces.insert(surface.clone());
+                <FifoManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                    state,
+                    client,
+                    manager,
+                    Request::GetFifo { id, surface },
+                    data,
+                    display,
+                    data_init,
+                );
+            }
+            request => {
+                <FifoManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                    state, client, manager, request, data, display, data_init,
+                );
+            }
+        }
+    }
+}
+
+impl
+    smithay::reexports::wayland_server::Dispatch<
+        smithay::reexports::wayland_protocols::wp::fifo::v1::server::wp_fifo_v1::WpFifoV1,
+        smithay::reexports::wayland_server::Weak<WlSurface>,
+    > for Astera
+{
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        fifo: &smithay::reexports::wayland_protocols::wp::fifo::v1::server::wp_fifo_v1::WpFifoV1,
+        request: smithay::reexports::wayland_protocols::wp::fifo::v1::server::wp_fifo_v1::Request,
+        data: &smithay::reexports::wayland_server::Weak<WlSurface>,
+        display: &DisplayHandle,
+        data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
+    ) {
+        use smithay::reexports::wayland_protocols::wp::fifo::v1::server::wp_fifo_v1::Request;
+        if matches!(request, Request::Destroy)
+            && let Ok(surface) = data.upgrade()
+        {
+            state.active_fifo_surfaces.remove(&surface);
+        }
+        <FifoManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+            state, client, fifo, request, data, display, data_init,
+        );
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        _fifo: &smithay::reexports::wayland_protocols::wp::fifo::v1::server::wp_fifo_v1::WpFifoV1,
+        data: &smithay::reexports::wayland_server::Weak<WlSurface>,
+    ) {
+        if let Ok(surface) = data.upgrade() {
+            state.active_fifo_surfaces.remove(&surface);
+        }
+    }
+}
+
+impl
+    smithay::reexports::wayland_server::Dispatch<
         smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::WpCommitTimingManagerV1,
         bool,
     > for Astera
@@ -2414,7 +2498,9 @@ smithay::reexports::wayland_server::delegate_dispatch!(Astera: [
 ] => smithay::wayland::output::OutputManagerState);
 delegate_compositor!(Astera);
 delegate_content_type!(Astera);
-delegate_fifo!(Astera);
+smithay::reexports::wayland_server::delegate_global_dispatch!(Astera: [
+    smithay::reexports::wayland_protocols::wp::fifo::v1::server::wp_fifo_manager_v1::WpFifoManagerV1: bool
+] => smithay::wayland::fifo::FifoManagerState);
 delegate_alpha_modifier!(Astera);
 delegate_shm!(Astera);
 delegate_single_pixel_buffer!(Astera);
