@@ -139,7 +139,8 @@ use smithay::{
         },
         idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState},
         input_method::{
-            InputMethodHandler, InputMethodManagerState, PopupSurface as InputMethodPopupSurface,
+            InputMethodHandler, InputMethodManagerState, InputMethodSeat,
+            PopupSurface as InputMethodPopupSurface,
         },
         keyboard_shortcuts_inhibit::{
             KeyboardShortcutsInhibitHandler, KeyboardShortcutsInhibitState,
@@ -1433,7 +1434,12 @@ impl Astera {
     }
 
     fn forward_keyboard_event(&mut self, client: Option<&ClientId>, time: u64) -> FilterResult<()> {
-        self.send_input_timestamp(input_timestamps::InputTimestampKind::Keyboard, client, time);
+        // An input-method keyboard grab replaces wl_keyboard.key delivery with
+        // zwp_input_method_keyboard_grab_v2.key. Input-timestamps subscribes only to the former,
+        // so emitting here while grabbed would leave the focused client with an orphan timestamp.
+        if !self.seat.input_method().keyboard_grabbed() {
+            self.send_input_timestamp(input_timestamps::InputTimestampKind::Keyboard, client, time);
+        }
         FilterResult::Forward
     }
 

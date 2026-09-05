@@ -16,9 +16,9 @@ use wayland_client::{
     protocol::{
         wl_buffer::WlBuffer, wl_callback::WlCallback, wl_compositor::WlCompositor,
         wl_data_device::WlDataDevice, wl_data_device_manager::WlDataDeviceManager,
-        wl_data_offer::WlDataOffer, wl_data_source::WlDataSource, wl_output::WlOutput,
-        wl_pointer::WlPointer, wl_registry::WlRegistry, wl_seat::WlSeat, wl_shm::WlShm,
-        wl_shm_pool::WlShmPool, wl_surface::WlSurface,
+        wl_data_offer::WlDataOffer, wl_data_source::WlDataSource, wl_keyboard::WlKeyboard,
+        wl_output::WlOutput, wl_pointer::WlPointer, wl_registry::WlRegistry, wl_seat::WlSeat,
+        wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface,
     },
 };
 use wayland_protocols::ext::data_control::v1::client::{
@@ -348,6 +348,7 @@ delegate_noop!(TestClient: ignore WpLinuxDrmSyncobjManagerV1);
 delegate_noop!(TestClient: ignore WpDrmLeaseDeviceV1);
 delegate_noop!(TestClient: ignore WlOutput);
 delegate_noop!(TestClient: ignore WlPointer);
+delegate_noop!(TestClient: ignore WlKeyboard);
 delegate_noop!(TestClient: ignore ZwpInputTimestampsManagerV1);
 delegate_noop!(TestClient: ignore WlShm);
 delegate_noop!(TestClient: ignore WlShmPool);
@@ -953,6 +954,115 @@ fn input_timestamps_do_not_leak_to_transient_seat_resources() {
     });
     assert_eq!(result, Some((true, false)));
     client.join().unwrap();
+}
+
+#[test]
+fn keyboard_timestamps_follow_input_method_grab_delivery() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (app_server, app_client) = UnixStream::pair().unwrap();
+    let (ime_server, ime_client) = UnixStream::pair().unwrap();
+    let app = display
+        .handle()
+        .insert_client(app_server, Arc::new(ClientState::default()))
+        .unwrap();
+    display
+        .handle()
+        .insert_client(ime_server, Arc::new(ClientState::trusted_input()))
+        .unwrap();
+
+    let (app_ready_tx, app_ready_rx) = mpsc::sync_channel(0);
+    let (check_grabbed_tx, check_grabbed_rx) = mpsc::sync_channel(0);
+    let (grabbed_result_tx, grabbed_result_rx) = mpsc::sync_channel(0);
+    let (check_released_tx, check_released_rx) = mpsc::sync_channel(0);
+    let (released_result_tx, released_result_rx) = mpsc::sync_channel(0);
+    let app_thread = thread::spawn(move || {
+        let connection = Connection::from_socket(app_client).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let manager = globals
+            .bind::<ZwpInputTimestampsManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let keyboard = seat.get_keyboard(&queue, ());
+        let (timestamp_tx, timestamp_rx) = mpsc::channel();
+        let _timestamps = manager.get_keyboard_timestamps(&keyboard, &queue, timestamp_tx);
+        connection.flush().unwrap();
+        app_ready_tx.send(()).unwrap();
+
+        check_grabbed_rx.recv().unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        grabbed_result_tx
+            .send(timestamp_rx.try_recv().is_ok())
+            .unwrap();
+        check_released_rx.recv().unwrap();
+        events.roundtrip(&mut TestClient).unwrap();
+        released_result_tx
+            .send(timestamp_rx.try_recv().is_ok())
+            .unwrap();
+    });
+
+    let (ime_ready_tx, ime_ready_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let (released_tx, released_rx) = mpsc::sync_channel(0);
+    let ime_thread = thread::spawn(move || {
+        let connection = Connection::from_socket(ime_client).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let seat = globals.bind::<WlSeat, _, _>(&queue, 1..=9, ()).unwrap();
+        let manager = globals
+            .bind::<ZwpInputMethodManagerV2, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let input_method = manager.get_input_method(&seat, &queue, ());
+        let grab = input_method.grab_keyboard(&queue, ());
+        connection.flush().unwrap();
+        ime_ready_tx.send(()).unwrap();
+
+        release_rx.recv().unwrap();
+        grab.release();
+        connection.flush().unwrap();
+        released_tx.send(()).unwrap();
+        events.dispatch_pending(&mut TestClient).unwrap();
+    });
+
+    let mut app_ready = false;
+    let mut ime_ready = false;
+    dispatch_until(&mut display, &mut state, |_| {
+        app_ready |= app_ready_rx.try_recv().is_ok();
+        ime_ready |= ime_ready_rx.try_recv().is_ok();
+        app_ready && ime_ready
+    });
+    dispatch_until(&mut display, &mut state, |state| {
+        state.input_timestamp_subscriptions.len() == 1
+            && state.seat.input_method().keyboard_grabbed()
+    });
+    state.forward_keyboard_event(Some(&app.id()), 4_000_125);
+    display.flush_clients().unwrap();
+    check_grabbed_tx.send(()).unwrap();
+    let mut grabbed_received = None;
+    dispatch_until(&mut display, &mut state, |_| {
+        grabbed_received = grabbed_result_rx.try_recv().ok();
+        grabbed_received.is_some()
+    });
+    assert_eq!(grabbed_received, Some(false));
+
+    release_tx.send(()).unwrap();
+    let mut client_released = false;
+    dispatch_until(&mut display, &mut state, |state| {
+        client_released |= released_rx.try_recv().is_ok();
+        client_released && !state.seat.input_method().keyboard_grabbed()
+    });
+    state.forward_keyboard_event(Some(&app.id()), 4_000_250);
+    display.flush_clients().unwrap();
+    check_released_tx.send(()).unwrap();
+    let mut released_received = None;
+    dispatch_until(&mut display, &mut state, |_| {
+        released_received = released_result_rx.try_recv().ok();
+        released_received.is_some()
+    });
+    assert_eq!(released_received, Some(true));
+    app_thread.join().unwrap();
+    ime_thread.join().unwrap();
 }
 
 #[test]
