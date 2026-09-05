@@ -1,4 +1,5 @@
 use smithay::{
+    desktop::{WindowSurfaceType, utils::under_from_surface_tree},
     input::pointer::PointerHandle,
     reexports::{
         wayland_protocols::wp::pointer_warp::v1::server::wp_pointer_warp_v1::{
@@ -71,13 +72,13 @@ impl Dispatch<WpPointerWarpV1, ()> for Astera {
                 if focused != surface || !x.is_finite() || !y.is_finite() {
                     return;
                 }
-                let target = (origin.x + x * scale, origin.y + y * scale).into();
-                if state
-                    .surface_under(target)
-                    .is_none_or(|(under, _, _)| under != surface)
+                let local = (x, y).into();
+                if under_from_surface_tree(&surface, local, (0, 0), WindowSurfaceType::TOPLEVEL)
+                    .is_none()
                 {
                     return;
                 }
+                let target = (origin.x + x * scale, origin.y + y * scale).into();
                 state.handle_absolute_pointer_motion(target, 0);
             }
             wp_pointer_warp_v1::Request::Destroy => {}
