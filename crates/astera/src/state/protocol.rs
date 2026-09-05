@@ -582,6 +582,7 @@ impl CompositorHandler for Astera {
         self.remove_color_representation_surface(surface);
         self.detach_toplevel_drag_surface(surface);
         self.commit_timer_surfaces.remove(surface);
+        self.active_commit_timers.remove(surface);
         let was_visible = self
             .output_runtime
             .values()
@@ -1611,13 +1612,35 @@ impl
         display: &DisplayHandle,
         data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
     ) {
-        use smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::Request;
-        if let Request::GetTimer { surface, .. } = &request {
-            state.commit_timer_surfaces.insert(surface.clone());
+        use smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timing_manager_v1::{Error, Request};
+        match request {
+            Request::GetTimer { id, surface } => {
+                if state.active_commit_timers.contains(&surface) {
+                    data_init.init(id, surface.downgrade());
+                    resource.post_error(
+                        Error::CommitTimerExists,
+                        "surface already has a commit timer",
+                    );
+                    return;
+                }
+                state.commit_timer_surfaces.insert(surface.clone());
+                state.active_commit_timers.insert(surface.clone());
+                <CommitTimingManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                    state,
+                    client,
+                    resource,
+                    Request::GetTimer { id, surface },
+                    data,
+                    display,
+                    data_init,
+                );
+            }
+            request => {
+                <CommitTimingManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
+                    state, client, resource, request, data, display, data_init,
+                );
+            }
         }
-        <CommitTimingManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
-            state, client, resource, request, data, display, data_init,
-        );
     }
 }
 
@@ -1637,6 +1660,11 @@ impl
         data_init: &mut smithay::reexports::wayland_server::DataInit<'_, Self>,
     ) {
         use smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timer_v1::{Error, Request};
+        if matches!(request, Request::Destroy)
+            && let Ok(surface) = data.upgrade()
+        {
+            state.active_commit_timers.remove(&surface);
+        }
         if let Request::SetTimestamp { tv_nsec, .. } = &request
             && *tv_nsec >= 1_000_000_000
         {
@@ -1649,6 +1677,17 @@ impl
         <CommitTimingManagerState as smithay::reexports::wayland_server::Dispatch<_, _, Self>>::request(
             state, client, resource, request, data, display, data_init,
         );
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        _client: ClientId,
+        _resource: &smithay::reexports::wayland_protocols::wp::commit_timing::v1::server::wp_commit_timer_v1::WpCommitTimerV1,
+        data: &smithay::reexports::wayland_server::Weak<WlSurface>,
+    ) {
+        if let Ok(surface) = data.upgrade() {
+            state.active_commit_timers.remove(&surface);
+        }
     }
 }
 

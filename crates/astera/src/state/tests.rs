@@ -2732,6 +2732,78 @@ fn commit_timing_blocks_state_until_monotonic_deadline() {
 }
 
 #[test]
+fn commit_timer_can_be_recreated_and_duplicate_is_rejected_without_server_panic() {
+    let mut display = Display::<Astera>::new().unwrap();
+    let mut state = Astera::new(&display.handle(), Config::default());
+    let (server_socket, client_socket) = UnixStream::pair().unwrap();
+    display
+        .handle()
+        .insert_client(server_socket, Arc::new(ClientState::default()))
+        .unwrap();
+    let (recreated_tx, recreated_rx) = mpsc::sync_channel(0);
+    let (recreate_ok_tx, recreate_ok_rx) = mpsc::sync_channel(0);
+    let (duplicate_tx, duplicate_rx) = mpsc::sync_channel(0);
+    let (error_tx, error_rx) = mpsc::sync_channel(0);
+    let client = thread::spawn(move || {
+        let connection = Connection::from_socket(client_socket).unwrap();
+        let (globals, mut events) = registry_queue_init::<TestClient>(&connection).unwrap();
+        let queue = events.handle();
+        let compositor = globals
+            .bind::<WlCompositor, _, _>(&queue, 1..=6, ())
+            .unwrap();
+        let timing = globals
+            .bind::<WpCommitTimingManagerV1, _, _>(&queue, 1..=1, ())
+            .unwrap();
+        let surface = compositor.create_surface(&queue, ());
+        let first = timing.get_timer(&surface, &queue, ());
+        first.destroy();
+        let _replacement = timing.get_timer(&surface, &queue, ());
+        connection.flush().unwrap();
+        recreated_tx.send(()).unwrap();
+        recreate_ok_tx
+            .send(events.roundtrip(&mut TestClient).is_ok())
+            .unwrap();
+
+        let _duplicate = timing.get_timer(&surface, &queue, ());
+        connection.flush().unwrap();
+        duplicate_tx.send(()).unwrap();
+        error_tx
+            .send(events.roundtrip(&mut TestClient).is_err())
+            .unwrap();
+    });
+
+    dispatch_until(&mut display, &mut state, |_| {
+        recreated_rx.try_recv().is_ok()
+    });
+    display.flush_clients().unwrap();
+    let mut recreate_succeeded = false;
+    dispatch_until(&mut display, &mut state, |_| {
+        if let Ok(value) = recreate_ok_rx.try_recv() {
+            recreate_succeeded = value;
+            true
+        } else {
+            false
+        }
+    });
+    assert!(recreate_succeeded);
+
+    dispatch_until(&mut display, &mut state, |_| {
+        duplicate_rx.try_recv().is_ok()
+    });
+    display.flush_clients().unwrap();
+    let mut rejected = false;
+    dispatch_until(&mut display, &mut state, |_| match error_rx.try_recv() {
+        Ok(value) => {
+            rejected = value;
+            true
+        }
+        Err(_) => false,
+    });
+    assert!(rejected);
+    client.join().unwrap();
+}
+
+#[test]
 fn commit_timing_rejects_invalid_nanoseconds() {
     let mut display = Display::<Astera>::new().unwrap();
     let mut state = Astera::new(&display.handle(), Config::default());

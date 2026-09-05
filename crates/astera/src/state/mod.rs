@@ -300,6 +300,7 @@ pub struct Astera {
     pending_fifo_barriers:
         BTreeMap<OutputId, Vec<crate::backend::render::PresentedFifoBarrier>>,
     commit_timer_surfaces: HashSet<WlSurface>,
+    active_commit_timers: HashSet<WlSurface>,
     xdg_dialog_toplevels: HashSet<
         smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel,
     >,
@@ -711,6 +712,7 @@ impl Astera {
             last_primary_selection_serial: None,
             pending_fifo_barriers: BTreeMap::new(),
             commit_timer_surfaces: HashSet::new(),
+            active_commit_timers: HashSet::new(),
             xdg_dialog_toplevels: HashSet::new(),
             pending_security_contexts: Vec::new(),
             pending_toplevel_icons: HashMap::new(),
